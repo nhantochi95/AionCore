@@ -74,6 +74,7 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    pub local_user: aionui_auth::CurrentUser,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
@@ -428,6 +429,7 @@ impl AppServices {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,
+            local_user: aionui_auth::resolve_effective_local_user(user_repo.as_ref()).await,
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),

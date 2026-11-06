@@ -373,9 +373,59 @@ impl ChannelManager {
     }
 
     /// Checks whether a specific plugin is currently running.
+    pub fn find_running_plugin_id_by_type(&self, owner_user_id: &str, platform: PluginType) -> Option<String> {
+        self.plugins.iter().find_map(|entry| {
+            if entry.key().owner_user_id == owner_user_id
+                && entry.value().plugin_type() == platform
+                && entry.value().status() == PluginStatus::Running
+            {
+                Some(entry.key().plugin_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn resolve_runtime_plugin_id(&self, owner_user_id: &str, plugin_id_or_type: &str) -> Option<String> {
+        let exact = Self::runtime_key(owner_user_id, plugin_id_or_type);
+        if self.plugins.contains_key(&exact) {
+            return Some(plugin_id_or_type.to_owned());
+        }
+        self.plugins.iter().find_map(|entry| {
+            if entry.key().owner_user_id == owner_user_id
+                && entry.value().plugin_type().to_string() == plugin_id_or_type
+            {
+                Some(entry.key().plugin_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Downloads an attachment by `file_id` through a running plugin.
+    pub async fn download_attachment(
+        &self,
+        owner_user_id: &str,
+        plugin_id: &str,
+        file_id: &str,
+    ) -> Result<(Vec<u8>, Option<String>), ChannelError> {
+        let resolved_id = self
+            .resolve_runtime_plugin_id(owner_user_id, plugin_id)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        let plugin = self
+            .plugins
+            .get(&Self::runtime_key(owner_user_id, &resolved_id))
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin.download_attachment(file_id).await
+    }
     pub fn is_plugin_running(&self, owner_user_id: &str, plugin_id: &str) -> bool {
         self.plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .get(&Self::runtime_key(
+                owner_user_id,
+                &self
+                    .resolve_runtime_plugin_id(owner_user_id, plugin_id)
+                    .unwrap_or_else(|| plugin_id.to_owned()),
+            ))
             .map(|p| p.status() == PluginStatus::Running)
             .unwrap_or(false)
     }
@@ -393,7 +443,12 @@ impl ChannelManager {
     ) -> Result<String, ChannelError> {
         let plugin = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .get(&Self::runtime_key(
+                owner_user_id,
+                &self
+                    .resolve_runtime_plugin_id(owner_user_id, plugin_id)
+                    .unwrap_or_else(|| plugin_id.to_owned()),
+            ))
             .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
         plugin.send_message(chat_id, message).await
     }
@@ -409,7 +464,12 @@ impl ChannelManager {
     ) -> Result<(), ChannelError> {
         let plugin = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .get(&Self::runtime_key(
+                owner_user_id,
+                &self
+                    .resolve_runtime_plugin_id(owner_user_id, plugin_id)
+                    .unwrap_or_else(|| plugin_id.to_owned()),
+            ))
             .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
         plugin.edit_message(chat_id, message_id, message).await
     }
@@ -584,7 +644,12 @@ impl ChannelManager {
 
         let live_status = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .get(&Self::runtime_key(
+                owner_user_id,
+                &self
+                    .resolve_runtime_plugin_id(owner_user_id, plugin_id)
+                    .unwrap_or_else(|| plugin_id.to_owned()),
+            ))
             .map(|p| p.status().to_string());
         let status_response = self.row_to_status_response(&row, live_status);
 

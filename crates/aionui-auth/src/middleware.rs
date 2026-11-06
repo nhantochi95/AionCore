@@ -75,6 +75,7 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    pub local_user_override: Option<CurrentUser>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -88,6 +89,29 @@ pub struct AuthState {
 /// Returns HTTP 401 for authentication failures.
 ///
 /// Use with `axum::middleware::from_fn_with_state`.
+pub async fn resolve_effective_local_user(user_repo: &dyn IUserRepository) -> CurrentUser {
+    if let Ok(users) = user_repo.list_users().await {
+        for user in users {
+            if user.id != "system_default_user"
+                && user.status == UserStatus::Active
+                && user_repo.is_default_data_adopter(&user.id).await.unwrap_or(false)
+            {
+                tracing::info!(
+                    user_id = %user.id,
+                    "local mode: resolved previously adopted user context"
+                );
+                return CurrentUser {
+                    id: user.id,
+                    username: user.username.unwrap_or_else(|| "system_default_user".to_string()),
+                    user_type: user.user_type,
+                    status: user.status,
+                };
+            }
+        }
+    }
+    CurrentUser::local_default()
+}
+
 pub async fn auth_middleware(
     State(state): State<AuthState>,
     mut request: Request,
@@ -95,7 +119,9 @@ pub async fn auth_middleware(
 ) -> Result<Response, ApiError> {
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.identity_mode == AuthIdentityMode::Local {
-        request.extensions_mut().insert(CurrentUser::local_default());
+        request
+            .extensions_mut()
+            .insert(state.local_user_override.clone().unwrap_or_else(CurrentUser::local_default));
         return Ok(next.run(request).await);
     }
 

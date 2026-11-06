@@ -295,6 +295,53 @@ pub struct UnifiedIncomingMessage {
     pub raw: Option<serde_json::Value>,
 }
 
+/// Formats `(chat_id, thread_id)` into a single addressable target string (`"<chat_id>#<thread_id>"`).
+pub fn format_chat_with_thread(chat_id: &str, thread_id: Option<&str>) -> String {
+    let base = split_chat_and_thread(chat_id).0;
+    match thread_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(tid) => format!("{base}#{tid}"),
+        None => base.to_owned(),
+    }
+}
+
+/// Splits an addressable target string `"<chat_id>#<thread_id>"` into `(chat_id, Some(thread_id))`.
+pub fn split_chat_and_thread(chat_target: &str) -> (&str, Option<&str>) {
+    match chat_target.split_once('#') {
+        Some((chat, tid)) if !tid.trim().is_empty() => (chat.trim(), Some(tid.trim())),
+        Some((chat, _)) => (chat.trim(), None),
+        None => (chat_target.trim(), None),
+    }
+}
+
+impl UnifiedIncomingMessage {
+    /// Extracts Forum Topic / thread ID stored in `raw` metadata if present.
+    pub fn thread_id(&self) -> Option<String> {
+        let raw = self.raw.as_ref()?;
+        if let Some(tid_num) = raw.get("message_thread_id").and_then(serde_json::Value::as_i64) {
+            return Some(tid_num.to_string());
+        }
+        raw.get("message_thread_id")
+            .or_else(|| raw.get("thread_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Extracts platform chat type (e.g. `"private"`, `"group"`, `"supergroup"`).
+    pub fn chat_type(&self) -> Option<&str> {
+        self.raw
+            .as_ref()?
+            .get("chat_type")
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Returns `true` when the message originated from a group/supergroup/channel chat.
+    pub fn is_group_chat(&self) -> bool {
+        matches!(self.chat_type(), Some("group" | "supergroup" | "channel")) || self.chat_id.starts_with('-')
+    }
+}
+
 /// Sender identity from an IM platform.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UnifiedUser {

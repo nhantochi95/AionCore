@@ -7,13 +7,15 @@ use crate::action::{ActionExecutor, MessageResult};
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
 use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig, throttle_ms_for_platform};
-use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
+use crate::types::{
+    ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage, format_chat_with_thread,
+};
 
 /// Orchestrates the full channel message lifecycle.
 ///
 /// Consumes incoming IM messages from `message_rx` and tool confirmation
 /// callbacks from `confirm_rx`, driving the pipeline:
-/// 1. ActionExecutor routing (auth → action/AI dispatch)
+/// 1. ActionExecutor routing (auth -> action/Team bridge/AI dispatch)
 /// 2. For Dispatched: send_to_agent + spawn ChannelStreamRelay
 /// 3. For Action: reply via plugin
 /// 4. Forward tool confirmations to the agent
@@ -37,6 +39,10 @@ impl ChannelOrchestrator {
             session_manager,
             sender,
         }
+    }
+
+    pub fn action_executor(&self) -> &Arc<ActionExecutor> {
+        &self.action_executor
     }
 
     /// Start the message loop. Runs until both channels close.
@@ -65,6 +71,7 @@ impl ChannelOrchestrator {
     async fn handle_message(&self, msg: UnifiedIncomingMessage) {
         let platform = msg.platform;
         let chat_id = msg.chat_id.clone();
+        let reply_chat = format_chat_with_thread(&chat_id, msg.thread_id().as_deref());
         let plugin_id = platform.to_string();
         let text = msg.content.text.clone();
         let message_owner_user_id = msg
@@ -79,9 +86,10 @@ impl ChannelOrchestrator {
 
         tokio::spawn(async move {
             match executor.handle_incoming_message(&msg).await {
+                Ok(MessageResult::Ignored) => {}
                 Ok(MessageResult::Action(response)) => {
                     if let Some(owner_user_id) = message_owner_user_id.as_deref() {
-                        send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await;
+                        send_action_response(&sender, owner_user_id, &plugin_id, &reply_chat, &response).await;
                     } else {
                         warn!("dropping channel action response without owner user");
                     }
@@ -101,7 +109,7 @@ impl ChannelOrchestrator {
                         &text,
                         platform,
                         &plugin_id,
-                        &chat_id,
+                        &reply_chat,
                     )
                     .await;
                 }
@@ -232,6 +240,6 @@ async fn handle_dispatched(
 fn handle_confirm(call_id: &str, value: &str) {
     // Channel conversations use yoloMode which auto-approves everything,
     // so this path is rarely hit. When needed, we can add a
-    // call_id→conversation_id lookup via IWorkerTaskManager.
+    // call_id->conversation_id lookup via IWorkerTaskManager.
     info!(call_id = %call_id, value = %value, "forwarding tool confirmation");
 }

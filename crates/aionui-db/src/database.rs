@@ -189,6 +189,7 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     // needed (and there is no on-disk path we could create one against).
     run_migrations(&pool).await?;
     ensure_system_user(&pool).await?;
+    crate::custom_bridge_schema::ensure_custom_bridge_tables(&pool).await?;
 
     info!("In-memory database initialized");
     Ok(Database { pool })
@@ -305,6 +306,9 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
     ensure_system_user(&pool)
         .await
         .map_err(|e| DatabaseInitError::new("database.seed", e))?;
+    crate::custom_bridge_schema::ensure_custom_bridge_tables(&pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.custom_schema", e))?;
 
     info!("Database initialized at {}", path.display());
     Ok(Database { pool })

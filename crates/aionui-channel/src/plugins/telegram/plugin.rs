@@ -10,12 +10,13 @@ use crate::constants::{TELEGRAM_MAX_RECONNECT_ATTEMPTS, TELEGRAM_MAX_RECONNECT_D
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
-    ActionButton, ActionCategory, ActionContext, BotInfo, MessageContentType, ParseMode, PluginConfig, PluginStatus,
+    ActionButton, ActionCategory, ActionContext, BotInfo, MessageContentType, OutgoingMessageType, ParseMode,
+    PluginConfig, PluginStatus,
     PluginType, UnifiedAction, UnifiedAttachment, UnifiedIncomingMessage, UnifiedMessageContent,
     UnifiedOutgoingMessage, UnifiedUser,
 };
 
-use super::api::TelegramApi;
+use super::api::{SendMediaMultipartParams, TelegramApi};
 use super::types::{
     AnswerCallbackQueryRequest, EditMessageTextRequest, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
     ReplyKeyboardMarkup, ReplyMarkup, SendMessageRequest, TgCallbackQuery, TgMessage,
@@ -172,6 +173,15 @@ impl ChannelPlugin for TelegramPlugin {
         let text = truncate_message(message.text.as_deref().unwrap_or(""), TELEGRAM_MESSAGE_LIMIT);
 
         let parse_mode = message.parse_mode.map(format_parse_mode);
+        let (_, thread_opt) = crate::types::split_chat_and_thread(chat_id);
+        let message_thread_id = thread_opt.and_then(|t| t.parse::<i64>().ok());
+
+        if let Some(media_msg_id) =
+            try_send_local_media(api, chat_id_num, message_thread_id, &message).await?
+        {
+            return Ok(media_msg_id);
+        }
+
         let reply_markup = build_reply_markup(&message);
         let reply_to = message
             .reply_to_message_id
@@ -183,11 +193,25 @@ impl ChannelPlugin for TelegramPlugin {
             text,
             parse_mode,
             reply_to_message_id: reply_to,
+            message_thread_id,
             reply_markup,
             disable_notification: message.silent,
         };
 
-        let sent = api.send_message(&req).await?;
+        let sent = match api.send_message(&req).await {
+            Ok(m) => m,
+            Err(err) if req.parse_mode.is_some() && is_telegram_entity_parse_error(&err) => {
+                warn!(error = %err, "Telegram HTML entity parse failed; retrying with plain text");
+                let mut plain_req = req.clone();
+                plain_req.parse_mode = None;
+                plain_req.text = truncate_message(
+                    &crate::formatter::strip_telegram_html_to_plain(&req.text),
+                    TELEGRAM_MESSAGE_LIMIT,
+                );
+                api.send_message(&plain_req).await?
+            }
+            Err(err) => return Err(err),
+        };
         Ok(sent.message_id.to_string())
     }
 
@@ -219,7 +243,20 @@ impl ChannelPlugin for TelegramPlugin {
             reply_markup,
         };
 
-        api.edit_message_text(&req).await
+        match api.edit_message_text(&req).await {
+            Ok(()) => Ok(()),
+            Err(err) if req.parse_mode.is_some() && is_telegram_entity_parse_error(&err) => {
+                warn!(error = %err, "Telegram edit HTML entity parse failed; retrying with plain text");
+                let mut plain_req = req.clone();
+                plain_req.parse_mode = None;
+                plain_req.text = truncate_message(
+                    &crate::formatter::strip_telegram_html_to_plain(&req.text),
+                    TELEGRAM_MESSAGE_LIMIT,
+                );
+                api.edit_message_text(&plain_req).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn active_user_count(&self) -> usize {
@@ -241,6 +278,14 @@ impl ChannelPlugin for TelegramPlugin {
 
     fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    async fn download_attachment(&self, file_id: &str) -> Result<(Vec<u8>, Option<String>), ChannelError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Telegram plugin not initialized".into()))?;
+        return api.download_file(file_id).await;
     }
 }
 
@@ -388,6 +433,8 @@ async fn handle_callback_query(
         raw: None,
     };
 
+    let mut msg = msg;
+    msg.raw = Some(extract_raw_chat_meta(cb.message.as_ref()));
     let _ = message_tx.send(msg).await;
 
     // Acknowledge the callback query
@@ -434,6 +481,8 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
         raw: None,
     };
 
+    let mut unified = unified;
+    unified.raw = Some(extract_raw_chat_meta(Some(msg)));
     let _ = message_tx.send(unified).await;
 }
 
@@ -546,6 +595,18 @@ struct ParsedCallback {
 
 /// Parse callback_data string `"category:action"` or `"category:action:k=v,k=v"`.
 fn parse_callback_data(data: &str) -> Option<ParsedCallback> {
+    if let Some(token) = data.strip_prefix("t:") {
+        let token = token.trim();
+        if !token.is_empty() {
+            let mut map = std::collections::HashMap::new();
+            map.insert("token".to_owned(), token.to_owned());
+            return Some(ParsedCallback {
+                category: ActionCategory::System,
+                action: "bridge.token".to_owned(),
+                params: Some(map),
+            });
+        }
+    }
     let parts: Vec<&str> = data.splitn(3, ':').collect();
     if parts.len() < 2 {
         return None;
@@ -668,6 +729,9 @@ fn action_category_prefix(action: &str) -> &'static str {
 ///
 /// This is the inverse of [`parse_callback_data`].
 fn format_callback_data(btn: &ActionButton) -> String {
+    if btn.action.starts_with("t:") {
+        return btn.action.clone();
+    }
     let category = action_category_prefix(&btn.action);
     match &btn.params {
         Some(params) if !params.is_empty() => {
@@ -684,6 +748,114 @@ fn format_callback_data(btn: &ActionButton) -> String {
 
 /// Parse a chat_id string to i64.
 fn parse_chat_id(chat_id: &str) -> Result<i64, ChannelError> {
+    let (base, _) = crate::types::split_chat_and_thread(chat_id);
+    base.parse::<i64>()
+        .map_err(|_| ChannelError::InvalidConfig(format!("Invalid chat_id: {chat_id}")))
+}
+
+fn is_telegram_entity_parse_error(err: &ChannelError) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("parse entities") || lower.contains("can't find end of the entity")
+}
+
+fn extract_raw_chat_meta(msg: Option<&TgMessage>) -> serde_json::Value {
+    match msg {
+        Some(m) => {
+            let topic_thread_id = if m.is_topic_message.unwrap_or(false) {
+                m.message_thread_id
+            } else {
+                None
+            };
+            serde_json::json!({
+                "chat_type": m.chat.chat_type,
+                "message_thread_id": topic_thread_id,
+            })
+        }
+        None => serde_json::json!({}),
+    }
+}
+
+async fn try_send_local_media(
+    api: &TelegramApi,
+    chat_id_num: i64,
+    message_thread_id: Option<i64>,
+    message: &UnifiedOutgoingMessage,
+) -> Result<Option<String>, ChannelError> {
+    let (is_photo, local_path_str) = match message.message_type {
+        OutgoingMessageType::Image => match message.image_url.as_deref() {
+            Some(p) if std::path::Path::new(p).is_file() => (true, p),
+            _ => return Ok(None),
+        },
+        OutgoingMessageType::File => match message.file_url.as_deref() {
+            Some(p) if std::path::Path::new(p).is_file() => (false, p),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    let path = std::path::Path::new(local_path_str);
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| ChannelError::MessageSendFailed(format!("Failed to read media file {}: {e}", path.display())))?;
+    let file_name = message
+        .file_name
+        .clone()
+        .or_else(|| path.file_name().and_then(|n| n.to_str()).map(ToOwned::to_owned))
+        .unwrap_or_else(|| if is_photo { "image.png".into() } else { "attachment.bin".into() });
+    let caption = message
+        .text
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_message(s, 1020));
+    let parse_mode = message.parse_mode.map(format_parse_mode);
+    let reply_markup = build_reply_markup(message);
+    let reply_to_message_id = message
+        .reply_to_message_id
+        .as_deref()
+        .and_then(|id| id.parse::<i64>().ok());
+
+    let params = SendMediaMultipartParams {
+        chat_id: chat_id_num,
+        message_thread_id,
+        file_name,
+        bytes,
+        mime_type: None,
+        caption,
+        parse_mode,
+        reply_to_message_id,
+        reply_markup,
+        disable_notification: message.silent,
+    };
+
+    let sent_res = if is_photo {
+        api.send_photo_bytes(params.clone()).await
+    } else {
+        api.send_document_bytes(params.clone()).await
+    };
+
+    let sent = match sent_res {
+        Ok(m) => m,
+        Err(err) if params.parse_mode.is_some() && is_telegram_entity_parse_error(&err) => {
+            let mut plain_params = params;
+            plain_params.parse_mode = None;
+            plain_params.caption = plain_params
+                .caption
+                .as_deref()
+                .map(|c| truncate_message(&crate::formatter::strip_telegram_html_to_plain(c), 1020));
+            if is_photo {
+                api.send_photo_bytes(plain_params).await?
+            } else {
+                api.send_document_bytes(plain_params).await?
+            }
+        }
+        Err(err) => return Err(err),
+    };
+
+    Ok(Some(sent.message_id.to_string()))
+}
+
+#[allow(dead_code)]
+fn legacy_unused_parse_chat_id_anchor(chat_id: &str) -> Result<i64, ChannelError> {
     chat_id
         .parse::<i64>()
         .map_err(|_| ChannelError::InvalidConfig(format!("Invalid chat_id: {chat_id}")))
@@ -1246,6 +1418,8 @@ mod tests {
             video,
             sticker,
             reply_to_message: None,
+            message_thread_id: None,
+            is_topic_message: None,
         }
     }
 }

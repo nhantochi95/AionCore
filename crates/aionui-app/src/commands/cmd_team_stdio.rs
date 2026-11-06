@@ -279,6 +279,82 @@ struct DescribeAssistantParams {
     locale: Option<String>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NotifyUserParams {
+    /// Notification category: milestone, approval_needed, completed, or blocker.
+    kind: String,
+    /// Concise human-readable status message or approval prompt.
+    summary: String,
+    /// Optional absolute file paths inside the team workspace to send to the user.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoomReadParams {
+    /// Optional Shared Room ID or name.
+    #[serde(default)]
+    room_id: Option<String>,
+    /// Maximum recent messages to return.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoomPostParams {
+    /// Optional Shared Room ID or name.
+    #[serde(default)]
+    room_id: Option<String>,
+    /// Message to post in the Shared Room.
+    message: String,
+    /// Optional explicit target team IDs or names to notify.
+    #[serde(default)]
+    mentions: Vec<String>,
+    /// Optional workspace file paths to share.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoomTaskCreateParams {
+    /// Optional Shared Room ID or name.
+    #[serde(default)]
+    room_id: Option<String>,
+    /// Target team ID or display name.
+    to_team: String,
+    /// Short cross-team task title.
+    title: String,
+    /// Detailed cross-team task specification.
+    #[serde(default)]
+    description: Option<String>,
+    /// Cross-team task IDs that must complete before waking the target team.
+    #[serde(default)]
+    blocked_by: Vec<String>,
+    /// Optional workspace file paths to share.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoomTaskUpdateParams {
+    /// Cross-team task ID to update.
+    task_id: String,
+    /// Updated cross-team task status: pending, in_progress, completed, cancelled.
+    #[serde(default)]
+    status: Option<String>,
+    /// Concise deliverable summary.
+    #[serde(default)]
+    result_summary: Option<String>,
+    /// Optional output file paths to publish.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Tool router
 // ---------------------------------------------------------------------------
@@ -441,6 +517,111 @@ impl TeamStdioServer {
         description = "Get detailed information about an assistant before spawning it as a teammate.\n\nReturns the assistant's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more assistants look\nrelevant from the one-line catalog in your system prompt.\n\nUse team_list_assistants to find candidate assistant_id values.\nAfter confirming a match, call team_spawn_agent with the same assistant_id."
     )]
     async fn describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_describe_assistant",
+            &serde_json::json!({ "assistant_id": params.assistant_id, "locale": params.locale }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_notify_user",
+        description = "Proactively notify the human user via Telegram/external channels with a concise progress milestone, approval request, blocker alert, or completion report, optionally attaching workspace output files. Lead only."
+    )]
+    async fn notify_user(&self, Parameters(params): Parameters<NotifyUserParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_notify_user",
+            &serde_json::json!({
+                "kind": params.kind,
+                "summary": params.summary,
+                "files": params.files,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_room_read",
+        description = "Read recent messages and cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only."
+    )]
+    async fn room_read(&self, Parameters(params): Parameters<RoomReadParams>) -> CallToolResult {
+        let mut args = serde_json::Map::new();
+        if let Some(room_id) = params.room_id {
+            args.insert("room_id".into(), serde_json::Value::String(room_id));
+        }
+        if let Some(limit) = params.limit {
+            args.insert("limit".into(), serde_json::json!(limit));
+        }
+        self.forward_to_tcp("team_room_read", &serde_json::Value::Object(args))
+            .await
+    }
+
+    #[tool(
+        name = "team_room_post",
+        description = "Post a message, handoff summary, or shared workspace artifacts to a Multi-Team Shared Room, optionally mentioning @TeamName to trigger another team's Leader. Lead only."
+    )]
+    async fn room_post(&self, Parameters(params): Parameters<RoomPostParams>) -> CallToolResult {
+        let mut args = serde_json::Map::new();
+        if let Some(room_id) = params.room_id {
+            args.insert("room_id".into(), serde_json::Value::String(room_id));
+        }
+        args.insert("message".into(), serde_json::Value::String(params.message));
+        if !params.mentions.is_empty() {
+            args.insert("mentions".into(), serde_json::json!(params.mentions));
+        }
+        if !params.files.is_empty() {
+            args.insert("files".into(), serde_json::json!(params.files));
+        }
+        self.forward_to_tcp("team_room_post", &serde_json::Value::Object(args))
+            .await
+    }
+
+    #[tool(
+        name = "team_room_task_create",
+        description = "Create a cross-team task in a Multi-Team Shared Room assigned to another participating Team's Leader, with optional blocked_by dependencies and shared artifact files. Lead only."
+    )]
+    async fn room_task_create(&self, Parameters(params): Parameters<RoomTaskCreateParams>) -> CallToolResult {
+        let mut args = serde_json::Map::new();
+        if let Some(room_id) = params.room_id {
+            args.insert("room_id".into(), serde_json::Value::String(room_id));
+        }
+        args.insert("to_team".into(), serde_json::Value::String(params.to_team));
+        args.insert("title".into(), serde_json::Value::String(params.title));
+        if let Some(desc) = params.description {
+            args.insert("description".into(), serde_json::Value::String(desc));
+        }
+        if !params.blocked_by.is_empty() {
+            args.insert("blocked_by".into(), serde_json::json!(params.blocked_by));
+        }
+        if !params.files.is_empty() {
+            args.insert("files".into(), serde_json::json!(params.files));
+        }
+        self.forward_to_tcp("team_room_task_create", &serde_json::Value::Object(args))
+            .await
+    }
+
+    #[tool(
+        name = "team_room_task_update",
+        description = "Update the status, result summary, or output artifacts of a cross-team task in a Shared Room. Marking completed automatically unblocks and wakes dependent teams. Lead only."
+    )]
+    async fn room_task_update(&self, Parameters(params): Parameters<RoomTaskUpdateParams>) -> CallToolResult {
+        let mut args = serde_json::Map::new();
+        args.insert("task_id".into(), serde_json::Value::String(params.task_id));
+        if let Some(status) = params.status {
+            args.insert("status".into(), serde_json::Value::String(status));
+        }
+        if let Some(summary) = params.result_summary {
+            args.insert("result_summary".into(), serde_json::Value::String(summary));
+        }
+        if !params.files.is_empty() {
+            args.insert("files".into(), serde_json::json!(params.files));
+        }
+        self.forward_to_tcp("team_room_task_update", &serde_json::Value::Object(args))
+            .await
+    }
+
+    #[allow(dead_code)]
+    async fn _placeholder_unused(&self, params: DescribeAssistantParams) -> CallToolResult {
         self.forward_to_tcp(
             "team_describe_assistant",
             &serde_json::json!({ "assistant_id": params.assistant_id, "locale": params.locale }),
@@ -871,7 +1052,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
+        assert_eq!(tools.len(), 18, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()

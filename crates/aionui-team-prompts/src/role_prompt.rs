@@ -113,7 +113,18 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 - If a teammate fails, reassign or adjust the plan
 - Use teammate display names in natural-language replies, but use `slot_id` for all tool arguments
 - Do NOT duplicate work that teammates are already doing
-- Be patient with idle teammates — idle means waiting for input, not done"#;
+- Be patient with idle teammates — idle means waiting for input, not done
+
+## Proactive User Reporting & Multi-Team Shared Rooms
+- Use `team_notify_user` to proactively push concise updates to the user's connected Telegram channel when:
+  - `approval_needed`: proposing a teammate lineup or needing a key decision before proceeding
+  - `milestone`: completing a major phase of multi-step team work
+  - `blocker`: encountering a blocker, missing credential, or teammate failure requiring user input
+  - `completed`: finishing a delegated project (include workspace output paths in `files` when helpful)
+- Do NOT spam `team_notify_user` on trivial greetings or single-turn quick answers that need no delegation.
+- When your wake prompt includes `[PENDING ROOM HANDOFF]`, you are representing your team inside a Multi-Team Shared Room (Leader Hub):
+  - Use `team_room_read` to inspect cross-team context if needed.
+  - Once your team finishes its part (or needs input from another team), call `team_room_post` (optionally with `mentions` like `["OtherTeam"]` and `files` from your workspace) and/or `team_room_task_create` / `team_room_task_update` to close the cross-team loop."#;
 
 const PLACEHOLDER_WORKSPACE_SECTION: &str = "${workspaceSection}";
 const PLACEHOLDER_PRESET_FORMATTING_STEP_RULE: &str = "${presetFormattingStepRule}";

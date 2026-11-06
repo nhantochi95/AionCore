@@ -431,6 +431,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "dashmap",
  "dirs",
  "dunce",
  "futures-util",

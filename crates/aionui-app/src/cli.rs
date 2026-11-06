@@ -214,6 +214,24 @@ pub(crate) enum TeamCommand {
     RenameAgent,
     ClearAgentContext,
     ShutdownAgent,
+    NotifyUser,
+    Room(TeamRoomArgs),
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TeamRoomArgs {
+    #[command(subcommand)]
+    pub command: TeamRoomCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TeamRoomCommand {
+    Read,
+    Post,
+    TaskCreate,
+    TaskUpdate,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }

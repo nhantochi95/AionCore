@@ -44,7 +44,7 @@ use crate::member_runtime::{
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
+    TeamAssistantCatalogPort, TeamExternalBridgePort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -185,6 +185,7 @@ pub struct TeamSessionService {
     /// Stored as `Weak` so the session map does not create a strong cycle with
     /// the service that owns it. Set once during [`TeamSessionService::new`]
     /// via [`Arc::new_cyclic`].
+    external_bridge: Arc<std::sync::OnceLock<Arc<dyn TeamExternalBridgePort>>>,
     self_ref: Weak<TeamSessionService>,
 }
 
@@ -305,6 +306,7 @@ impl TeamSessionService {
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
+            external_bridge: Arc::new(std::sync::OnceLock::new()),
             self_ref: weak.clone(),
         })
     }
@@ -516,6 +518,18 @@ impl TeamSessionService {
             .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
+    }
+
+    pub fn set_external_bridge(&self, bridge: Arc<dyn TeamExternalBridgePort>) {
+        let _ = self.external_bridge.set(bridge);
+    }
+
+    pub fn external_bridge(&self) -> Option<&Arc<dyn TeamExternalBridgePort>> {
+        self.external_bridge.get()
+    }
+
+    pub async fn resolve_team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
+        self.team_owner_user_id(team_id).await
     }
 
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {

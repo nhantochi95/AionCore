@@ -44,6 +44,7 @@ pub struct ChannelRouterState {
     pub plugin_factory: Arc<PluginFactory>,
     pub settings_service: Arc<ChannelSettingsService>,
     pub extension_registry: ExtensionRegistry,
+    pub team_bridge: Arc<std::sync::OnceLock<Arc<dyn crate::team_bridge::ChannelTeamBridgePort>>>,
 }
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
@@ -117,6 +118,12 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
             put(set_channel_default_model_setting),
         )
         .route("/api/channel/settings/sync", post(sync_channel_settings))
+        // Team <-> Telegram bridge bindings
+        .route("/api/channel/team-bindings", get(list_team_bindings))
+        .route(
+            "/api/channel/team-bindings/{team_id}",
+            get(get_team_binding).put(upsert_team_binding).delete(delete_team_binding),
+        )
         .with_state(state)
 }
 
@@ -676,6 +683,68 @@ async fn sync_channel_settings(
         message: Some(format!("Sessions cleared for {}", req.platform)),
         error: None,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Team <-> Telegram bridge binding handlers
+// ---------------------------------------------------------------------------
+
+impl ChannelRouterState {
+    pub fn set_team_bridge(&self, bridge: Arc<dyn crate::team_bridge::ChannelTeamBridgePort>) {
+        let _ = self.team_bridge.set(bridge);
+    }
+
+    fn require_team_bridge(&self) -> Result<&Arc<dyn crate::team_bridge::ChannelTeamBridgePort>, ApiError> {
+        self.team_bridge
+            .get()
+            .ok_or_else(|| ApiError::Internal("Team channel bridge is not initialized".into()))
+    }
+}
+
+/// `GET /api/channel/team-bindings` — list Telegram bridge settings for all Teams.
+async fn list_team_bindings(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<crate::team_bridge::TeamTelegramBridgeConfigDto>>>, ApiError> {
+    let bridge = state.require_team_bridge()?;
+    let items = bridge.list_team_bridge_configs(&user.id).await?;
+    Ok(Json(ApiResponse::ok(items)))
+}
+
+/// `GET /api/channel/team-bindings/{team_id}` — get Telegram bridge settings for one Team.
+async fn get_team_binding(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(team_id): Path<String>,
+) -> Result<Json<ApiResponse<crate::team_bridge::TeamTelegramBridgeConfigDto>>, ApiError> {
+    let bridge = state.require_team_bridge()?;
+    let cfg = bridge.get_team_bridge_config(&user.id, &team_id).await?;
+    Ok(Json(ApiResponse::ok(cfg)))
+}
+
+/// `PUT /api/channel/team-bindings/{team_id}` — update Telegram bridge settings for one Team.
+async fn upsert_team_binding(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(team_id): Path<String>,
+    body: Result<Json<crate::team_bridge::UpsertTeamTelegramBridgeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<crate::team_bridge::TeamTelegramBridgeConfigDto>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let bridge = state.require_team_bridge()?;
+    let cfg = bridge.upsert_team_bridge_config(&user.id, &team_id, req).await?;
+    Ok(Json(ApiResponse::ok(cfg)))
+}
+
+/// `DELETE /api/channel/team-bindings/{team_id}` — remove Group/Topic binding for one Team.
+async fn delete_team_binding(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(team_id): Path<String>,
+) -> Result<Json<ApiResponse<crate::team_bridge::TeamTelegramBridgeConfigDto>>, ApiError> {
+    let bridge = state.require_team_bridge()?;
+    let cfg = bridge.delete_team_group_binding(&user.id, &team_id).await?;
+    Ok(Json(ApiResponse::ok(cfg)))
 }
 
 // ---------------------------------------------------------------------------

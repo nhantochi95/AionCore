@@ -36,8 +36,6 @@ fn slack_combined() {
     assert_eq!(out, "See *<https://x.io|link>* now");
 }
 
-// Regression guard: Slack must no longer fall through to the bare HTML-escape
-// branch (which left markdown bold/links unconverted).
 #[test]
 fn slack_not_plain_escape_fallback() {
     let out = format_text_for_platform("**x**", PluginType::Slack);
@@ -45,10 +43,40 @@ fn slack_not_plain_escape_fallback() {
     assert_eq!(out, "*x*");
 }
 
-// Discord renders markdown natively — text passes through unchanged (no HTML
-// escaping of `<`, `>`, `&`; the old fallback would have mangled them).
 #[test]
 fn discord_passes_markdown_through_unchanged() {
     let input = "**bold** _i_ `code` <@123> a < b & c";
     assert_eq!(format_text_for_platform(input, PluginType::Discord), input);
+}
+
+#[test]
+fn telegram_converts_gfm_table_and_preserves_snake_case_code() {
+    let md = "\
+### Đề xuất đội hình
+| Vai trò | Assistant | Nhiệm vụ |
+| --- | --- | --- |
+| Backend | `claude_code` | Viết `team_notify_user` |
+| QA | `codex_cli` | Chạy `cargo_test` |";
+
+    let html = format_text_for_platform(md, PluginType::Telegram);
+    assert!(html.contains("<b>Đề xuất đội hình</b>"));
+    assert!(html.contains("▸ <b>Vai trò:</b> Backend"));
+    assert!(html.contains("<code>claude_code</code>"));
+    assert!(html.contains("<code>team_notify_user</code>"));
+    assert!(!html.contains("| --- |"));
+}
+
+#[test]
+fn telegram_chunking_balances_pre_code_blocks() {
+    let long_code = "let x = 1;\n".repeat(60);
+    let html = markdown_to_telegram_html(&format!("Intro\n```rust\n{long_code}```\nOutro"));
+    let chunks = chunk_telegram_html(&html, 300);
+    assert!(chunks.len() >= 2);
+    for chunk in &chunks {
+        assert_eq!(
+            chunk.matches("<pre><code>").count(),
+            chunk.matches("</code></pre>").count(),
+            "unbalanced <pre><code> in chunk: {chunk}"
+        );
+    }
 }

@@ -8,7 +8,7 @@ use aionui_api_types::{
 };
 use serde_json::{Value, json};
 
-use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand};
+use crate::cli::{TeamArgs, TeamCommand, TeamRoomCommand, TeamTaskCommand};
 use crate::commands::team_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -60,6 +60,14 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
         TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"]).await,
         TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
+        TeamCommand::NotifyUser => call_tool(vec!["notify-user"]).await,
+        TeamCommand::Room(room) => match room.command {
+            TeamRoomCommand::Read => call_tool(vec!["room", "read"]).await,
+            TeamRoomCommand::Post => call_tool(vec!["room", "post"]).await,
+            TeamRoomCommand::TaskCreate => call_tool(vec!["room", "task-create"]).await,
+            TeamRoomCommand::TaskUpdate => call_tool(vec!["room", "task-update"]).await,
+            TeamRoomCommand::Unknown(path) => Err(unknown_command("team room", path, "unknown team room command")),
+        },
         TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }
 }

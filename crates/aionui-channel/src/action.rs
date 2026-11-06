@@ -16,6 +16,9 @@ use crate::types::{
 /// back to the IM platform.
 #[derive(Debug, Clone)]
 pub enum MessageResult {
+    /// Message was silently ignored (e.g. unauthorized user in a group chat)
+    /// or already handled directly by the Team/Shared-Room bridge.
+    Ignored,
     /// An action response to send/edit on the platform.
     Action(ActionResponse),
     /// Message was dispatched to the AI Agent. The caller should send
@@ -38,6 +41,7 @@ pub enum MessageResult {
 /// 2. Routed to an action handler (button callback)
 /// 3. Dispatched to the AI Agent (text message)
 pub struct ActionExecutor {
+    team_bridge: std::sync::OnceLock<Arc<dyn crate::team_bridge::ChannelTeamBridgePort>>,
     pairing: Arc<PairingService>,
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
@@ -55,8 +59,13 @@ impl ActionExecutor {
             pairing,
             session_mgr,
             settings,
+            team_bridge: std::sync::OnceLock::new(),
             owner_user_id,
         }
+    }
+
+    pub fn set_team_bridge(&self, bridge: Arc<dyn crate::team_bridge::ChannelTeamBridgePort>) {
+        let _ = self.team_bridge.set(bridge);
     }
 
     pub fn owner_user_id(&self) -> Option<&str> {
@@ -87,6 +96,14 @@ impl ActionExecutor {
 
         let internal_user_id = match internal_user_id {
             Some(id) => id,
+            None if msg.is_group_chat() => {
+                debug!(
+                    user_id = %user_id,
+                    chat_id = %chat_id,
+                    "silently ignoring unauthorized sender in group chat"
+                );
+                return Ok(MessageResult::Ignored);
+            }
             None => {
                 let response = self
                     .handle_unauthorized(owner_user_id, user_id, &platform_type, &msg.user.display_name)
@@ -97,8 +114,34 @@ impl ActionExecutor {
 
         // 2. Button callback → action routing
         if let Some(action) = &msg.action {
+            if action.action == "bridge.token"
+                && let Some(bridge) = self.team_bridge.get()
+            {
+                let token = action
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("token"))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let response = bridge
+                    .handle_bridge_token(owner_user_id, token, &action.context, msg.raw.as_ref())
+                    .await?;
+                return Ok(MessageResult::Action(response));
+            }
             let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
             return Ok(MessageResult::Action(response));
+        }
+
+        // 2b. Team / Shared-Room bridge routing (commands, reply-routes, group/topic bindings, active DM target)
+        if let Some(bridge) = self.team_bridge.get() {
+            if let Some((command, args)) = parse_slash_command(&msg.content.text)
+                && let Some(response) = bridge.handle_bridge_command(owner_user_id, msg, command, args).await?
+            {
+                return Ok(MessageResult::Action(response));
+            }
+            if bridge.try_dispatch_to_target(owner_user_id, msg).await? {
+                return Ok(MessageResult::Ignored);
+            }
         }
 
         // 3. Text message → session resolution → AI dispatch
@@ -447,6 +490,26 @@ impl ActionExecutor {
 }
 
 // ── Helper builders ─────────────────────────────────────────────────
+
+fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let (cmd_token, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((c, r)) => (c, r.trim()),
+        None => (trimmed, ""),
+    };
+    let cmd_without_slash = cmd_token.trim_start_matches('/');
+    let cmd_name = cmd_without_slash
+        .split_once('@')
+        .map(|(name, _bot)| name)
+        .unwrap_or(cmd_without_slash);
+    if cmd_name.is_empty() {
+        return None;
+    }
+    Some((cmd_name, rest))
+}
 
 fn build_pairing_response(code: &str) -> ActionResponse {
     ActionResponse {
@@ -1285,5 +1348,30 @@ mod tests {
         let resp = build_unknown_action_response("foo.bar");
         let text = resp.text.unwrap();
         assert!(text.contains("foo.bar"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_group_chat_message_is_silently_ignored_without_pairing_code() {
+        let (executor, repo) = setup();
+        let mut msg = make_text_message("stranger_99", "-100123456789", "hello everyone", PluginType::Telegram);
+        msg.raw = Some(serde_json::json!({ "chat_type": "supergroup", "message_thread_id": 12 }));
+
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+        assert!(matches!(result, MessageResult::Ignored));
+        assert!(
+            repo.pairings.lock().unwrap().is_empty(),
+            "unauthorized group messages must NEVER create pairing codes"
+        );
+    }
+
+    #[test]
+    fn parse_slash_command_handles_bot_username_and_args() {
+        assert_eq!(parse_slash_command("/team NhanTown"), Some(("team", "NhanTown")));
+        assert_eq!(
+            parse_slash_command("/status@MyAionBot   now "),
+            Some(("status", "now"))
+        );
+        assert_eq!(parse_slash_command("/solo"), Some(("solo", "")));
+        assert_eq!(parse_slash_command("hello /team"), None);
     }
 }

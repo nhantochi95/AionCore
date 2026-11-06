@@ -143,6 +143,7 @@ pub struct ModuleStates {
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
+    pub shared_room: crate::bridge::SharedRoomRouterState,
     pub session_message: SessionMessageRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
@@ -297,6 +298,35 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    let team_state = build_module_state_phase(&boot, "team", || {
+        build_team_state(
+            services,
+            Some(cron.cron_service.clone()),
+            backend_binary_path.clone(),
+            assistant.service.clone(),
+        )
+    });
+    let bridge_repo = Arc::new(aionui_db::SqliteCustomBridgeRepository::new(pool.clone()));
+    let hub_provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let telegram_team_hub = crate::bridge::TelegramTeamHub::new(
+        bridge_repo,
+        channel_state.repo.clone(),
+        channel_state.manager.clone(),
+        team_state.service.clone(),
+        services.conversation_repo.clone(),
+        hub_provider_repo,
+        services.event_bus.clone(),
+        encryption_key,
+        services.data_dir.clone(),
+    );
+    telegram_team_hub.spawn_event_watcher();
+    let _ = channel_state.team_bridge.set(telegram_team_hub.clone());
+    channel_components
+        .orchestrator
+        .action_executor()
+        .set_team_bridge(telegram_team_hub.clone());
+    team_state.service.set_external_bridge(telegram_team_hub.clone());
+
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
@@ -320,14 +350,11 @@ pub async fn build_module_states(
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_module_state_phase(&boot, "team", || {
-            build_team_state(
-                services,
-                Some(cron.cron_service.clone()),
-                backend_binary_path.clone(),
-                assistant.service.clone(),
-            )
-        }),
+        team: team_state,
+        shared_room: crate::bridge::SharedRoomRouterState {
+            hub: telegram_team_hub,
+            event_bus: services.event_bus.clone(),
+        },
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
@@ -484,7 +511,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
     let client_pref_service = if services.identity_mode.is_local() {
-        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
+        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, &services.local_user.id)
     } else {
         ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
     };
@@ -743,6 +770,9 @@ async fn build_channel_message_service(
 }
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
+    if services.local && services.local_user.id != "system_default_user" {
+        return Some(services.local_user.id.clone());
+    }
     if services.identity_mode == IdentityMode::AionPro {
         return None;
     }
@@ -820,6 +850,7 @@ pub async fn build_channel_state(
         plugin_factory: Arc::clone(&plugin_factory),
         settings_service: channel_settings,
         extension_registry,
+        team_bridge: Arc::new(std::sync::OnceLock::new()),
     };
 
     let components = ChannelOrchestratorComponents {
@@ -1150,7 +1181,13 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
             manager: services.ws_manager.clone(),
             router,
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
+            token_user_resolver: {
+                let local_user_id = services.local_user.id.clone();
+                Arc::new(move |_| {
+                    let id = local_user_id.clone();
+                    Box::pin(async move { Some(id) })
+                })
+            },
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }

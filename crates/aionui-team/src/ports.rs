@@ -9,6 +9,66 @@ use async_trait::async_trait;
 
 use crate::error::TeamError;
 
+/// External bridge port allowing `TeamSessionService` and MCP/CLI tool dispatch
+/// to notify connected user channels (e.g. Telegram) and collaborate in
+/// Multi-Team Shared Rooms without coupling `aionui-team` to `aionui-channel`.
+#[async_trait]
+pub trait TeamExternalBridgePort: Send + Sync {
+    async fn notify_user(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        kind: &str,
+        summary: &str,
+        files: Vec<String>,
+    ) -> Result<serde_json::Value, String>;
+
+    async fn room_read(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        room_id: Option<&str>,
+        limit: usize,
+    ) -> Result<serde_json::Value, String>;
+
+    async fn room_post(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        room_id: Option<&str>,
+        message: &str,
+        mentions: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<serde_json::Value, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn room_task_create(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        room_id: Option<&str>,
+        to_team: &str,
+        title: &str,
+        description: Option<&str>,
+        blocked_by: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<serde_json::Value, String>;
+
+    async fn room_task_update(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        status: Option<&str>,
+        result_summary: Option<&str>,
+        files: Vec<String>,
+    ) -> Result<serde_json::Value, String>;
+
+    async fn pending_room_handoff_banner(&self, user_id: &str, team_id: &str) -> Option<String>;
+
+    fn on_team_delegation(&self, team_id: &str);
+}
+
 /// Resolves Team tool capability without exposing backend-specific descriptors
 /// or persisted handshake shapes to the Team domain.
 #[async_trait]

@@ -441,7 +441,14 @@ impl TeamSession {
                         .unwrap_or_default();
                     (command, false)
                 } else {
-                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let mut wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    if agent.role == TeammateRole::Lead
+                        && let Some(svc) = self.service.upgrade()
+                        && let Some(ext) = svc.external_bridge()
+                        && let Some(handoff_banner) = ext.pending_room_handoff_banner(&self.user_id, &self.team.id).await
+                    {
+                        wake_body = format!("{handoff_banner}\n\n{wake_body}");
+                    }
                     let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                     let first_message = if needs_role_prompt {
                         let tool_transport = self.team_tool_transport_for_agent(&agent).await?;

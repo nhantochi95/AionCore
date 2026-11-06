@@ -78,6 +78,11 @@ pub enum TeamToolName {
     TeamRenameAgent,
     TeamClearAgentContext,
     TeamShutdownAgent,
+    TeamNotifyUser,
+    TeamRoomRead,
+    TeamRoomPost,
+    TeamRoomTaskCreate,
+    TeamRoomTaskUpdate,
 }
 
 impl TeamToolName {
@@ -96,6 +101,11 @@ impl TeamToolName {
             Self::TeamRenameAgent => "team_rename_agent",
             Self::TeamClearAgentContext => "team_clear_agent_context",
             Self::TeamShutdownAgent => "team_shutdown_agent",
+            Self::TeamNotifyUser => "team_notify_user",
+            Self::TeamRoomRead => "team_room_read",
+            Self::TeamRoomPost => "team_room_post",
+            Self::TeamRoomTaskCreate => "team_room_task_create",
+            Self::TeamRoomTaskUpdate => "team_room_task_update",
         }
     }
 
@@ -114,6 +124,11 @@ impl TeamToolName {
             "team_rename_agent" => Self::TeamRenameAgent,
             "team_clear_agent_context" => Self::TeamClearAgentContext,
             "team_shutdown_agent" => Self::TeamShutdownAgent,
+            "team_notify_user" => Self::TeamNotifyUser,
+            "team_room_read" => Self::TeamRoomRead,
+            "team_room_post" => Self::TeamRoomPost,
+            "team_room_task_create" => Self::TeamRoomTaskCreate,
+            "team_room_task_update" => Self::TeamRoomTaskUpdate,
             _ => return None,
         })
     }
@@ -567,6 +582,165 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             when: "Shut down teammate",
             input_summary: "slot_id, optional reason",
         },
+        TeamToolSpec {
+            name: TeamToolName::TeamNotifyUser,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Proactively notify the human user via Telegram/external channels with a concise progress milestone, approval request, blocker alert, or completion report, optionally attaching workspace output files. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["milestone", "approval_needed", "completed", "blocker"],
+                        "description": "Notification category: milestone, approval_needed, completed, or blocker"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Concise human-readable status message or approval prompt"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional absolute paths inside the team workspace or shared artifacts to send to the user"
+                    }
+                },
+                "required": ["kind", "summary"]
+            }),
+            cli_command: &["notify-user"],
+            when: "Report milestone/approval/blocker/result to user",
+            input_summary: "kind, summary, optional files",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamRoomRead,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Read recent messages and cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "room_id": {
+                        "type": "string",
+                        "description": "Optional Shared Room ID or name; defaults to the active pending handoff room or single joined room"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum recent messages to return (default 30, max 100)"
+                    }
+                }
+            }),
+            cli_command: &["room", "read"],
+            when: "Read shared room messages/tasks",
+            input_summary: "optional room_id, limit",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamRoomPost,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Post a message, handoff summary, or shared workspace artifacts to a Multi-Team Shared Room, optionally mentioning @TeamName to trigger another team's Leader. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "room_id": {
+                        "type": "string",
+                        "description": "Optional Shared Room ID or name; defaults to the active pending handoff room or single joined room"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message to post in the Shared Room (may include @TeamName or @all)"
+                    },
+                    "mentions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional explicit target team IDs or names to notify"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional absolute file paths inside the team workspace to stage into Shared Room artifacts and copy to recipient .shared-inbox/"
+                    }
+                },
+                "required": ["message"]
+            }),
+            cli_command: &["room", "post"],
+            when: "Post update/handoff to shared room",
+            input_summary: "message, optional room_id/mentions/files",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamRoomTaskCreate,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Create a cross-team task in a Multi-Team Shared Room assigned to another participating Team's Leader, with optional blocked_by dependencies and shared artifact files. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "room_id": {
+                        "type": "string",
+                        "description": "Optional Shared Room ID or name"
+                    },
+                    "to_team": {
+                        "type": "string",
+                        "description": "Target team ID or display name"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short cross-team task title"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed cross-team task specification and acceptance criteria"
+                    },
+                    "blocked_by": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Cross-team task IDs that must complete before waking the target team"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional workspace files to attach and sync to the target team's .shared-inbox/"
+                    }
+                },
+                "required": ["to_team", "title"]
+            }),
+            cli_command: &["room", "task-create"],
+            when: "Assign cross-team task in shared room",
+            input_summary: "to_team, title, optional room_id/description/blocked_by/files",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamRoomTaskUpdate,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Update the status, result summary, or output artifacts of a cross-team task in a Shared Room. Marking completed automatically unblocks and wakes dependent teams. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Cross-team task ID to update"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "cancelled"],
+                        "description": "Updated cross-team task status"
+                    },
+                    "result_summary": {
+                        "type": "string",
+                        "description": "Concise deliverable summary when reporting progress or completion"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional output files to publish to Shared Room artifacts and downstream .shared-inbox/"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+            cli_command: &["room", "task-update"],
+            when: "Update cross-team room task",
+            input_summary: "task_id, optional status/result_summary/files",
+        },
     ]
 }
 
@@ -578,7 +752,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 13);
+        assert_eq!(descriptors.len(), 18);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -614,6 +788,11 @@ mod tests {
             ("team_rename_agent", vec!["rename-agent"]),
             ("team_clear_agent_context", vec!["clear-agent-context"]),
             ("team_shutdown_agent", vec!["shutdown-agent"]),
+            ("team_notify_user", vec!["notify-user"]),
+            ("team_room_read", vec!["room", "read"]),
+            ("team_room_post", vec!["room", "post"]),
+            ("team_room_task_create", vec!["room", "task-create"]),
+            ("team_room_task_update", vec!["room", "task-update"]),
         ];
         for (tool, path) in cases {
             assert_eq!(cli_command_for_tool(tool), Some(path.as_slice()));
@@ -633,6 +812,11 @@ mod tests {
         assert!(!names.contains(&"team_clear_agent_context".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
         assert!(!names.contains(&"team_interrupt_agent".to_owned()));
+        assert!(!names.contains(&"team_notify_user".to_owned()));
+        assert!(!names.contains(&"team_room_read".to_owned()));
+        assert!(!names.contains(&"team_room_post".to_owned()));
+        assert!(!names.contains(&"team_room_task_create".to_owned()));
+        assert!(!names.contains(&"team_room_task_update".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
     }
@@ -695,5 +879,16 @@ mod tests {
         let required = descriptor.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("name")));
         assert!(required.contains(&json!("assistant_id")));
+    }
+
+    #[test]
+    fn notify_and_room_tools_are_lead_only_with_strict_schemas() {
+        let notify = team_tool_descriptor("team_notify_user").expect("notify descriptor");
+        assert_eq!(notify.permission, TeamToolPermission::LeadOnly);
+        assert_eq!(notify.input_schema["required"], json!(["kind", "summary"]));
+
+        let room_post = team_tool_descriptor("team_room_post").expect("room_post descriptor");
+        assert_eq!(room_post.permission, TeamToolPermission::LeadOnly);
+        assert_eq!(room_post.input_schema["required"], json!(["message"]));
     }
 }

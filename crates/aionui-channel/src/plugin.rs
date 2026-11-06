@@ -77,6 +77,13 @@ pub trait ChannelPlugin: Send + Sync {
 
     /// The most recent error message, if status is `Error`.
     fn last_error(&self) -> Option<&str>;
+
+    /// Download a platform attachment by `file_id`, returning `(bytes, remote_file_path_hint)`.
+    async fn download_attachment(&self, _file_id: &str) -> Result<(Vec<u8>, Option<String>), ChannelError> {
+        Err(ChannelError::PlatformApi(
+            "Attachment download is not supported by this plugin".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -22,8 +22,10 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    ClearAgentContextInput, InterruptAgentInput, ReadMessagesInput, RenameAgentInput, SendMessageInput,
-    ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput, TaskListStatusInput, TaskUpdateInput,
+
+    ClearAgentContextInput, InterruptAgentInput, NotifyUserInput, ReadMessagesInput, RenameAgentInput, RoomPostInput,
+    RoomReadInput, RoomTaskCreateInput, RoomTaskUpdateInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput,
+    TaskCreateInput, TaskListInput, TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -522,6 +524,17 @@ pub(crate) async fn dispatch_tool(
 ) -> Result<String, ToolCallError> {
     super::tools::authorize_tool(caller_role, tool_name).map_err(ToolCallError::from_message)?;
 
+    if caller_role == TeammateRole::Lead
+        && matches!(
+            tool_name,
+            "team_send_message" | "team_spawn_agent" | "team_task_create" | "team_interrupt_agent"
+        )
+        && let Some(svc) = service.upgrade()
+        && let Some(ext) = svc.external_bridge()
+    {
+        ext.on_team_delegation(team_id);
+    }
+
     match tool_name {
         "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
@@ -540,6 +553,11 @@ pub(crate) async fn dispatch_tool(
         }
         "team_list_assistants" => exec_list_assistants(arguments, service, team_id).await,
         "team_describe_assistant" => exec_describe_assistant(arguments, service, team_id).await,
+        "team_notify_user" => exec_notify_user(arguments, service, team_id, caller_role).await,
+        "team_room_read" => exec_room_read(arguments, service, team_id, caller_role).await,
+        "team_room_post" => exec_room_post(arguments, service, team_id, caller_role).await,
+        "team_room_task_create" => exec_room_task_create(arguments, service, team_id, caller_role).await,
+        "team_room_task_update" => exec_room_task_update(arguments, service, team_id, caller_role).await,
         _ => Err(ToolCallError::from_message(format!("Unknown tool: {tool_name}"))),
     }
 }
@@ -601,6 +619,164 @@ async fn exec_describe_assistant(
 // ---------------------------------------------------------------------------
 // Individual tool handlers
 // ---------------------------------------------------------------------------
+
+async fn resolve_external_bridge_and_user(
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+    tool_name: &str,
+) -> Result<(Arc<dyn crate::ports::TeamExternalBridgePort>, String), ToolCallError> {
+    if caller_role != TeammateRole::Lead {
+        return Err(ToolCallError::from_message(format!("Only Lead can use {tool_name}")));
+    }
+    let svc = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let user_id = svc
+        .team_owner_user_id(team_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    let ext = svc
+        .external_bridge()
+        .cloned()
+        .ok_or_else(|| ToolCallError::from_message("External channel/room bridge is not configured"))?;
+    Ok((ext, user_id))
+}
+
+async fn exec_notify_user(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    let input: NotifyUserInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    if !matches!(
+        input.kind.as_str(),
+        "milestone" | "approval_needed" | "completed" | "blocker"
+    ) {
+        return Err(ToolCallError::from_message(
+            "Invalid params: kind must be milestone, approval_needed, completed, or blocker",
+        ));
+    }
+    if input.summary.trim().is_empty() {
+        return Err(ToolCallError::from_message("Invalid params: summary must not be empty"));
+    }
+    let (ext, user_id) = resolve_external_bridge_and_user(service, team_id, caller_role, "team_notify_user").await?;
+    let value = ext
+        .notify_user(&user_id, team_id, &input.kind, &input.summary, input.files)
+        .await
+        .map_err(ToolCallError::from_message)?;
+    json_text(&value)
+}
+
+async fn exec_room_read(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    let input: RoomReadInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let limit = input.limit.unwrap_or(30).clamp(1, 100);
+    let (ext, user_id) = resolve_external_bridge_and_user(service, team_id, caller_role, "team_room_read").await?;
+    let value = ext
+        .room_read(&user_id, team_id, input.room_id.as_deref(), limit)
+        .await
+        .map_err(ToolCallError::from_message)?;
+    json_text(&value)
+}
+
+async fn exec_room_post(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    let input: RoomPostInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    if input.message.trim().is_empty() {
+        return Err(ToolCallError::from_message("Invalid params: message must not be empty"));
+    }
+    let (ext, user_id) = resolve_external_bridge_and_user(service, team_id, caller_role, "team_room_post").await?;
+    let value = ext
+        .room_post(
+            &user_id,
+            team_id,
+            input.room_id.as_deref(),
+            &input.message,
+            input.mentions,
+            input.files,
+        )
+        .await
+        .map_err(ToolCallError::from_message)?;
+    json_text(&value)
+}
+
+async fn exec_room_task_create(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    let input: RoomTaskCreateInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    if input.to_team.trim().is_empty() || input.title.trim().is_empty() {
+        return Err(ToolCallError::from_message(
+            "Invalid params: to_team and title must not be empty",
+        ));
+    }
+    let (ext, user_id) =
+        resolve_external_bridge_and_user(service, team_id, caller_role, "team_room_task_create").await?;
+    let value = ext
+        .room_task_create(
+            &user_id,
+            team_id,
+            input.room_id.as_deref(),
+            &input.to_team,
+            &input.title,
+            input.description.as_deref(),
+            input.blocked_by,
+            input.files,
+        )
+        .await
+        .map_err(ToolCallError::from_message)?;
+    json_text(&value)
+}
+
+async fn exec_room_task_update(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    let input: RoomTaskUpdateInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    if input.task_id.trim().is_empty() {
+        return Err(ToolCallError::from_message("Invalid params: task_id must not be empty"));
+    }
+    if let Some(status) = input.status.as_deref()
+        && !matches!(status, "pending" | "in_progress" | "completed" | "cancelled")
+    {
+        return Err(ToolCallError::from_message(
+            "Invalid params: status must be pending, in_progress, completed, or cancelled",
+        ));
+    }
+    let (ext, user_id) =
+        resolve_external_bridge_and_user(service, team_id, caller_role, "team_room_task_update").await?;
+    let value = ext
+        .room_task_update(
+            &user_id,
+            team_id,
+            &input.task_id,
+            input.status.as_deref(),
+            input.result_summary.as_deref(),
+            input.files,
+        )
+        .await
+        .map_err(ToolCallError::from_message)?;
+    json_text(&value)
+}
 
 const MAX_INBOX_MESSAGES: usize = 50;
 const MAX_INBOX_CONTENT_CHARS: usize = 4_000;

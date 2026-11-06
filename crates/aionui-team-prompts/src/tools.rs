@@ -57,6 +57,8 @@ mod tests {
         assert!(!names.contains(&"team_spawn_agent".to_owned()));
         assert!(!names.contains(&"team_rename_agent".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+        assert!(!names.contains(&"team_notify_user".to_owned()));
+        assert!(!names.contains(&"team_room_post".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
     }
@@ -89,6 +91,11 @@ mod tests {
                 ("team_rename_agent".to_owned(), TeamToolPermission::LeadOnly),
                 ("team_clear_agent_context".to_owned(), TeamToolPermission::LeadOnly),
                 ("team_shutdown_agent".to_owned(), TeamToolPermission::LeadOnly),
+                ("team_notify_user".to_owned(), TeamToolPermission::LeadOnly),
+                ("team_room_read".to_owned(), TeamToolPermission::LeadOnly),
+                ("team_room_post".to_owned(), TeamToolPermission::LeadOnly),
+                ("team_room_task_create".to_owned(), TeamToolPermission::LeadOnly),
+                ("team_room_task_update".to_owned(), TeamToolPermission::LeadOnly),
             ]
         );
     }

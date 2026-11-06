@@ -135,6 +135,63 @@ pub struct ShutdownAgentInput {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyUserInput {
+    pub kind: String,
+    pub summary: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomReadInput {
+    #[serde(default)]
+    pub room_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomPostInput {
+    #[serde(default)]
+    pub room_id: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomTaskCreateInput {
+    #[serde(default)]
+    pub room_id: Option<String>,
+    pub to_team: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomTaskUpdateInput {
+    pub task_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Built-in backend predicate for spawn_agent (synchronous fast-path).
 // Dynamic capability check (MCP-based) happens in TeamSession::spawn_agent.
@@ -160,8 +217,16 @@ mod tests {
     }
 
     #[test]
+    fn notify_and_room_tools_are_lead_only() {
+        assert!(authorize_tool(TeammateRole::Lead, "team_notify_user").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_notify_user").is_err());
+        assert!(authorize_tool(TeammateRole::Lead, "team_room_post").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_room_post").is_err());
+    }
+
+    #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 13);
+        assert_eq!(all_tool_descriptors().len(), 18);
     }
 
     #[test]
@@ -170,7 +235,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 18);
     }
 
     #[test]

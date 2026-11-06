@@ -59,6 +59,10 @@ pub(crate) struct TgMessage {
     pub video: Option<TgVideo>,
     pub sticker: Option<TgSticker>,
     pub reply_to_message: Option<Box<TgMessage>>,
+    #[serde(default)]
+    pub message_thread_id: Option<i64>,
+    #[serde(default)]
+    pub is_topic_message: Option<bool>,
 }
 
 /// Telegram chat object.
@@ -130,6 +134,15 @@ pub(crate) struct TgSticker {
     pub emoji: Option<String>,
 }
 
+/// Response from `getFile`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TgFile {
+    #[allow(dead_code)]
+    pub file_id: String,
+    pub file_path: Option<String>,
+    pub file_size: Option<u64>,
+}
+
 /// Telegram callback query from inline keyboard button press.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TgCallbackQuery {
@@ -154,6 +167,8 @@ pub(crate) struct SendMessageRequest {
     pub reply_to_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_markup: Option<ReplyMarkup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_thread_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_notification: Option<bool>,
 }
@@ -331,6 +346,7 @@ mod tests {
             parse_mode: Some("HTML".into()),
             reply_to_message_id: None,
             reply_markup: None,
+            message_thread_id: None,
             disable_notification: None,
         };
         let json = serde_json::to_value(&req).unwrap();

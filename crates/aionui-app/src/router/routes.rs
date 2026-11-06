@@ -271,6 +271,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
+        local_user_override: Some(services.local_user.clone()),
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
         })),
@@ -337,6 +338,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Team routes protected by auth middleware
     let team_authenticated =
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let shared_room_authenticated = crate::bridge::shared_room_routes(states.shared_room)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Cron routes protected by auth middleware
     let cron_authenticated =
@@ -415,6 +418,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(skill_runtime)
         .merge(channel_authenticated)
         .merge(team_authenticated)
+        .merge(shared_room_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)

@@ -2,6 +2,7 @@
 
 //! SQLite database layer: init, migrations, repository traits, and implementations.
 mod agent_binding;
+pub mod custom_bridge_schema;
 mod database;
 mod error;
 mod instance_lock;
@@ -63,6 +64,15 @@ pub use repository::{
     SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
+};
+
+pub use custom_bridge_schema::{
+    CUSTOM_BRIDGE_SCHEMA_VERSION, CreateSharedRoomMessageParams, CreateSharedRoomParams, CreateSharedRoomTaskParams,
+    CustomChannelActionTokenRow, CustomChannelBindingRow, CustomChannelDmTargetRow, CustomChannelMsgRouteRow,
+    CustomSharedRoomMemberRow, CustomSharedRoomMessageRow, CustomSharedRoomRow, CustomSharedRoomTaskRow,
+    CustomStreamMode, CustomTargetNotifyPrefRow, CustomTargetType, DEFAULT_ACTION_TOKEN_TTL_MS,
+    SqliteCustomBridgeRepository, UpdateSharedRoomParams, UpdateSharedRoomTaskParams, UpsertChannelBindingParams,
+    ensure_custom_bridge_tables,
 };
 
 // Re-export sqlx pool type for downstream crates
