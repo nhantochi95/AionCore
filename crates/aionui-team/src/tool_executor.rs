@@ -95,6 +95,26 @@ fn team_tool_role(role: TeammateRole) -> TeamToolRole {
     }
 }
 
+pub(crate) async fn execute_sessionless_tool(
+    service: &Weak<TeamSessionService>,
+    context: &TeamToolContext,
+    call: &TeamToolCall,
+) -> Option<Result<Value, TeamToolErrorPayload>> {
+    let tool = call.tool.as_str();
+    let raw = crate::mcp::server::try_dispatch_sessionless_tool(
+        tool,
+        &call.arguments,
+        service,
+        &context.team_id,
+        context.caller_role,
+    )
+    .await?;
+    Some(
+        raw.map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
+            .map_err(map_tool_error),
+    )
+}
+
 fn map_tool_error(error: ToolCallError) -> TeamToolErrorPayload {
     let code = if error.message.starts_with("Unknown tool:") {
         TeamToolErrorCode::UnknownTool

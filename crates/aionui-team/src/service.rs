@@ -2364,8 +2364,17 @@ impl TeamSessionService {
     ) -> Result<serde_json::Value, TeamToolErrorPayload> {
         let scheduler = self
             .get_session_scheduler(&context.team_id)
-            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
-        execute_with_scheduler(&scheduler, &self.self_ref, context, call).await
+            ;
+        if let Some(scheduler) = scheduler {
+            return execute_with_scheduler(&scheduler, &self.self_ref, context, call).await;
+        }
+        if let Some(result) = crate::tool_executor::execute_sessionless_tool(&self.self_ref, context, &call).await {
+            return result;
+        }
+        Err(error_payload(
+            TeamToolErrorCode::TeamNotFound,
+            "active team session not found",
+        ))
     }
 
     #[cfg(test)]

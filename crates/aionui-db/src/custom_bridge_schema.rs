@@ -1165,7 +1165,13 @@ impl SqliteCustomBridgeRepository {
         let name = params.name.unwrap_or(existing.name);
         let description = params.description.unwrap_or(existing.description);
         let rules = params.rules.unwrap_or(existing.rules);
-        let host_team_id = params.host_team_id.unwrap_or(existing.host_team_id);
+        let mut host_team_id = params.host_team_id.unwrap_or(existing.host_team_id);
+        if let Some(ref team_ids) = params.team_ids
+            && let Some(ref hid) = host_team_id
+            && !team_ids.iter().any(|id| id == hid)
+        {
+            host_team_id = team_ids.first().cloned();
+        }
         let max_hops = params.max_hops.unwrap_or(existing.max_hops).max(1);
 
         let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
@@ -1190,11 +1196,25 @@ impl SqliteCustomBridgeRepository {
         .map_err(DbError::Query)?;
 
         if let Some(team_ids) = params.team_ids {
-            sqlx::query("DELETE FROM custom_shared_room_members WHERE room_id = ?")
-                .bind(room_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(DbError::Query)?;
+            let existing_members: Vec<String> = sqlx::query_scalar(
+                "SELECT team_id FROM custom_shared_room_members WHERE room_id = ?",
+            )
+            .bind(room_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+
+            for old_tid in existing_members {
+                if !team_ids.iter().any(|tid| tid == &old_tid) {
+                    sqlx::query("DELETE FROM custom_shared_room_members WHERE room_id = ? AND team_id = ?")
+                        .bind(room_id)
+                        .bind(&old_tid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(DbError::Query)?;
+                }
+            }
+
             for team_id in &team_ids {
                 sqlx::query(
                     r#"
@@ -1257,9 +1277,130 @@ impl SqliteCustomBridgeRepository {
         .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
+        sqlx::query(
+            "DELETE FROM custom_channel_dm_targets WHERE owner_user_id = ? AND target_type = 'room' AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(room_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+        sqlx::query(
+            "DELETE FROM custom_target_notify_prefs WHERE owner_user_id = ? AND target_type = 'room' AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(room_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
 
         tx.commit().await.map_err(DbError::Query)?;
         Ok(true)
+    }
+
+    /// Cleans up all bridge bindings, DM pointers, notify prefs, and Shared Room memberships
+    /// referencing a deleted `team_id`, returning the IDs of any Shared Rooms that were updated.
+    pub async fn cleanup_deleted_team(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, DbError> {
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+
+        sqlx::query(
+            "DELETE FROM custom_target_notify_prefs WHERE owner_user_id = ? AND target_type = 'team' AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        sqlx::query(
+            "DELETE FROM custom_channel_bindings WHERE owner_user_id = ? AND target_type = 'team' AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        sqlx::query(
+            "DELETE FROM custom_channel_dm_targets WHERE owner_user_id = ? AND target_type = 'team' AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        let mut affected_room_ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT r.id
+            FROM custom_shared_rooms r
+            LEFT JOIN custom_shared_room_members m ON m.room_id = r.id
+            WHERE r.owner_user_id = ? AND (m.team_id = ? OR r.host_team_id = ?)
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .bind(team_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+        affected_room_ids.dedup();
+
+        sqlx::query(
+            r#"
+            DELETE FROM custom_shared_room_members
+            WHERE team_id = ? AND room_id IN (SELECT id FROM custom_shared_rooms WHERE owner_user_id = ?)
+            "#,
+        )
+        .bind(team_id)
+        .bind(owner_user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        for rid in &affected_room_ids {
+            let current_host: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT host_team_id FROM custom_shared_rooms WHERE owner_user_id = ? AND id = ?",
+            )
+            .bind(owner_user_id)
+            .bind(rid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+
+            if current_host.flatten().as_deref() == Some(team_id) {
+                let replacement_host: Option<String> = sqlx::query_scalar(
+                    "SELECT team_id FROM custom_shared_room_members WHERE room_id = ? ORDER BY joined_at ASC LIMIT 1",
+                )
+                .bind(rid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+
+                sqlx::query(
+                    "UPDATE custom_shared_rooms SET host_team_id = ?, updated_at = ? WHERE owner_user_id = ? AND id = ?",
+                )
+                .bind(replacement_host)
+                .bind(now)
+                .bind(owner_user_id)
+                .bind(rid)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+            } else {
+                sqlx::query("UPDATE custom_shared_rooms SET updated_at = ? WHERE owner_user_id = ? AND id = ?")
+                    .bind(now)
+                    .bind(owner_user_id)
+                    .bind(rid)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(DbError::Query)?;
+            }
+        }
+
+        tx.commit().await.map_err(DbError::Query)?;
+        Ok(affected_room_ids)
     }
 
     pub async fn list_shared_room_members(&self, room_id: &str) -> Result<Vec<CustomSharedRoomMemberRow>, DbError> {

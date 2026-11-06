@@ -29,7 +29,8 @@ use aionui_db::{
 };
 use aionui_realtime::{BroadcastEventBus, EventBroadcaster};
 use aionui_team::events::{
-    TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT, TEAM_RUN_COMPLETED_EVENT, TEAM_RUN_FAILED_EVENT, TEAM_RUN_STARTED_EVENT,
+    TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT, TEAM_REMOVED_EVENT, TEAM_RUN_CANCELLED_EVENT,
+    TEAM_RUN_COMPLETED_EVENT, TEAM_RUN_FAILED_EVENT, TEAM_RUN_STARTED_EVENT,
 };
 use aionui_team::{TeamExternalBridgePort, TeamSessionService};
 use async_trait::async_trait;
@@ -39,9 +40,12 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::file_guard::{
     StagedRoomArtifact, is_image_file_name, sanitize_file_name, save_inbound_telegram_attachment,
-    stage_room_artifacts_and_sync_inbox, validate_outbound_file_path,
+    stage_room_artifacts_batch, validate_outbound_file_path,
 };
-use crate::bridge::judge::{ParticipatingTeam, RoomRoutingInput, RoutedTarget, is_team_blocked_by_dependencies, resolve_room_targets};
+use crate::bridge::judge::{
+    ParticipatingTeam, RoomRoutingInput, RoutedTarget, is_task_blocked, resolve_room_targets,
+    validate_task_dependencies,
+};
 
 /// Minimum run duration (45s) for Desktop-initiated runs to trigger a proactive Telegram summary
 /// when no teammates were delegated and `stream_mode == "milestones"`.
@@ -259,6 +263,22 @@ impl TelegramTeamHub {
                             let uid = user_id.to_owned();
                             tokio::spawn(async move {
                                 hub_clone.handle_team_run_failed(&uid, payload).await;
+                            });
+                        }
+                    }
+                    TEAM_RUN_CANCELLED_EVENT => {
+                        if let Ok(payload) = serde_json::from_value::<TeamRunPayload>(event.data.clone()) {
+                            hub_clone.active_runs.remove(&payload.team_id);
+                        }
+                    }
+                    TEAM_REMOVED_EVENT => {
+                        if let Some(user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str)
+                            && let Some(team_id) = event.data.get("team_id").and_then(serde_json::Value::as_str)
+                        {
+                            let uid = user_id.to_owned();
+                            let tid = team_id.to_owned();
+                            tokio::spawn(async move {
+                                hub_clone.handle_team_removed(&uid, &tid).await;
                             });
                         }
                     }
@@ -745,6 +765,28 @@ impl TelegramTeamHub {
     // -----------------------------------------------------------------------
     // EventBus lifecycle handlers
     // -----------------------------------------------------------------------
+
+    async fn handle_team_removed(&self, owner_user_id: &str, team_id: &str) {
+        self.active_runs.remove(team_id);
+        match self.bridge_repo.cleanup_deleted_team(owner_user_id, team_id).await {
+            Ok(affected_room_ids) => {
+                for rid in affected_room_ids {
+                    if let Ok(room_dto) = self.build_shared_room_dto(owner_user_id, &rid).await {
+                        self.event_bus.broadcast(WebSocketMessage::new(
+                            "sharedRoom.updated",
+                            serde_json::json!({
+                                "user_id": owner_user_id,
+                                "room": room_dto,
+                            }),
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(team_id = %team_id, error = %err, "failed to clean up deleted team references in bridge repo");
+            }
+        }
+    }
 
     async fn handle_member_runtime_failed(&self, owner_user_id: &str, payload: TeamAgentRuntimeStatusPayload) {
         let Ok(team) = self.team_service.get_team(owner_user_id, &payload.team_id).await else {
@@ -1340,18 +1382,15 @@ impl TelegramTeamHub {
 
         let mut members = Vec::with_capacity(member_rows.len());
         for m in member_rows {
-            let (team_name, workspace, leader_name) = match team_map.get(&m.team_id) {
-                Some(t) => {
-                    let (lname, _) = Self::find_lead_info(t);
-                    (t.name.clone(), t.workspace.clone(), lname)
-                }
-                None => (m.team_id.clone(), String::new(), "Leader".to_owned()),
+            let Some(t) = team_map.get(&m.team_id) else {
+                continue;
             };
+            let (leader_name, _) = Self::find_lead_info(t);
             let is_host = room.host_team_id.as_deref() == Some(m.team_id.as_str());
             members.push(SharedRoomMemberDto {
                 team_id: m.team_id,
-                team_name,
-                workspace,
+                team_name: t.name.clone(),
+                workspace: t.workspace.clone(),
                 leader_name,
                 is_host,
                 pending_handoff_msg_id: m.pending_handoff_msg_id,
@@ -1540,13 +1579,17 @@ impl TelegramTeamHub {
             .map(|m| m.workspace.clone())
             .collect();
 
-        let staged_artifacts = stage_room_artifacts_and_sync_inbox(
+        let allow_user_local_files = args.sender_type == "user" && args.sender_team_id.is_none();
+        let artifact_batch = stage_room_artifacts_batch(
             args.room_id,
             &args.source_files,
             source_ws,
             &self.data_dir,
             &recipient_workspaces,
+            allow_user_local_files,
         )?;
+        let staged_artifacts = artifact_batch.artifacts;
+        let recipient_inbox_paths = artifact_batch.recipient_inbox_paths;
 
         let reply_sender_team_id = if let Some(ref rid) = args.reply_to_id {
             self.bridge_repo
@@ -1726,24 +1769,14 @@ impl TelegramTeamHub {
                 .map(|m| m.workspace.clone())
                 .unwrap_or_default();
 
-            let mut local_inbox_files = Vec::new();
-            let safe_room = sanitize_file_name(args.room_id);
-            for art in &staged_artifacts {
-                if !member_ws.trim().is_empty() {
-                    let inbox_candidate = PathBuf::from(&member_ws).join(".shared-inbox").join(&safe_room);
-                    if let Ok(entries) = std::fs::read_dir(&inbox_candidate) {
-                        for entry in entries.flatten() {
-                            if entry.file_name().to_string_lossy().ends_with(&art.file_name) {
-                                local_inbox_files.push(entry.path().to_string_lossy().into_owned());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if local_inbox_files.is_empty() {
-                    local_inbox_files.push(art.staged_path.clone());
-                }
-            }
+            let local_inbox_files: Vec<String> = if staged_artifacts.is_empty() {
+                Vec::new()
+            } else {
+                recipient_inbox_paths
+                    .get(member_ws.trim())
+                    .cloned()
+                    .unwrap_or_else(|| staged_artifacts.iter().map(|a| a.staged_path.clone()).collect())
+            };
 
             let files_note = if local_inbox_files.is_empty() {
                 String::new()
@@ -1905,8 +1938,24 @@ impl TelegramTeamHub {
             .map(|m| m.workspace.clone())
             .collect();
 
-        let staged = stage_room_artifacts_and_sync_inbox(room_id, &files, source_ws, &self.data_dir, &recipient_ws)?;
+        let existing_tasks = self
+            .bridge_repo
+            .list_shared_room_tasks(room_id)
+            .await
+            .unwrap_or_default();
         let task_id = generate_prefixed_id("rtask");
+        validate_task_dependencies(&task_id, &blocked_by, &existing_tasks)?;
+
+        let allow_user_local_files = from_team_id.is_none();
+        let staged = stage_room_artifacts_batch(
+            room_id,
+            &files,
+            source_ws,
+            &self.data_dir,
+            &recipient_ws,
+            allow_user_local_files,
+        )?
+        .artifacts;
 
         let created = self
             .bridge_repo
@@ -1928,7 +1977,7 @@ impl TelegramTeamHub {
             .iter()
             .map(|m| (m.team_id.clone(), m.team_name.clone()))
             .collect();
-        let dto = Self::map_room_task_dto(created, &name_map);
+        let dto = Self::map_room_task_dto(created.clone(), &name_map);
 
         self.event_bus.broadcast(WebSocketMessage::new(
             "sharedRoom.taskChanged",
@@ -1939,13 +1988,13 @@ impl TelegramTeamHub {
             }),
         ));
 
-        // If the task is NOT gated by unfinished `blocked_by` tasks, wake the assignee Team's Lead immediately!
+        // If this specific task is NOT gated by unfinished `blocked_by` tasks, wake the assignee Team's Lead immediately!
         let all_tasks = self
             .bridge_repo
             .list_shared_room_tasks(room_id)
             .await
             .unwrap_or_default();
-        if !is_team_blocked_by_dependencies(&to_team_id, &all_tasks) {
+        if !is_task_blocked(&created, &all_tasks) {
             let wake_msg = format!(
                 "[CROSS-TEAM TASK ASSIGNED in #{room_name} | room_id=\"{room_id}\" | task_id=\"{task_id}\"]\n\
                  Title: {title}\n\
@@ -2011,13 +2060,16 @@ impl TelegramTeamHub {
                 .filter(|m| Some(m.team_id.as_str()) != actor_team_id && !m.workspace.trim().is_empty())
                 .map(|m| m.workspace.clone())
                 .collect();
-            let newly_staged = stage_room_artifacts_and_sync_inbox(
+            let allow_user_local_files = actor_team_id.is_none();
+            let newly_staged = stage_room_artifacts_batch(
                 &existing.room_id,
                 &files,
                 source_ws,
                 &self.data_dir,
                 &recipient_ws,
-            )?;
+                allow_user_local_files,
+            )?
+            .artifacts;
             merged_artifacts.extend(newly_staged);
         }
 
@@ -2054,9 +2106,9 @@ impl TelegramTeamHub {
             }),
         ));
 
-        // Closed-Loop Layer 3: If this task transitioned to `completed`, wake any downstream Team
+        // Closed-Loop Layer 3: If this task newly transitioned to `completed`, wake any downstream Team
         // whose `blocked_by` task just became unblocked!
-        if updated.status == "completed" {
+        if existing.status != "completed" && updated.status == "completed" {
             let after_tasks = self
                 .bridge_repo
                 .list_shared_room_tasks(&existing.room_id)
@@ -2071,8 +2123,11 @@ impl TelegramTeamHub {
                 if !deps.iter().any(|d| d == task_id) {
                     continue;
                 }
-                let was_blocked = is_team_blocked_by_dependencies(&candidate.to_team_id, &before_tasks);
-                let now_blocked = is_team_blocked_by_dependencies(&candidate.to_team_id, &after_tasks);
+                let was_blocked = before_tasks
+                    .iter()
+                    .find(|t| t.id == candidate.id)
+                    .is_some_and(|before_cand| is_task_blocked(before_cand, &before_tasks));
+                let now_blocked = is_task_blocked(candidate, &after_tasks);
                 if was_blocked && !now_blocked {
                     let _ = self
                         .bridge_repo

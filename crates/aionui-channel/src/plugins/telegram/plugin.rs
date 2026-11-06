@@ -755,7 +755,9 @@ fn parse_chat_id(chat_id: &str) -> Result<i64, ChannelError> {
 
 fn is_telegram_entity_parse_error(err: &ChannelError) -> bool {
     let lower = err.to_string().to_ascii_lowercase();
-    lower.contains("parse entities") || lower.contains("can't find end of the entity")
+    lower.contains("parse entities")
+        || lower.contains("can't find end of the entity")
+        || lower.contains("can't find end tag")
 }
 
 fn extract_raw_chat_meta(msg: Option<&TgMessage>) -> serde_json::Value {
@@ -863,8 +865,12 @@ fn legacy_unused_parse_chat_id_anchor(chat_id: &str) -> Result<i64, ChannelError
 
 /// Truncate a message to the platform limit, appending "..." if truncated.
 fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
+    let char_count = text.chars().count();
+    if char_count <= limit {
         return text.to_string();
+    }
+    if limit <= 3 {
+        return text.chars().take(limit).collect();
     }
     // Truncate at char boundary, leave room for "..."
     let truncated: String = text.chars().take(limit - 3).collect();

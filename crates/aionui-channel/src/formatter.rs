@@ -140,18 +140,25 @@ pub fn chunk_telegram_html(html: &str, max_chars: usize) -> Vec<String> {
             break;
         }
 
-        // Reserve 32 chars in case we need to close/reopen `<pre><code>`.
-        let effective_limit = limit.saturating_sub(32);
+        // Reserve 48 chars in case we need to close/reopen `<pre><code>` or inline tags.
+        let effective_limit = limit.saturating_sub(48);
         let split_byte = find_safe_split_byte(&remaining, effective_limit);
         let mut head = remaining[..split_byte].to_owned();
         let mut tail = remaining[split_byte..].trim_start_matches('\n').to_owned();
 
-        // Balance `<pre><code>` across chunk boundary if split inside a code block.
+        // Balance `<pre><code>` or inline tags (`<b>`, `<i>`, `<code>`) across chunk boundary.
         let open_pre = head.matches("<pre><code>").count();
         let close_pre = head.matches("</code></pre>").count();
         if open_pre > close_pre {
             head.push_str("</code></pre>");
             tail = format!("<pre><code>{tail}");
+        } else {
+            for (open_tag, close_tag) in [("<b>", "</b>"), ("<i>", "</i>"), ("<code>", "</code>")] {
+                if head.matches(open_tag).count() > head.matches(close_tag).count() {
+                    head.push_str(close_tag);
+                    tail = format!("{open_tag}{tail}");
+                }
+            }
         }
 
         chunks.push(head);
@@ -190,7 +197,11 @@ fn find_safe_split_byte(text: &str, max_chars: usize) -> usize {
     {
         return pos;
     }
-    safe_end.max(1)
+    if safe_end == 0 {
+        text.chars().next().map_or(0, char::len_utf8)
+    } else {
+        safe_end
+    }
 }
 
 fn avoid_mid_tag_or_entity(window: &str) -> usize {

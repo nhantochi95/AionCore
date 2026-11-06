@@ -80,3 +80,38 @@ fn telegram_chunking_balances_pre_code_blocks() {
         );
     }
 }
+
+#[test]
+fn torture_telegram_12k_vietnamese_emojis_unspaced_unicode_and_xss_escaping() {
+    let vi_para = "**Báo cáo tiến độ dự án NhanTown 👑🪑:** Hệ thống đã xử lý thành công `<script>alert('xss') & drop()</script>` và kiểm tra độ ổn định UTF-8 tiếng Việt (ế, ộ, ư, đ).\n\n";
+    let huge_md = format!(
+        "{}{}",
+        vi_para.repeat(75),
+        "👑ếộưđ".repeat(900) // Continuous unspaced 3- and 4-byte UTF-8 sequence!
+    );
+    assert!(huge_md.chars().count() > 12_000);
+
+    let html = markdown_to_telegram_html(&huge_md);
+    assert!(!html.contains("<script>"), "raw <script> tag must be escaped");
+    assert!(html.contains("&lt;script&gt;"));
+
+    let chunks = chunk_telegram_html(&html, TELEGRAM_SAFE_CHUNK_CHARS);
+    assert!(chunks.len() >= 4);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        assert!(
+            chunk.chars().count() <= TELEGRAM_SAFE_CHUNK_CHARS,
+            "chunk #{idx} exceeded safe char limit: {}",
+            chunk.chars().count()
+        );
+        assert_eq!(
+            chunk.matches("<b>").count(),
+            chunk.matches("</b>").count(),
+            "unbalanced <b> in chunk #{idx}"
+        );
+        assert_eq!(
+            chunk.matches("<code>").count(),
+            chunk.matches("</code>").count(),
+            "unbalanced <code> in chunk #{idx}"
+        );
+    }
+}

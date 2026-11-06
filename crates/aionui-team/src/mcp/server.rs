@@ -562,6 +562,37 @@ pub(crate) async fn dispatch_tool(
     }
 }
 
+pub(crate) async fn try_dispatch_sessionless_tool(
+    tool_name: &str,
+    arguments: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_role: TeammateRole,
+) -> Option<Result<String, ToolCallError>> {
+    if !matches!(
+        tool_name,
+        "team_notify_user"
+            | "team_room_read"
+            | "team_room_post"
+            | "team_room_task_create"
+            | "team_room_task_update"
+    ) {
+        return None;
+    }
+    if let Err(err) = super::tools::authorize_tool(caller_role, tool_name) {
+        return Some(Err(ToolCallError::from_message(err)));
+    }
+    let res = match tool_name {
+        "team_notify_user" => exec_notify_user(arguments, service, team_id, caller_role).await,
+        "team_room_read" => exec_room_read(arguments, service, team_id, caller_role).await,
+        "team_room_post" => exec_room_post(arguments, service, team_id, caller_role).await,
+        "team_room_task_create" => exec_room_task_create(arguments, service, team_id, caller_role).await,
+        "team_room_task_update" => exec_room_task_update(arguments, service, team_id, caller_role).await,
+        _ => unreachable!(),
+    };
+    Some(res)
+}
+
 async fn exec_list_assistants(
     args: &Value,
     service: &Weak<TeamSessionService>,

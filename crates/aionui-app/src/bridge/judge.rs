@@ -38,43 +38,111 @@ pub struct RoomRoutingInput<'a> {
     pub room_tasks: &'a [CustomSharedRoomTaskRow],
 }
 
-/// Normalize a team name into a compact `@mention` handle (lowercase alphanumeric + `-`/`_`).
+/// Normalize a team name into a compact `@mention` handle (lowercase alphanumeric + `-`/`_`),
+/// collapsing consecutive whitespace into a single `-` to match Frontend `mentionSlug` 100%.
 pub fn mention_slug(name: &str) -> String {
-    name.trim()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c.to_lowercase().next().unwrap_or(c)
-            } else if c.is_whitespace() {
-                '-'
-            } else {
-                '_'
+    let mut out = String::new();
+    let mut prev_ws = false;
+    for c in name.trim().chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                out.push('-');
+                prev_ws = true;
             }
-        })
-        .collect::<String>()
-        .trim_matches(['-', '_'])
-        .to_owned()
+        } else {
+            prev_ws = false;
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
+            } else {
+                out.push('_');
+            }
+        }
+    }
+    out.trim_matches(['-', '_']).to_owned()
 }
 
-/// Returns true if `team_id` currently has an unfinished task in this room whose
-/// `blocked_by` task IDs are NOT yet `completed`.
-pub fn is_team_blocked_by_dependencies(team_id: &str, room_tasks: &[CustomSharedRoomTaskRow]) -> bool {
+/// Returns true if a specific task still has at least one `blocked_by` dependency that is NOT `"completed"`.
+pub fn is_task_blocked(task: &CustomSharedRoomTaskRow, room_tasks: &[CustomSharedRoomTaskRow]) -> bool {
+    if matches!(task.status.as_str(), "completed" | "cancelled") {
+        return false;
+    }
+    let deps: Vec<String> = serde_json::from_str(&task.blocked_by_json).unwrap_or_default();
+    if deps.is_empty() {
+        return false;
+    }
     let completed_ids: HashSet<&str> = room_tasks
         .iter()
         .filter(|t| t.status == "completed")
         .map(|t| t.id.as_str())
         .collect();
+    deps.iter().any(|dep_id| !completed_ids.contains(dep_id.as_str()))
+}
 
-    for task in room_tasks {
-        if task.to_team_id != team_id || matches!(task.status.as_str(), "completed" | "cancelled") {
-            continue;
+/// Validates `blocked_by` task IDs before creating or updating a Cross-Team Task:
+/// - Every referenced ID must exist in `room_tasks` (in the same Shared Room).
+/// - No self-reference (`new_task_id` in `blocked_by`) or cycle (`A -> B -> A`).
+pub fn validate_task_dependencies(
+    new_task_id: &str,
+    blocked_by: &[String],
+    room_tasks: &[CustomSharedRoomTaskRow],
+) -> Result<(), String> {
+    if blocked_by.is_empty() {
+        return Ok(());
+    }
+
+    let mut dep_graph: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    for t in room_tasks {
+        let deps: Vec<String> = serde_json::from_str(&t.blocked_by_json).unwrap_or_default();
+        dep_graph.insert(t.id.as_str(), deps);
+    }
+
+    for dep in blocked_by {
+        let trimmed = dep.trim();
+        if trimmed.is_empty() {
+            return Err("blocked_by task ID must not be empty".to_owned());
         }
-        let deps: Vec<String> = serde_json::from_str(&task.blocked_by_json).unwrap_or_default();
-        if deps.iter().any(|dep_id| !completed_ids.contains(dep_id.as_str())) {
-            return true;
+        if trimmed == new_task_id {
+            return Err(format!("Task '{new_task_id}' cannot depend on itself"));
+        }
+        if !dep_graph.contains_key(trimmed) {
+            return Err(format!(
+                "Dependency task '{trimmed}' does not exist in this Shared Room"
+            ));
         }
     }
-    false
+
+    // Check cycle reachability: if `new_task_id` is reachable from any `dep`, adding `new_task_id -> dep` creates a cycle.
+    for dep in blocked_by {
+        let mut stack = vec![dep.as_str()];
+        let mut visited = HashSet::new();
+        while let Some(curr) = stack.pop() {
+            if curr == new_task_id {
+                return Err(format!(
+                    "Circular blocked_by dependency detected involving task '{new_task_id}' and '{dep}'"
+                ));
+            }
+            if !visited.insert(curr) {
+                continue;
+            }
+            if let Some(next_deps) = dep_graph.get(curr) {
+                for nd in next_deps {
+                    stack.push(nd.as_str());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true if `team_id` currently has an unfinished task in this room whose
+/// `blocked_by` task IDs are NOT yet `completed`.
+pub fn is_team_blocked_by_dependencies(team_id: &str, room_tasks: &[CustomSharedRoomTaskRow]) -> bool {
+    room_tasks
+        .iter()
+        .any(|task| task.to_team_id == team_id && is_task_blocked(task, room_tasks))
 }
 
 /// Deterministic Tier-1 routing check. Returns `Some(targets)` if Tier 1 matched
@@ -467,5 +535,46 @@ mod tests {
         };
         let routed_after_leader = resolve_room_targets(&leader_closing, &[], &[0u8; 32]).await;
         assert!(routed_after_leader.is_empty());
+    }
+
+    #[test]
+    fn dependency_validator_rejects_self_unknown_and_cycles() {
+        let tasks = vec![
+            CustomSharedRoomTaskRow {
+                id: "rt-1".into(),
+                room_id: "r1".into(),
+                from_team_id: None,
+                to_team_id: "t-a".into(),
+                title: "Step 1".into(),
+                description: String::new(),
+                status: "pending".into(),
+                blocked_by_json: r#"["rt-2"]"#.into(),
+                artifact_paths_json: "[]".into(),
+                result_summary: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+            CustomSharedRoomTaskRow {
+                id: "rt-2".into(),
+                room_id: "r1".into(),
+                from_team_id: None,
+                to_team_id: "t-b".into(),
+                title: "Step 2".into(),
+                description: String::new(),
+                status: "pending".into(),
+                blocked_by_json: "[]".into(),
+                artifact_paths_json: "[]".into(),
+                result_summary: None,
+                created_at: 2,
+                updated_at: 2,
+            },
+        ];
+
+        assert!(validate_task_dependencies("rt-3", &["rt-3".into()], &tasks).is_err());
+        assert!(validate_task_dependencies("rt-3", &["rt-missing".into()], &tasks).is_err());
+        // Adding `rt-2 -> rt-1` when `rt-1 -> rt-2` already exists creates a cycle!
+        assert!(validate_task_dependencies("rt-2", &["rt-1".into()], &tasks).is_err());
+        // Valid acyclic chain `rt-3 -> rt-1` succeeds!
+        assert!(validate_task_dependencies("rt-3", &["rt-1".into()], &tasks).is_ok());
     }
 }

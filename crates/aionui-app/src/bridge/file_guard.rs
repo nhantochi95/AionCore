@@ -1,6 +1,7 @@
 //! Canonical outbound path validation, inbound Telegram attachment staging,
 //! and cross-team Shared Room `.shared-inbox/` artifact synchronization.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use aionui_common::now_ms;
@@ -15,6 +16,13 @@ pub struct StagedRoomArtifact {
     pub staged_path: String,
     pub size_bytes: u64,
     pub is_image: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StagedArtifactBatch {
+    pub artifacts: Vec<StagedRoomArtifact>,
+    /// Keyed by trimmed recipient workspace string -> exact copied `.shared-inbox/<room>/<file>` paths.
+    pub recipient_inbox_paths: HashMap<String, Vec<String>>,
 }
 
 /// Sanitize an untrusted filename so it cannot escape directories or contain OS-reserved chars.
@@ -64,6 +72,15 @@ pub fn validate_outbound_file_path(
     raw_path: &str,
     team_workspace: Option<&str>,
     data_dir: &Path,
+) -> Result<PathBuf, String> {
+    validate_outbound_file_path_with_policy(raw_path, team_workspace, data_dir, false)
+}
+
+pub fn validate_outbound_file_path_with_policy(
+    raw_path: &str,
+    team_workspace: Option<&str>,
+    data_dir: &Path,
+    allow_user_local_files: bool,
 ) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
@@ -136,15 +153,18 @@ pub fn validate_outbound_file_path(
         }
     }
 
-    let mut allowed = false;
-    if let Some(ws) = team_workspace.map(str::trim).filter(|w| !w.is_empty())
-        && let Ok(canon_ws) = dunce::canonicalize(ws)
-        && path_starts_with_ci(&canonical, &canon_ws)
-    {
-        allowed = true;
+    if allow_user_local_files {
+        return Ok(canonical);
     }
-    if !allowed
-        && let Ok(canon_tmp) = dunce::canonicalize(std::env::temp_dir())
+
+    let mut allowed = false;
+    if let Some(ws) = team_workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        if let Ok(canon_ws) = dunce::canonicalize(ws)
+            && path_starts_with_ci(&canonical, &canon_ws)
+        {
+            allowed = true;
+        }
+    } else if let Ok(canon_tmp) = dunce::canonicalize(std::env::temp_dir())
         && path_starts_with_ci(&canonical, &canon_tmp)
     {
         allowed = true;
@@ -218,8 +238,27 @@ pub fn stage_room_artifacts_and_sync_inbox(
     data_dir: &Path,
     recipient_workspaces: &[String],
 ) -> Result<Vec<StagedRoomArtifact>, String> {
+    Ok(stage_room_artifacts_batch(
+        room_id,
+        source_files,
+        source_team_workspace,
+        data_dir,
+        recipient_workspaces,
+        false,
+    )?
+    .artifacts)
+}
+
+pub fn stage_room_artifacts_batch(
+    room_id: &str,
+    source_files: &[String],
+    source_team_workspace: Option<&str>,
+    data_dir: &Path,
+    recipient_workspaces: &[String],
+    allow_user_local_files: bool,
+) -> Result<StagedArtifactBatch, String> {
     if source_files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StagedArtifactBatch::default());
     }
 
     let safe_room = sanitize_file_name(room_id);
@@ -232,8 +271,15 @@ pub fn stage_room_artifacts_and_sync_inbox(
     })?;
 
     let mut staged = Vec::with_capacity(source_files.len());
-    for raw_file in source_files {
-        let valid_src = validate_outbound_file_path(raw_file, source_team_workspace, data_dir)?;
+    let mut recipient_inbox_paths: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (idx, raw_file) in source_files.iter().enumerate() {
+        let valid_src = validate_outbound_file_path_with_policy(
+            raw_file,
+            source_team_workspace,
+            data_dir,
+            allow_user_local_files,
+        )?;
         let meta = std::fs::metadata(&valid_src)
             .map_err(|e| format!("Failed to read metadata of '{}': {e}", valid_src.display()))?;
         let orig_name = valid_src
@@ -241,7 +287,7 @@ pub fn stage_room_artifacts_and_sync_inbox(
             .and_then(|n| n.to_str())
             .unwrap_or("artifact.bin");
         let safe_name = sanitize_file_name(orig_name);
-        let stamped_name = format!("{}_{}", now_ms(), safe_name);
+        let stamped_name = format!("{}_{}_{}", now_ms(), idx, safe_name);
         let staged_dest = artifacts_dir.join(&stamped_name);
 
         if valid_src != staged_dest {
@@ -254,28 +300,46 @@ pub fn stage_room_artifacts_and_sync_inbox(
             })?;
         }
 
+        let canonical_staged = dunce::canonicalize(&staged_dest).unwrap_or(staged_dest.clone());
+        let canonical_staged_str = canonical_staged.to_string_lossy().into_owned();
+
         for ws in recipient_workspaces {
             let trimmed_ws = ws.trim();
             if trimmed_ws.is_empty() {
                 continue;
             }
             let inbox_dir = PathBuf::from(trimmed_ws).join(".shared-inbox").join(&safe_room);
-            if std::fs::create_dir_all(&inbox_dir).is_ok() {
+            let delivered_path = if std::fs::create_dir_all(&inbox_dir).is_ok() {
                 let recipient_dest = inbox_dir.join(&stamped_name);
-                let _ = std::fs::copy(&staged_dest, &recipient_dest);
-            }
+                if std::fs::copy(&staged_dest, &recipient_dest).is_ok() {
+                    dunce::canonicalize(&recipient_dest)
+                        .unwrap_or(recipient_dest)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    canonical_staged_str.clone()
+                }
+            } else {
+                canonical_staged_str.clone()
+            };
+            recipient_inbox_paths
+                .entry(trimmed_ws.to_owned())
+                .or_default()
+                .push(delivered_path);
         }
 
-        let canonical_staged = dunce::canonicalize(&staged_dest).unwrap_or(staged_dest);
         staged.push(StagedRoomArtifact {
             file_name: safe_name.clone(),
-            staged_path: canonical_staged.to_string_lossy().into_owned(),
+            staged_path: canonical_staged_str,
             size_bytes: meta.len(),
             is_image: is_image_file_name(&safe_name),
         });
     }
 
-    Ok(staged)
+    Ok(StagedArtifactBatch {
+        artifacts: staged,
+        recipient_inbox_paths,
+    })
 }
 
 #[cfg(test)]

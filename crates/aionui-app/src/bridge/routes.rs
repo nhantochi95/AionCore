@@ -478,6 +478,20 @@ async fn update_task(
         .map_err(db_err_to_api)?
         .ok_or_else(|| ApiError::NotFound(format!("Shared room not found: {}", path.id)))?;
 
+    let existing_task = state
+        .hub
+        .bridge_repo()
+        .get_shared_room_task(&path.task_id)
+        .await
+        .map_err(db_err_to_api)?
+        .ok_or_else(|| ApiError::NotFound(format!("Shared room task not found: {}", path.task_id)))?;
+    if existing_task.room_id != path.id {
+        return Err(ApiError::NotFound(format!(
+            "Task {} does not belong to room {}",
+            path.task_id, path.id
+        )));
+    }
+
     let dto = state
         .hub
         .update_cross_team_task(
