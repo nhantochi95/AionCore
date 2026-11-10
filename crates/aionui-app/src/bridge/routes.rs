@@ -87,6 +87,10 @@ pub struct SendSharedRoomMessageRequest {
     pub files: Vec<String>,
     #[serde(default)]
     pub reply_to_id: Option<String>,
+    #[serde(default)]
+    pub wake_targets: Option<Vec<String>>,
+    #[serde(default)]
+    pub live_steering: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +374,7 @@ async fn send_message(
             source_files: req.files,
             reply_to_id: req.reply_to_id,
             origin_telegram_chat: None,
+            wake_targets: req.wake_targets,
         })
         .await
         .map_err(ApiError::BadRequest)?;

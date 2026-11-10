@@ -340,6 +340,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let shared_room_authenticated = crate::bridge::shared_room_routes(states.shared_room)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let worktree_authenticated = crate::routes::worktree_routes(states.worktree)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let inbox_authenticated = crate::routes::inbox_routes(states.inbox)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let wallets_authenticated = crate::routes::wallets_routes(states.wallets)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Cron routes protected by auth middleware
     let cron_authenticated =
@@ -419,6 +425,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(channel_authenticated)
         .merge(team_authenticated)
         .merge(shared_room_authenticated)
+        .merge(worktree_authenticated)
+        .merge(inbox_authenticated)
+        .merge(wallets_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
@@ -548,7 +557,7 @@ fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentit
 fn is_global_websocket_event(event_name: &str) -> bool {
     matches!(
         event_name,
-        "runtime.statusChanged" | "extensions.lifecycle" | "hub.state-changed"
+        "runtime.statusChanged" | "extensions.lifecycle" | "hub.state-changed" | "system-settings:language-changed"
     )
 }
 

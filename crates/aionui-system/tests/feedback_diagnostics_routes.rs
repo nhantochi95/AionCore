@@ -33,6 +33,7 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
             SqliteFeedbackDiagnosticsRepository::new(db.pool().clone()),
         )),
+        event_broadcaster: None,
     }
 }
 

@@ -44,6 +44,7 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
             SqliteFeedbackDiagnosticsRepository::new(db.pool().clone()),
         )),
+        event_broadcaster: None,
     }
 }
 
@@ -463,4 +464,35 @@ async fn put_long_key_rejected() {
     let req = json_request("PUT", "/api/settings/client", serde_json::json!({long_key: true}));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_settings_broadcasts_language_changed_event() {
+    let (mut state_base, _db) = {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(TEST_USER_ID)
+        .bind(TEST_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        (build_state(&db), db)
+    };
+
+    let bus = Arc::new(BroadcastEventBus::new(16));
+    let mut rx = bus.subscribe();
+    state_base.event_broadcaster = Some(bus);
+
+    let app = settings_routes(state_base);
+    let req = json_request("PATCH", "/api/settings", serde_json::json!({"language": "vi-VN"}));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let event = rx.recv().await.expect("should receive broadcast event");
+    assert_eq!(event.name, "system-settings:language-changed");
+    assert_eq!(event.data["language"], "vi-VN");
+    assert_eq!(event.data["user_id"], TEST_USER_ID);
 }

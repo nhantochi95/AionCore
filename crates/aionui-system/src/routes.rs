@@ -6,15 +6,18 @@ use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
+use std::sync::Arc;
+
 use aionui_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, CurrentUserResponse, DetectProtocolRequest,
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
     SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    UpdateProviderRequest, UpdateSettingsRequest, WebSocketMessage,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_realtime::EventBroadcaster;
 
 use crate::client_pref::ClientPrefService;
 use crate::diagnostics::FeedbackDiagnosticsService;
@@ -37,6 +40,7 @@ pub struct SystemRouterState {
     pub version_check_service: VersionCheckService,
     pub runtime_prepare_service: RuntimePrepareService,
     pub feedback_diagnostics_service: FeedbackDiagnosticsService,
+    pub event_broadcaster: Option<Arc<dyn EventBroadcaster>>,
 }
 
 impl From<SystemError> for ApiError {
@@ -137,11 +141,25 @@ async fn update_settings(
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let requested_language = req.language.clone();
     let settings = state
         .settings_service
         .update_settings(&user.id, req)
         .await
         .map_err(ApiError::from)?;
+
+    if let Some(new_lang) = requested_language {
+        if let Some(broadcaster) = state.event_broadcaster.as_ref() {
+            broadcaster.broadcast(WebSocketMessage::new(
+                "system-settings:language-changed",
+                serde_json::json!({
+                    "language": new_lang,
+                    "user_id": user.id,
+                }),
+            ));
+        }
+    }
+
     Ok(Json(ApiResponse::ok(settings)))
 }
 

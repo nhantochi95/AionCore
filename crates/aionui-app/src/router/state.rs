@@ -18,7 +18,7 @@ use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    IProviderRepository, ISettingsRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
     SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
@@ -144,6 +144,9 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub shared_room: crate::bridge::SharedRoomRouterState,
+    pub worktree: crate::routes::WorktreeRouterState,
+    pub inbox: crate::routes::InboxRouterState,
+    pub wallets: crate::routes::WalletsRouterState,
     pub session_message: SessionMessageRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
@@ -308,6 +311,7 @@ pub async fn build_module_states(
     });
     let bridge_repo = Arc::new(aionui_db::SqliteCustomBridgeRepository::new(pool.clone()));
     let hub_provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let settings_repo: Arc<dyn ISettingsRepository> = Arc::new(SqliteSettingsRepository::new(pool.clone()));
     let telegram_team_hub = crate::bridge::TelegramTeamHub::new(
         bridge_repo,
         channel_state.repo.clone(),
@@ -315,6 +319,7 @@ pub async fn build_module_states(
         team_state.service.clone(),
         services.conversation_repo.clone(),
         hub_provider_repo,
+        settings_repo,
         services.event_bus.clone(),
         encryption_key,
         services.data_dir.clone(),
@@ -351,6 +356,19 @@ pub async fn build_module_states(
         skill: skill_state,
         channel: channel_state,
         team: team_state,
+        worktree: crate::routes::WorktreeRouterState {
+            bridge_repo: telegram_team_hub.bridge_repo().clone(),
+            worktree_engine: std::sync::Arc::new(aionui_project::GitWorktreeEngine::new()),
+        },
+        inbox: crate::routes::InboxRouterState {
+            bridge_repo: telegram_team_hub.bridge_repo().clone(),
+            event_bus: services.event_bus.clone(),
+            worktree_engine: std::sync::Arc::new(aionui_project::GitWorktreeEngine::new()),
+        },
+        wallets: crate::routes::WalletsRouterState {
+            bridge_repo: telegram_team_hub.bridge_repo().clone(),
+            event_bus: services.event_bus.clone(),
+        },
         shared_room: crate::bridge::SharedRoomRouterState {
             hub: telegram_team_hub,
             event_bus: services.event_bus.clone(),
@@ -524,6 +542,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
         runtime_prepare_service: RuntimePrepareService::new(services.event_bus.clone()),
+        event_broadcaster: Some(services.event_bus.clone()),
         feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
             SqliteFeedbackDiagnosticsRepository::new(pool),
         )),
@@ -1259,6 +1278,7 @@ mod tests {
     struct ChannelStateNoopAgent {
         conversation_id: String,
         workspace: String,
+        event_tx: tokio::sync::broadcast::Sender<AgentStreamEvent>,
     }
 
     #[async_trait::async_trait]
@@ -1284,11 +1304,13 @@ mod tests {
         }
 
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentStreamEvent> {
-            let (tx, _) = tokio::sync::broadcast::channel(1);
-            tx.subscribe()
+            self.event_tx.subscribe()
         }
 
         async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+            let _ = self.event_tx.send(AgentStreamEvent::Finish(
+                aionui_ai_agent::protocol::events::FinishEventData::default(),
+            ));
             Ok(())
         }
 
@@ -1308,9 +1330,11 @@ mod tests {
     fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(|opts: BuildTaskOptions| {
             Box::pin(async move {
+                let (event_tx, _) = tokio::sync::broadcast::channel(16);
                 Ok(AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
                     conversation_id: opts.conversation_id().to_owned(),
                     workspace: opts.context.workspace.path,
+                    event_tx,
                 })))
             }) as futures_util::future::BoxFuture<'static, Result<AgentInstance, AgentError>>
         });
@@ -1324,10 +1348,12 @@ mod tests {
             Box::pin(async move {
                 let conversation_id = opts.conversation_id().to_owned();
                 let workspace = opts.context.workspace.path.clone();
+                let (event_tx, _) = tokio::sync::broadcast::channel(16);
                 captured_env.lock().unwrap().push(opts.context.runtime_env.clone());
                 Ok(AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
                     conversation_id,
                     workspace,
+                    event_tx,
                 })))
             }) as futures_util::future::BoxFuture<'static, Result<AgentInstance, AgentError>>
         });
@@ -1565,6 +1591,12 @@ mod tests {
             env.contains(&(AIONUI_BASE_URL_ENV.to_owned(), config.local_base_url())),
             "cron conversation runtime env should include AIONUI_BASE_URL"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cron.conversation_service.runtime_state().is_claimed(&conversation.id)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         services.database.close().await;
     }

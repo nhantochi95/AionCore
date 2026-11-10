@@ -21,12 +21,16 @@ use aionui_channel::types::{
     UnifiedIncomingMessage, UnifiedOutgoingMessage, format_chat_with_thread, split_chat_and_thread,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
+use aionui_db::custom_bridge_schema::{
+    CreateActionInboxParams, RecordCostRunParams, WalletType, classify_agent_wallet,
+};
 use aionui_db::{
     CreateSharedRoomMessageParams, CreateSharedRoomTaskParams, CustomSharedRoomMessageRow, CustomSharedRoomRow,
     CustomSharedRoomTaskRow, CustomStreamMode, CustomTargetType, IChannelRepository, IConversationRepository,
-    IProviderRepository, MessagePageDirection, MessagePageParams, SqliteCustomBridgeRepository,
+    IProviderRepository, ISettingsRepository, MessagePageDirection, MessagePageParams, SqliteCustomBridgeRepository,
     UpdateSharedRoomTaskParams, UpsertChannelBindingParams,
 };
+use aionui_project::GitWorktreeEngine;
 use aionui_realtime::{BroadcastEventBus, EventBroadcaster};
 use aionui_team::events::{
     TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT, TEAM_REMOVED_EVENT, TEAM_RUN_CANCELLED_EVENT,
@@ -43,9 +47,11 @@ use crate::bridge::file_guard::{
     stage_room_artifacts_batch, validate_outbound_file_path,
 };
 use crate::bridge::judge::{
-    ParticipatingTeam, RoomRoutingInput, RoutedTarget, is_task_blocked, resolve_room_targets,
-    validate_task_dependencies,
+    ParticipatingTeam, RoomRoutingInput, RoutedTarget, is_task_blocked,
+    is_team_blocked_by_dependencies, mention_slug, resolve_room_targets, validate_task_dependencies,
 };
+use crate::bridge::locales::{HubI18n, HubLocale};
+use crate::routes::inbox::ActionInboxCardDto;
 
 /// Minimum run duration (45s) for Desktop-initiated runs to trigger a proactive Telegram summary
 /// when no teammates were delegated and `stream_mode == "milestones"`.
@@ -157,6 +163,7 @@ pub struct PostRoomMessageArgs<'a> {
     pub source_files: Vec<String>,
     pub reply_to_id: Option<String>,
     pub origin_telegram_chat: Option<String>,
+    pub wake_targets: Option<Vec<String>>,
 }
 
 pub struct TelegramTeamHub {
@@ -166,6 +173,7 @@ pub struct TelegramTeamHub {
     team_service: Arc<TeamSessionService>,
     conversation_repo: Arc<dyn IConversationRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
+    settings_repo: Arc<dyn ISettingsRepository>,
     event_bus: Arc<BroadcastEventBus>,
     encryption_key: [u8; 32],
     data_dir: PathBuf,
@@ -181,6 +189,7 @@ impl TelegramTeamHub {
         team_service: Arc<TeamSessionService>,
         conversation_repo: Arc<dyn IConversationRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
+        settings_repo: Arc<dyn ISettingsRepository>,
         event_bus: Arc<BroadcastEventBus>,
         encryption_key: [u8; 32],
         data_dir: PathBuf,
@@ -192,6 +201,7 @@ impl TelegramTeamHub {
             team_service,
             conversation_repo,
             provider_repo,
+            settings_repo,
             event_bus,
             encryption_key,
             data_dir,
@@ -205,6 +215,18 @@ impl TelegramTeamHub {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    pub async fn resolve_locale(&self, user_id: &str) -> HubLocale {
+        let lang = self
+            .settings_repo
+            .get_settings(user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.language)
+            .unwrap_or_else(|| "en-US".to_owned());
+        HubLocale::from_lang(&lang)
     }
 
     /// Spawns the background EventBus watcher that handles:
@@ -235,13 +257,18 @@ impl TelegramTeamHub {
                             let uid = user_id.to_owned();
                             hub_clone
                                 .active_runs
-                                .entry(payload.team_id)
+                                .entry(payload.team_id.clone())
                                 .or_insert_with(|| ActiveTeamRunTracker {
-                                    origin: RunOrigin::Desktop { owner_user_id: uid },
+                                    origin: RunOrigin::Desktop {
+                                        owner_user_id: uid.clone(),
+                                    },
                                     started_at_ms: now_ms(),
                                     delegated: false,
                                     notify_completed_sent: false,
                                 });
+                            tokio::spawn(async move {
+                                hub_clone.enforce_wallet_fuse_on_run_started(&uid, payload).await;
+                            });
                         }
                     }
                     TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT => {
@@ -289,6 +316,14 @@ impl TelegramTeamHub {
                             let uid = user_id.to_owned();
                             tokio::spawn(async move {
                                 hub_clone.handle_team_run_completed(&uid, payload).await;
+                            });
+                        }
+                    }
+                    "inbox:item_resolved" => {
+                        if event.data.get("resolved_by").and_then(serde_json::Value::as_str) == Some("desktop") {
+                            let data = event.data.clone();
+                            tokio::spawn(async move {
+                                hub_clone.sync_desktop_inbox_resolution_to_telegram(data).await;
                             });
                         }
                     }
@@ -453,6 +488,7 @@ impl TelegramTeamHub {
     ) -> Result<Vec<String>, String> {
         let base_chat_id = split_chat_and_thread(reply_chat).0;
         let mut sent_ids = Vec::new();
+        let locale = self.resolve_locale(owner_user_id).await;
 
         // If report exceeds 8,000 chars, attach full Markdown report as a `.md` document alongside a preview.
         if markdown_text.chars().count() > TELEGRAM_DOCUMENT_THRESHOLD_CHARS {
@@ -462,9 +498,8 @@ impl TelegramTeamHub {
             let report_path = reports_dir.join(&file_name);
             if std::fs::write(&report_path, markdown_text.as_bytes()).is_ok() {
                 let preview_chars: String = markdown_text.chars().take(1800).collect();
-                let preview_md = format!(
-                    "{preview_chars}\n\n… *(Báo cáo dài — bản đầy đủ đính kèm trong file `{file_name}` bên dưới)*"
-                );
+                let footnote = HubI18n::report_preview_footnote(locale, &file_name);
+                let preview_md = format!("{preview_chars}{footnote}");
                 let preview_html = markdown_to_telegram_html(&preview_md);
                 let msg = UnifiedOutgoingMessage {
                     message_type: OutgoingMessageType::Text,
@@ -493,7 +528,7 @@ impl TelegramTeamHub {
 
                 let doc_msg = UnifiedOutgoingMessage {
                     message_type: OutgoingMessageType::File,
-                    text: Some("📄 Báo cáo chi tiết đầy đủ".to_owned()),
+                    text: Some(HubI18n::btn_full_report(locale).to_owned()),
                     parse_mode: None,
                     buttons,
                     keyboard: None,
@@ -631,6 +666,7 @@ impl TelegramTeamHub {
         include_approve: bool,
         include_stop: bool,
     ) -> Option<Vec<Vec<ActionButton>>> {
+        let locale = self.resolve_locale(owner_user_id).await;
         let mut row1 = Vec::new();
         if include_approve
             && let Ok(tok) = self
@@ -646,7 +682,7 @@ impl TelegramTeamHub {
                 .await
         {
             row1.push(ActionButton {
-                label: "✅ Duyệt & Chạy tiếp".into(),
+                label: HubI18n::btn_approve_and_continue(locale).into(),
                 action: format!("t:{tok}"),
                 params: None,
             });
@@ -666,7 +702,7 @@ impl TelegramTeamHub {
             .await
         {
             row2.push(ActionButton {
-                label: "📋 Bảng Task".into(),
+                label: HubI18n::btn_task_board(locale).into(),
                 action: format!("t:{tok}"),
                 params: None,
             });
@@ -685,7 +721,7 @@ impl TelegramTeamHub {
                 .await
         {
             row2.push(ActionButton {
-                label: "⏹ Dừng".into(),
+                label: HubI18n::btn_stop(locale).into(),
                 action: format!("t:{tok}"),
                 params: None,
             });
@@ -810,6 +846,7 @@ impl TelegramTeamHub {
         };
 
         let mut buttons = Vec::new();
+        let locale = self.resolve_locale(owner_user_id).await;
         if let Ok(tok) = self
             .bridge_repo
             .create_action_token(
@@ -823,16 +860,13 @@ impl TelegramTeamHub {
             .await
         {
             buttons.push(vec![ActionButton {
-                label: format!("🔁 Thử lại {member_name}"),
+                label: HubI18n::btn_retry_member(locale, &member_name),
                 action: format!("t:{tok}"),
                 params: None,
             }]);
         }
 
-        let alert_md = format!(
-            "⚠️ **[{team_name} · Cảnh báo Member]**\n• **Thành viên:** `{member_name}`\n• **Chi tiết:** {reason}",
-            team_name = team.name
-        );
+        let alert_md = HubI18n::member_warning(locale, &team.name, &member_name, &reason);
         let _ = self
             .send_formatted_telegram_message(
                 owner_user_id,
@@ -862,11 +896,8 @@ impl TelegramTeamHub {
 
         if let Some(chat) = reply_chat {
             let (lead_name, _) = Self::find_lead_info(&team);
-            let md = format!(
-                "❌ **[{team_name} · {lead_name} 👑]**\nPhiên thực thi (`{run_id}`) gặp sự cố và đã dừng. Anh có thể nhắn lại để tiếp tục hoặc gõ `/status` kiểm tra.",
-                team_name = team.name,
-                run_id = payload.team_run_id
-            );
+            let locale = self.resolve_locale(owner_user_id).await;
+            let md = HubI18n::run_error_notice(locale, &team.name, &lead_name, &payload.team_run_id);
             let buttons = self
                 .make_team_quick_buttons(owner_user_id, &payload.team_id, false, false)
                 .await;
@@ -884,6 +915,201 @@ impl TelegramTeamHub {
         }
     }
 
+    fn classify_team_lead_wallet(team: &TeamResponse) -> (String, WalletType) {
+        let lead = team
+            .assistants
+            .iter()
+            .find(|a| {
+                a.role.eq_ignore_ascii_case("lead")
+                    || a.role.eq_ignore_ascii_case("leader")
+                    || team.leader_assistant_id.as_deref() == Some(a.slot_id.as_str())
+            })
+            .or_else(|| team.assistants.first());
+
+        let Some(agent) = lead else {
+            return ("lead".to_owned(), WalletType::CliSubscription);
+        };
+
+        let raw_backend = if !agent.backend.trim().is_empty() && !agent.backend.eq_ignore_ascii_case("custom") {
+            agent.backend.trim()
+        } else if !agent.assistant_backend.trim().is_empty() && !agent.assistant_backend.eq_ignore_ascii_case("custom")
+        {
+            agent.assistant_backend.trim()
+        } else {
+            agent.model.trim()
+        };
+
+        let normalized = raw_backend.to_lowercase();
+        let backend_hint = if normalized.starts_with("claude") && !normalized.contains('/') {
+            "claude"
+        } else if normalized.starts_with("codex") && !normalized.contains('/') {
+            "codex"
+        } else if normalized.starts_with("gemini") && !normalized.contains('/') {
+            "gemini"
+        } else if normalized.starts_with("antigravity") {
+            "antigravity"
+        } else {
+            normalized.as_str()
+        };
+
+        (
+            agent.slot_id.clone(),
+            classify_agent_wallet(Some(backend_hint), None, false),
+        )
+    }
+
+    async fn is_team_api_key_hard_blocked(
+        &self,
+        owner_user_id: &str,
+        team: &TeamResponse,
+    ) -> Option<(f64, f64)> {
+        let (_, wallet_type) = Self::classify_team_lead_wallet(team);
+        if wallet_type != WalletType::ApiKey {
+            return None;
+        }
+        let Ok(wallet) = self.bridge_repo.get_or_create_cost_wallet(owner_user_id).await else {
+            return None;
+        };
+        if wallet.is_hard_blocked() {
+            Some((wallet.api_key_spent_usd, wallet.api_key_budget_limit_usd))
+        } else {
+            None
+        }
+    }
+
+    async fn enforce_wallet_fuse_on_run_started(&self, owner_user_id: &str, payload: TeamRunPayload) {
+        let Ok(team) = self.team_service.get_team(owner_user_id, &payload.team_id).await else {
+            return;
+        };
+        if let Some((spent, limit)) = self.is_team_api_key_hard_blocked(owner_user_id, &team).await {
+            self.active_runs.remove(&payload.team_id);
+            let locale = self.resolve_locale(owner_user_id).await;
+            let notice = HubI18n::wallet_hard_blocked_notice(locale, &team.name, spent, limit);
+            let _ = self
+                .team_service
+                .cancel_run(
+                    owner_user_id,
+                    &payload.team_id,
+                    &payload.team_run_id,
+                    None,
+                    Some(notice),
+                )
+                .await;
+        }
+    }
+
+    async fn record_team_run_cost(
+        &self,
+        owner_user_id: &str,
+        team: &TeamResponse,
+        run_id: &str,
+        synthesis_chars: usize,
+    ) {
+        let (agent_id, wallet_type) = Self::classify_team_lead_wallet(team);
+        let tokens_out = ((synthesis_chars as i64) / 4).max(64);
+        let tokens_in = 512_i64;
+        let cost_usd = match wallet_type {
+            WalletType::CliSubscription => 0.0,
+            WalletType::ApiKey => ((tokens_in as f64 * 0.000003) + (tokens_out as f64 * 0.000015)).max(0.01),
+        };
+
+        if let Ok((wallet, newly_soft, newly_hard)) = self
+            .bridge_repo
+            .record_cost_run(RecordCostRunParams {
+                owner_user_id: owner_user_id.to_owned(),
+                run_id: run_id.to_owned(),
+                team_id: team.id.clone(),
+                agent_id,
+                wallet_type: wallet_type.as_str().to_owned(),
+                tokens_input: tokens_in,
+                tokens_output: tokens_out,
+                cost_usd,
+            })
+            .await
+        {
+            self.event_bus.broadcast(WebSocketMessage::new(
+                "wallet:spend_updated",
+                serde_json::json!({
+                    "user_id": owner_user_id,
+                    "spent_usd": wallet.api_key_spent_usd,
+                    "budget_limit_usd": wallet.api_key_budget_limit_usd,
+                    "cli_subscription_runs": wallet.cli_subscription_runs_count,
+                    "api_key_runs": wallet.api_key_runs_count,
+                    "soft_warning": wallet.is_soft_warning(),
+                    "hard_blocked": wallet.is_hard_blocked(),
+                }),
+            ));
+
+            if (newly_soft || newly_hard)
+                && let Ok(items) = self
+                    .bridge_repo
+                    .list_action_inbox_items(owner_user_id, Some("pending"))
+                    .await
+                && let Some(latest_budget_card) = items.into_iter().find(|r| r.category == "budget_warning")
+            {
+                self.event_bus.broadcast(WebSocketMessage::new(
+                    "inbox:item_added",
+                    serde_json::json!({
+                        "user_id": owner_user_id,
+                        "item": ActionInboxCardDto::from_row(latest_budget_card),
+                    }),
+                ));
+            }
+        }
+    }
+
+    pub async fn sync_desktop_inbox_resolution_to_telegram(&self, data: serde_json::Value) {
+        let Some(owner_user_id) = data.get("user_id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(card_id) = data.get("id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let action = data
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("resolved");
+
+        let (tg_chat_opt, tg_msg_opt, title) = if let Ok(Some(card)) = self.bridge_repo.get_action_inbox_item(card_id).await {
+            (
+                card.telegram_chat_id,
+                card.telegram_msg_id,
+                card.title,
+            )
+        } else {
+            (
+                data.get("telegram_chat_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+                data.get("telegram_msg_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+                data.get("title").and_then(serde_json::Value::as_str).unwrap_or(card_id).to_owned(),
+            )
+        };
+
+        let (Some(chat_id), Some(msg_id)) = (tg_chat_opt, tg_msg_opt) else {
+            return;
+        };
+
+        let locale = self.resolve_locale(owner_user_id).await;
+        let updated_md = HubI18n::inbox_resolved_on_desktop(locale, &title, action);
+        let edit_msg = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Text,
+            text: Some(markdown_to_telegram_html(&updated_md)),
+            parse_mode: Some(ParseMode::HTML),
+            buttons: None,
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        let base_chat = split_chat_and_thread(&chat_id).0;
+        let _ = self
+            .channel_manager
+            .edit_message(owner_user_id, "telegram", base_chat, &msg_id, edit_msg)
+            .await;
+    }
+
     async fn handle_team_run_completed(&self, owner_user_id: &str, payload: TeamRunPayload) {
         let tracker = self.active_runs.remove(&payload.team_id).map(|(_, v)| v);
         let Ok(team) = self.team_service.get_team(owner_user_id, &payload.team_id).await else {
@@ -894,6 +1120,16 @@ impl TelegramTeamHub {
             .as_ref()
             .map(|t| t.started_at_ms)
             .unwrap_or_else(|| now_ms().saturating_sub(60_000));
+        let cached_synthesis = self
+            .read_latest_lead_synthesis(owner_user_id, &team, started_at_ms)
+            .await;
+        self.record_team_run_cost(
+            owner_user_id,
+            &team,
+            &payload.team_run_id,
+            cached_synthesis.as_deref().map_or(0, str::len),
+        )
+        .await;
 
         // 1. Closed-Loop Shared Room Handoff Guarantee (Layer 2):
         // If this Team had any pending Shared Room handoff and went idle without calling `team_room_post`,
@@ -901,10 +1137,7 @@ impl TelegramTeamHub {
         if let Ok(pending_rooms) = self.bridge_repo.list_pending_handoffs_for_team(&payload.team_id).await
             && !pending_rooms.is_empty()
         {
-            if let Some(synthesis) = self
-                .read_latest_lead_synthesis(owner_user_id, &team, started_at_ms)
-                .await
-            {
+            if let Some(ref synthesis) = cached_synthesis {
                 for (room, _member) in pending_rooms {
                     let _ = self
                         .post_message_to_shared_room(PostRoomMessageArgs {
@@ -912,11 +1145,12 @@ impl TelegramTeamHub {
                             room_id: &room.id,
                             sender_type: "leader",
                             sender_team_id: Some(&payload.team_id),
-                            content: &synthesis,
+                            content: synthesis,
                             explicit_mentions: Vec::new(),
                             source_files: Vec::new(),
                             reply_to_id: None,
                             origin_telegram_chat: None,
+                            wake_targets: None,
                         })
                         .await;
                 }
@@ -1072,10 +1306,27 @@ impl TelegramTeamHub {
         };
 
         let mut user_text = msg.content.text.trim().to_owned();
+        let locale = self.resolve_locale(owner_user_id).await;
         if user_text.is_empty() && !saved_files.is_empty() {
-            user_text = format!("Anh vừa gửi {} file đính kèm qua Telegram, hãy kiểm tra.", saved_files.len());
+            user_text = HubI18n::telegram_attachment_notice(locale, saved_files.len());
         }
         if user_text.is_empty() {
+            return Ok(true);
+        }
+
+        if let Some((spent, limit)) = self.is_team_api_key_hard_blocked(owner_user_id, &team).await {
+            let notice = HubI18n::wallet_hard_blocked_notice(locale, &team.name, spent, limit);
+            let _ = self
+                .send_formatted_telegram_message(
+                    owner_user_id,
+                    &reply_chat,
+                    &notice,
+                    None,
+                    Some(msg.id.clone()),
+                    CustomTargetType::Team,
+                    team_id,
+                )
+                .await;
             return Ok(true);
         }
 
@@ -1101,10 +1352,7 @@ impl TelegramTeamHub {
         {
             Ok(_ack) => {
                 let (lead_name, _) = Self::find_lead_info(&team);
-                let ack_md = format!(
-                    "⏳ **[{team_name} · {lead_name} 👑]** đã nhận yêu cầu và đang xử lý...",
-                    team_name = team.name
-                );
+                let ack_md = HubI18n::request_received_processing(locale, &team.name, &lead_name);
                 let stop_btns = self.make_team_quick_buttons(owner_user_id, team_id, false, true).await;
                 let _ = self
                     .send_formatted_telegram_message(
@@ -1121,10 +1369,7 @@ impl TelegramTeamHub {
             }
             Err(err) => {
                 self.active_runs.remove(team_id);
-                let err_md = format!(
-                    "⚠️ Không thể gửi tin tới Team **{}**: `{}`",
-                    team.name, err
-                );
+                let err_md = HubI18n::unable_to_send_team_message(locale, &team.name, &err.to_string());
                 let _ = self
                     .send_formatted_telegram_message(
                         owner_user_id,
@@ -1152,10 +1397,11 @@ impl TelegramTeamHub {
         };
         let reply_chat = format_chat_with_thread(&msg.chat_id, msg.thread_id().as_deref());
         let saved_files = self.download_inbound_files(owner_user_id, msg, None, room_id).await;
+        let locale = self.resolve_locale(owner_user_id).await;
 
         let mut user_text = msg.content.text.trim().to_owned();
         if user_text.is_empty() && !saved_files.is_empty() {
-            user_text = format!("Anh vừa đính kèm {} file vào phòng họp.", saved_files.len());
+            user_text = HubI18n::shared_room_attached_files(locale, saved_files.len());
         }
         if user_text.is_empty() {
             return Ok(true);
@@ -1172,6 +1418,7 @@ impl TelegramTeamHub {
                 source_files: saved_files,
                 reply_to_id: None,
                 origin_telegram_chat: Some(reply_chat.clone()),
+                wake_targets: None,
             })
             .await;
 
@@ -1179,11 +1426,7 @@ impl TelegramTeamHub {
             && !routed.is_empty()
         {
             let woken_names: Vec<String> = routed.iter().map(|r| format!("`{}`", r.team_id)).collect();
-            let ack = format!(
-                "📨 **[Phòng Họp Liên Team]** Đã định tuyến tới {} Leader ({})",
-                routed.len(),
-                woken_names.join(", ")
-            );
+            let ack = HubI18n::shared_room_routed_notice(locale, routed.len(), &woken_names.join(", "));
             let _ = self
                 .send_formatted_telegram_message(
                     owner_user_id,
@@ -1213,20 +1456,21 @@ impl TelegramTeamHub {
             .unwrap_or_default();
 
         let has_active_run = run_state.as_ref().and_then(|r| r.active_run.as_ref()).is_some();
+        let locale = self.resolve_locale(owner_user_id).await;
         let run_badge = match run_state.as_ref().and_then(|r| r.active_run.as_ref()) {
-            Some(r) => format!("🟢 Đang chạy (`{:?}`)", r.status),
-            None => "⚪ Đang nghỉ (Idle)".to_owned(),
+            Some(r) => HubI18n::status_running(locale, &format!("{:?}", r.status)),
+            None => HubI18n::status_idle(locale).to_owned(),
         };
 
         let mut lines = vec![
-            format!("📊 **[{} · Bảng Trạng Thái]**", team.name),
-            format!("• **Trạng thái:** {run_badge}"),
+            HubI18n::status_board_header(locale, &team.name),
+            HubI18n::status_board_status(locale, &run_badge),
         ];
         if !team.workspace.trim().is_empty() {
             lines.push(format!("• **Workspace:** `{}`", team.workspace));
         }
 
-        lines.push("\n**Thành viên:**".to_owned());
+        lines.push(HubI18n::status_board_members(locale).to_owned());
         for a in &team.assistants {
             let role_icon = if a.role.eq_ignore_ascii_case("lead") || a.role.eq_ignore_ascii_case("leader") {
                 "👑"
@@ -1238,17 +1482,17 @@ impl TelegramTeamHub {
         }
 
         if tasks.is_empty() {
-            lines.push("\n📋 **TaskBoard:** Chưa có task nào.".to_owned());
+            lines.push(HubI18n::taskboard_empty(locale).to_owned());
         } else {
             let completed = tasks.iter().filter(|t| t.status == "completed").count();
             let in_prog = tasks.iter().filter(|t| t.status == "in_progress").count();
             let pending = tasks.iter().filter(|t| t.status == "pending").count();
-            lines.push(format!(
-                "\n📋 **TaskBoard ({} tasks):** ✅ {} xong · 🔄 {} đang làm · ⏳ {} chờ",
+            lines.push(HubI18n::taskboard_counts(
+                locale,
                 tasks.len(),
                 completed,
                 in_prog,
-                pending
+                pending,
             ));
             for t in tasks.iter().take(8) {
                 let icon = match t.status.as_str() {
@@ -1270,16 +1514,21 @@ impl TelegramTeamHub {
     async fn build_status_card_for_room(&self, owner_user_id: &str, room_id: &str) -> Result<(String, Option<Vec<Vec<ActionButton>>>), String> {
         let dto = self.build_shared_room_dto(owner_user_id, room_id).await?;
         let tasks = self.list_shared_room_task_dtos(owner_user_id, room_id).await?;
+        let locale = self.resolve_locale(owner_user_id).await;
 
         let mut lines = vec![
-            format!("🏛 **[Phòng Họp: {}]**", dto.name),
-            format!("• **Lượt thảo luận tự động:** `{}/{}`", dto.hop_count_since_human, dto.max_hops),
-            "\n**Các Team tham gia (Leader Hub):**".to_owned(),
+            HubI18n::shared_room_header(locale, &dto.name),
+            HubI18n::shared_room_hops(locale, dto.hop_count_since_human, dto.max_hops),
+            HubI18n::shared_room_participating(locale).to_owned(),
         ];
         for m in &dto.members {
-            let crown = if m.is_host { "🪑 Chủ trì" } else { "👑 Leader" };
+            let crown = if m.is_host {
+                HubI18n::role_chair(locale)
+            } else {
+                HubI18n::role_leader(locale)
+            };
             let handoff = if m.pending_handoff_msg_id.is_some() {
-                " _(đang xử lý handoff)_"
+                HubI18n::handling_handoff_indicator(locale)
             } else {
                 ""
             };
@@ -1287,9 +1536,9 @@ impl TelegramTeamHub {
         }
 
         if tasks.is_empty() {
-            lines.push("\n📋 **Cross-Team Tasks:** Chưa có task liên team.".to_owned());
+            lines.push(HubI18n::cross_team_tasks_empty(locale).to_owned());
         } else {
-            lines.push(format!("\n📋 **Cross-Team Tasks ({}):**", tasks.len()));
+            lines.push(HubI18n::cross_team_tasks_header(locale, tasks.len()));
             for t in tasks.iter().take(8) {
                 let icon = match t.status.as_str() {
                     "completed" => "✅",
@@ -1299,7 +1548,7 @@ impl TelegramTeamHub {
                 let blocked_note = if t.blocked_by.is_empty() {
                     String::new()
                 } else {
-                    format!(" [chờ: {}]", t.blocked_by.join(","))
+                    HubI18n::blocked_tag(locale, &t.blocked_by.join(","))
                 };
                 lines.push(format!(
                     "  {icon} `{}` → **@{}**: {}{}",
@@ -1323,7 +1572,7 @@ impl TelegramTeamHub {
                 .await
         {
             rows.push(vec![ActionButton {
-                label: "✅ Cho phép thảo luận tiếp (+5 lượt)".into(),
+                label: HubI18n::btn_allow_more_hops(locale).into(),
                 action: format!("t:{tok}"),
                 params: None,
             }]);
@@ -1554,8 +1803,9 @@ impl TelegramTeamHub {
                 .await;
         }
 
+        let locale = self.resolve_locale(args.owner_user_id).await;
         let sender_label = match (args.sender_type, args.sender_team_id) {
-            ("user", _) => "Anh (User)".to_owned(),
+            ("user", _) => HubI18n::room_user_sender_label(locale).to_owned(),
             ("leader", Some(tid)) => room_dto
                 .members
                 .iter()
@@ -1622,7 +1872,12 @@ impl TelegramTeamHub {
             })
             .collect();
 
-        let routed_targets = if args.sender_type == "system" {
+        let mut routed_targets = if args.sender_type == "system" {
+            Vec::new()
+        } else if let Some(ref allowlist) = args.wake_targets
+            && allowlist.is_empty()
+        {
+            // User explicitly muted all wake-preview chips in RoundedPillComposer
             Vec::new()
         } else {
             let providers = self
@@ -1642,6 +1897,44 @@ impl TelegramTeamHub {
             };
             resolve_room_targets(&routing_input, &providers, &self.encryption_key).await
         };
+
+        // Apply Desktop wake-chip allowlist when user muted specific chips
+        if let Some(ref allowlist) = args.wake_targets
+            && !allowlist.is_empty()
+        {
+            let mut allowed_ids = Vec::new();
+            for raw in allowlist {
+                let needle = raw.trim().trim_start_matches('@').to_lowercase();
+                if needle.is_empty() {
+                    continue;
+                }
+                for m in &room_dto.members {
+                    if (m.team_id.eq_ignore_ascii_case(&needle)
+                        || m.team_name.to_lowercase() == needle
+                        || mention_slug(&m.team_name) == mention_slug(&needle))
+                        && !allowed_ids.contains(&m.team_id)
+                    {
+                        allowed_ids.push(m.team_id.clone());
+                    }
+                }
+            }
+
+            routed_targets.retain(|rt| allowed_ids.contains(&rt.team_id));
+
+            // If user deliberately muted some chips (e.g., muted Host to wake a specific Member)
+            // and default routing picked only muted teams, fall back to the unmuted chips.
+            if routed_targets.is_empty() && allowed_ids.len() < room_dto.members.len() {
+                routed_targets = allowed_ids
+                    .into_iter()
+                    .filter(|tid| !is_team_blocked_by_dependencies(tid, &room_tasks))
+                    .map(|team_id| RoutedTarget {
+                        team_id,
+                        reason: "explicit:wake_chip".to_owned(),
+                        tier: 1,
+                    })
+                    .collect();
+            }
+        }
 
         // Check `max_hops` loop guard for bot-to-bot turns
         let refreshed_room = self
@@ -1742,8 +2035,41 @@ impl TelegramTeamHub {
             return Ok((msg_dto, Vec::new()));
         }
 
-        // Dispatch wakeups to each routed Team's Lead
+        // Dispatch wakeups to each routed Team's Lead (enforcing 100% Smart Budget Fuse for metered API-key teams)
         for target in &effective_targets {
+            if let Ok(team_meta) = self.team_service.get_team(args.owner_user_id, &target.team_id).await
+                && let Some((spent, limit)) = self.is_team_api_key_hard_blocked(args.owner_user_id, &team_meta).await
+            {
+                let fuse_notice = HubI18n::wallet_hard_blocked_notice(locale, &team_meta.name, spent, limit);
+                if let Ok(saved_fuse) = self
+                    .bridge_repo
+                    .insert_shared_room_message(CreateSharedRoomMessageParams {
+                        id: generate_prefixed_id("smsg"),
+                        room_id: args.room_id.to_owned(),
+                        sender_type: "system".to_owned(),
+                        sender_team_id: None,
+                        sender_label: "Budget Fuse".to_owned(),
+                        reply_to_id: None,
+                        content: fuse_notice,
+                        attachments_json: "[]".to_owned(),
+                        target_team_ids_json: "[]".to_owned(),
+                        hop_index: current_hop,
+                    })
+                    .await
+                {
+                    let fuse_dto = Self::map_room_message_dto(saved_fuse);
+                    self.event_bus.broadcast(WebSocketMessage::new(
+                        "sharedRoom.messageCreated",
+                        serde_json::json!({
+                            "user_id": args.owner_user_id,
+                            "room_id": args.room_id,
+                            "message": fuse_dto,
+                        }),
+                    ));
+                }
+                continue;
+            }
+
             let _ = self
                 .bridge_repo
                 .set_member_pending_handoff(args.room_id, &target.team_id, Some(&msg_id), current_hop)
@@ -1840,10 +2166,8 @@ impl TelegramTeamHub {
     }
 
     async fn emit_hop_limit_reached_notice(&self, owner_user_id: &str, room_dto: &SharedRoomDto) {
-        let notice_text = format!(
-            "⏸ Đã tạm dừng chuyển lượt tự động sau **{}** lượt trao đổi liên tiếp giữa các Leader để tránh tốn token ngoài ý muốn. Bấm **Cho phép thảo luận tiếp (+5 lượt)** hoặc gửi tin nhắn mới để tiếp tục.",
-            room_dto.max_hops
-        );
+        let locale = self.resolve_locale(owner_user_id).await;
+        let notice_text = HubI18n::max_hops_paused_notice(locale, room_dto.max_hops);
         let msg_id = generate_prefixed_id("smsg");
         if let Ok(saved) = self
             .bridge_repo
@@ -1873,27 +2197,32 @@ impl TelegramTeamHub {
             ));
         }
 
+        let action_token = self
+            .bridge_repo
+            .create_action_token(
+                owner_user_id,
+                CustomTargetType::Room,
+                &room_dto.id,
+                "allow_more_hops",
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .ok();
+
+        let mut tg_chat_for_inbox: Option<String> = None;
+        let mut tg_msg_for_inbox: Option<String> = None;
+
         if let Some(tg_dest) = self.resolve_room_telegram_destination(owner_user_id, &room_dto.id).await {
             let mut buttons = Vec::new();
-            if let Ok(tok) = self
-                .bridge_repo
-                .create_action_token(
-                    owner_user_id,
-                    CustomTargetType::Room,
-                    &room_dto.id,
-                    "allow_more_hops",
-                    &serde_json::json!({}),
-                    None,
-                )
-                .await
-            {
+            if let Some(ref tok) = action_token {
                 buttons.push(vec![ActionButton {
-                    label: "✅ Cho phép thảo luận tiếp (+5 lượt)".into(),
+                    label: HubI18n::btn_allow_more_hops(locale).into(),
                     action: format!("t:{tok}"),
                     params: None,
                 }]);
             }
-            let _ = self
+            if let Ok(sent_ids) = self
                 .send_formatted_telegram_message(
                     owner_user_id,
                     &tg_dest,
@@ -1903,7 +2232,47 @@ impl TelegramTeamHub {
                     CustomTargetType::Room,
                     &room_dto.id,
                 )
-                .await;
+                .await
+            {
+                tg_chat_for_inbox = Some(tg_dest);
+                tg_msg_for_inbox = sent_ids.into_iter().last();
+            }
+        }
+
+        let inbox_title = match locale {
+            HubLocale::ViVn => format!("Chạm giới hạn vòng thảo luận tại #{}", room_dto.name),
+            HubLocale::EnUs => format!("Max-Hops Loop Limit Reached in #{}", room_dto.name),
+        };
+        if let Ok(inbox_row) = self
+            .bridge_repo
+            .create_action_inbox_item(CreateActionInboxParams {
+                id: None,
+                owner_user_id: owner_user_id.to_owned(),
+                category: "max_hops".to_owned(),
+                title: inbox_title,
+                summary: notice_text,
+                details_json: serde_json::json!({
+                    "room_id": room_dto.id,
+                    "room_name": room_dto.name,
+                    "current_hops": room_dto.hop_count_since_human,
+                    "max_hops": room_dto.max_hops,
+                })
+                .to_string(),
+                target_type: Some("room".to_owned()),
+                target_id: room_dto.id.clone(),
+                action_token,
+                telegram_chat_id: tg_chat_for_inbox,
+                telegram_msg_id: tg_msg_for_inbox,
+            })
+            .await
+        {
+            self.event_bus.broadcast(WebSocketMessage::new(
+                "inbox:item_added",
+                serde_json::json!({
+                    "user_id": owner_user_id,
+                    "item": ActionInboxCardDto::from_row(inbox_row),
+                }),
+            ));
         }
     }
 
@@ -2033,6 +2402,19 @@ impl TelegramTeamHub {
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Shared room task not found: {task_id}"))?;
+
+        // Feature F19: Human-Only Done Guard
+        // Automated agents (actor_team_id.is_some()) are strictly forbidden from transitioning tasks to 'done' or 'completed'.
+        // Only human users (actor_team_id = None) have the authority to finalize tasks.
+        if let Some(ref st) = status {
+            let normalized = st.trim().to_lowercase();
+            if (normalized == "done" || normalized == "completed") && actor_team_id.is_some() {
+                return Err(
+                    "Forbidden: Only human users can transition a task to Done. Agents may only transition tasks up to 'in_review' or 'blocked'."
+                        .to_string(),
+                );
+            }
+        }
 
         let room_dto = self
             .build_shared_room_dto(owner_user_id, &existing.room_id)
@@ -2186,6 +2568,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
         args: &str,
     ) -> Result<Option<ActionResponse>, ChannelError> {
         let trimmed_args = args.trim();
+        let locale = self.resolve_locale(owner_user_id).await;
 
         match command {
             "/team" | "/teams" => {
@@ -2197,7 +2580,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
 
                 if teams.is_empty() {
                     return Ok(Some(ActionResponse {
-                        text: Some("Chưa có Team nào trong AionUi. Anh tạo Team trên app trước nhé!".into()),
+                        text: Some(HubI18n::no_teams_info(locale).into()),
                         parse_mode: None,
                         buttons: None,
                         keyboard: None,
@@ -2228,9 +2611,10 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                     stream_mode: CustomStreamMode::Milestones,
                                 })
                                 .await?;
-                            let html = markdown_to_telegram_html(&format!(
-                                "📌 Đã gắn nhóm/topic này với Team **[{team_name} · {lead_name} 👑]**!\nTừ giờ mọi tin nhắn tại đây sẽ gửi thẳng tới Leader `{lead_name}`.",
-                                team_name = team.name
+                            let html = markdown_to_telegram_html(&HubI18n::bind_topic_info(
+                                locale,
+                                &team.name,
+                                &lead_name,
                             ));
                             return Ok(Some(ActionResponse {
                                 text: Some(html),
@@ -2254,10 +2638,11 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                     &team.id,
                                 )
                                 .await?;
-                            let html = markdown_to_telegram_html(&format!(
-                                "✅ Đã chuyển kênh chat sang Team **[{team_name} · {lead_name} 👑]** ({count} thành viên).\nAnh nhắn trực tiếp ở đây để giao việc cho Leader nhé! _(Gõ `/solo` nếu muốn về chat đơn)_",
-                                team_name = team.name,
-                                count = team.assistants.len()
+                            let html = markdown_to_telegram_html(&HubI18n::switch_team_info(
+                                locale,
+                                &team.name,
+                                &lead_name,
+                                team.assistants.len(),
                             ));
                             return Ok(Some(ActionResponse {
                                 text: Some(html),
@@ -2328,16 +2713,16 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         )
                         .await?;
                     rows.push(vec![ActionButton {
-                        label: "🏠 Chuyển về Solo Chat riêng".into(),
+                        label: HubI18n::btn_switch_solo(locale).into(),
                         action: format!("t:{solo_tok}"),
                         params: None,
                     }]);
                 }
 
                 let header = if msg.is_group_chat() {
-                    "📌 **Chọn Team để gắn với nhóm / Topic này:**"
+                    HubI18n::select_team_bind_prompt(locale)
                 } else {
-                    "👑 **Chọn Team anh muốn trò chuyện trực tiếp với Leader:**\n_(Mẹo: Khi bất kỳ Team nào báo cáo chủ động, anh chỉ cần vuốt **Reply** vào tin nhắn đó là trả lời đúng Team ngay!)_"
+                    HubI18n::select_team_chat_prompt(locale)
                 };
 
                 Ok(Some(ActionResponse {
@@ -2354,9 +2739,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
             "/room" | "/rooms" => {
                 let rooms = self.bridge_repo.list_shared_rooms(owner_user_id).await?;
                 if rooms.is_empty() {
-                    let html = markdown_to_telegram_html(
-                        "🏛 Chưa có **Phòng Họp Liên Team (Shared Room)** nào.\nAnh có thể bấm `+` ở mục **Shared Rooms** trên thanh bên trái AionUi để tạo phòng họp giữa nhiều Leader!",
-                    );
+                    let html = markdown_to_telegram_html(HubI18n::no_shared_rooms_info(locale));
                     return Ok(Some(ActionResponse {
                         text: Some(html),
                         parse_mode: Some(ParseMode::HTML),
@@ -2399,9 +2782,9 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                 )
                                 .await?;
                         }
-                        let html = markdown_to_telegram_html(&format!(
-                            "🏛 Đã kết nối tới Phòng Họp Liên Team **#{}**!\nAnh có thể tag `@TeamName`, `@all` hoặc nhắn tự nhiên để các Leader phối hợp.",
-                            room.name
+                        let html = markdown_to_telegram_html(&HubI18n::shared_room_joined_info(
+                            locale,
+                            &room.name,
                         ));
                         return Ok(Some(ActionResponse {
                             text: Some(html),
@@ -2441,9 +2824,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                 }
 
                 Ok(Some(ActionResponse {
-                    text: Some(markdown_to_telegram_html(
-                        "🏛 **Chọn Phòng Họp Liên Team (Shared Room):**",
-                    )),
+                    text: Some(markdown_to_telegram_html(HubI18n::select_shared_room_prompt(locale))),
                     parse_mode: Some(ParseMode::HTML),
                     buttons: Some(rows),
                     keyboard: None,
@@ -2458,9 +2839,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                     .clear_dm_target(owner_user_id, "telegram", &msg.chat_id)
                     .await?;
                 Ok(Some(ActionResponse {
-                    text: Some(markdown_to_telegram_html(
-                        "🏠 Đã chuyển về chế độ **Solo Chat** riêng. Gõ `/team` bất kỳ lúc nào để kết nối lại với các Team!",
-                    )),
+                    text: Some(markdown_to_telegram_html(HubI18n::switched_to_solo_info(locale))),
                     parse_mode: Some(ParseMode::HTML),
                     buttons: None,
                     keyboard: None,
@@ -2538,7 +2917,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
 
                 let Some((ttype, tid)) = target else {
                     return Ok(Some(ActionResponse {
-                        text: Some("Hiện không có Team nào đang gắn với cuộc trò chuyện này.".into()),
+                        text: Some(HubI18n::no_bound_team_info(locale).into()),
                         parse_mode: None,
                         buttons: None,
                         keyboard: None,
@@ -2586,9 +2965,9 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                 }
 
                 let reply_md = if stopped_names.is_empty() {
-                    "⚪ Hiện không có phiên chạy (active run) nào cần dừng.".to_owned()
+                    HubI18n::no_active_runs_to_stop(locale).to_owned()
                 } else {
-                    format!("⏹ Đã gửi lệnh dừng cho `{}` phiên đang chạy!", stopped_names.len())
+                    HubI18n::stopped_active_runs_info(locale, stopped_names.len())
                 };
                 Ok(Some(ActionResponse {
                     text: Some(markdown_to_telegram_html(&reply_md)),
@@ -2612,6 +2991,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
         context: &ActionContext,
         raw_meta: Option<&serde_json::Value>,
     ) -> Result<ActionResponse, ChannelError> {
+        let locale = self.resolve_locale(owner_user_id).await;
         let Some(row) = self.bridge_repo.get_valid_action_token(token).await? else {
             return Ok(ActionResponse {
                 text: None,
@@ -2619,7 +2999,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                 buttons: None,
                 keyboard: None,
                 behavior: ActionBehavior::Answer,
-                toast: Some("⏱ Nút thao tác này đã hết hạn.".into()),
+                toast: Some(HubI18n::action_expired(locale).into()),
                 edit_message_id: None,
             });
         };
@@ -2678,9 +3058,10 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         .await?;
                 }
 
-                let text = markdown_to_telegram_html(&format!(
-                    "✅ Đang kết nối trực tiếp với **[{team_name} · {lead_name} 👑]**!\nAnh gửi tin nhắn hoặc ảnh/tài liệu để giao việc cho Leader nhé.",
-                    team_name = team.name
+                let text = markdown_to_telegram_html(&HubI18n::connected_team_notice(
+                    locale,
+                    &team.name,
+                    &lead_name,
                 ));
                 Ok(ActionResponse {
                     text: Some(text),
@@ -2690,7 +3071,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         .await,
                     keyboard: None,
                     behavior: ActionBehavior::Send,
-                    toast: Some(format!("Đã chọn Team {}", team.name)),
+                    toast: Some(HubI18n::selected_team_toast(locale, &team.name)),
                     edit_message_id: None,
                 })
             }
@@ -2727,17 +3108,14 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         .await?;
                 }
 
-                let text = markdown_to_telegram_html(&format!(
-                    "🏛 Đang ở **Phòng Họp Liên Team #{room_name}**!\nNhắn `@TeamName`, `@all` hoặc giao việc chung để các Leader phối hợp.",
-                    room_name = room.name
-                ));
+                let text = markdown_to_telegram_html(&HubI18n::in_shared_room_notice(locale, &room.name));
                 Ok(ActionResponse {
                     text: Some(text),
                     parse_mode: Some(ParseMode::HTML),
                     buttons: None,
                     keyboard: None,
                     behavior: ActionBehavior::Send,
-                    toast: Some(format!("Đã mở phòng #{}", room.name)),
+                    toast: Some(HubI18n::opened_room_toast(locale, &room.name)),
                     edit_message_id: None,
                 })
             }
@@ -2748,7 +3126,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                     .await?;
                 Ok(ActionResponse {
                     text: Some(markdown_to_telegram_html(
-                        "🏠 Đã chuyển về **Solo Chat** mặc định. Gõ `/team` khi cần quay lại Team!",
+                        HubI18n::switched_to_default_solo_notice(locale),
                     )),
                     parse_mode: Some(ParseMode::HTML),
                     buttons: None,
@@ -2776,7 +3154,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         edit_message_id: None,
                     }),
                     Err(e) => Ok(ActionResponse {
-                        text: Some(format!("⚠️ Không đọc được bảng Task: {e}")),
+                        text: Some(HubI18n::read_taskboard_error(locale, &e)),
                         parse_mode: None,
                         buttons: None,
                         keyboard: None,
@@ -2788,7 +3166,8 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
             }
 
             // Mutating one-shot actions guarded by `consume_action_token_once`
-            "approve_continue" | "stop_run" | "retry_member" | "allow_more_hops" => {
+            "approve_continue" | "stop_run" | "retry_member" | "allow_more_hops"
+            | "worktree_merge" | "inbox_resolve" | "inbox_choice" | "budget_ack" => {
                 let consumed = self.bridge_repo.consume_action_token_once(token).await?;
                 if !consumed {
                     return Ok(ActionResponse {
@@ -2797,9 +3176,28 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         buttons: None,
                         keyboard: None,
                         behavior: ActionBehavior::Answer,
-                        toast: Some("✅ Thao tác này đã được xử lý trước đó.".into()),
+                        toast: Some(HubI18n::action_already_processed(locale).into()),
                         edit_message_id: None,
                     });
+                }
+
+                // If this action token was attached to an Action Inbox card, mark it resolved
+                let resolved_inbox_item = self
+                    .bridge_repo
+                    .resolve_action_inbox_item_by_token(token, row.action_kind.as_str(), "telegram")
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(ref inbox_item) = resolved_inbox_item {
+                    self.event_bus.broadcast(WebSocketMessage::new(
+                        "inbox:item_resolved",
+                        serde_json::json!({
+                            "user_id": owner_user_id,
+                            "id": inbox_item.id,
+                            "action": row.action_kind,
+                            "resolved_by": "telegram",
+                        }),
+                    ));
                 }
 
                 match row.action_kind.as_str() {
@@ -2819,17 +3217,18 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                 notify_completed_sent: false,
                             },
                         );
+                        let default_prompt = HubI18n::default_approval_prompt(locale);
                         let approval_msg = payload
                             .get("prompt")
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("Anh đã duyệt phương án đề xuất (Approved). Hãy tiến hành triển khai và báo cáo khi hoàn thành.");
+                            .unwrap_or(default_prompt);
                         let _ = self
                             .team_service
                             .send_message(owner_user_id, &row.target_id, approval_msg, None)
                             .await;
                         Ok(ActionResponse {
                             text: Some(markdown_to_telegram_html(
-                                "✅ **Đã gửi xác nhận duyệt** tới Leader! Hệ thống đang tiếp tục triển khai...",
+                                HubI18n::approval_confirmed_markdown(locale),
                             )),
                             parse_mode: Some(ParseMode::HTML),
                             buttons: None,
@@ -2856,7 +3255,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                 .await;
                         }
                         Ok(ActionResponse {
-                            text: Some(markdown_to_telegram_html("⏹ **Đã gửi lệnh dừng phiên chạy!**")),
+                            text: Some(markdown_to_telegram_html(HubI18n::run_stopped_markdown(locale))),
                             parse_mode: Some(ParseMode::HTML),
                             buttons: None,
                             keyboard: None,
@@ -2885,7 +3284,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         }
                         Ok(ActionResponse {
                             text: Some(markdown_to_telegram_html(
-                                "🔁 **Đã gửi lệnh khởi động lại runtime cho Member!**",
+                                HubI18n::member_runtime_restarted_markdown(locale),
                             )),
                             parse_mode: Some(ParseMode::HTML),
                             buttons: None,
@@ -2912,8 +3311,83 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         }
                         Ok(ActionResponse {
                             text: Some(markdown_to_telegram_html(
-                                "✅ **Đã cấp thêm +5 lượt thảo luận tự động** cho Phòng Họp Liên Team!",
+                                HubI18n::more_hops_granted_markdown(locale),
                             )),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: ActionBehavior::Send,
+                            toast: None,
+                            edit_message_id: None,
+                        })
+                    }
+
+                    "worktree_merge" => {
+                        let inbox_details: serde_json::Value = resolved_inbox_item
+                            .as_ref()
+                            .and_then(|item| serde_json::from_str(&item.details_json).ok())
+                            .unwrap_or_default();
+                        let lease_id_opt = payload
+                            .get("lease_id")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| inbox_details.get("lease_id").and_then(serde_json::Value::as_str))
+                            .or_else(|| (row.target_type == "worktree").then_some(row.target_id.as_str()));
+
+                        if let Some(lease_id) = lease_id_opt
+                            && let Ok(Some(lease)) = self.bridge_repo.get_worktree_lease(lease_id).await
+                        {
+                            let commit_msg = format!(
+                                "feat({}): squash merge worktree {}",
+                                lease.team_id.as_deref().unwrap_or("team"),
+                                lease.lease_id
+                            );
+                            let engine = GitWorktreeEngine::new();
+                            if let Ok(merge_res) = engine
+                                .squash_merge(
+                                    std::path::Path::new(&lease.repo_path),
+                                    std::path::Path::new(&lease.worktree_path),
+                                    &lease.branch,
+                                    &lease.base_branch,
+                                    &commit_msg,
+                                    Some("User"),
+                                    Some("user@local"),
+                                    &lease.lease_id,
+                                )
+                                .await
+                            {
+                                let _ = self
+                                    .bridge_repo
+                                    .update_worktree_status(
+                                        lease_id,
+                                        "merged",
+                                        merge_res.leftovers_ref.as_deref(),
+                                    )
+                                    .await;
+                            }
+                        }
+
+                        let text = match locale {
+                            HubLocale::ViVn => "✅ **Đã duyệt gộp nhánh Git Worktree qua Telegram!**",
+                            HubLocale::EnUs => "✅ **Approved Git Worktree squash merge via Telegram!**",
+                        };
+                        Ok(ActionResponse {
+                            text: Some(markdown_to_telegram_html(text)),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: ActionBehavior::Send,
+                            toast: None,
+                            edit_message_id: None,
+                        })
+                    }
+
+                    "inbox_resolve" | "inbox_choice" | "budget_ack" => {
+                        let text = match locale {
+                            HubLocale::ViVn => "✅ **Đã ghi nhận phản hồi của anh qua Telegram!**",
+                            HubLocale::EnUs => "✅ **Recorded your response via Telegram!**",
+                        };
+                        Ok(ActionResponse {
+                            text: Some(markdown_to_telegram_html(text)),
                             parse_mode: Some(ParseMode::HTML),
                             buttons: None,
                             keyboard: None,
@@ -2933,7 +3407,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                 buttons: None,
                 keyboard: None,
                 behavior: ActionBehavior::Answer,
-                toast: Some(format!("Thao tác không xác định: {other}")),
+                toast: Some(HubI18n::unknown_action_toast(locale, other)),
                 edit_message_id: None,
             }),
         }
@@ -3212,13 +3686,8 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             .await
             .map_err(|e| e.to_string())?;
         let (lead_name, _) = Self::find_lead_info(&team);
-
-        let badge = match kind {
-            "approval_needed" => "🙋 Cần anh duyệt",
-            "completed" => "✅ Hoàn thành",
-            "blocker" => "⚠️ Vướng mắc cần hỗ trợ",
-            _ => "📌 Cập nhật tiến độ",
-        };
+        let locale = self.resolve_locale(user_id).await;
+        let badge = HubI18n::task_status_badge(locale, kind);
 
         if kind == "completed"
             && let Some(mut entry) = self.active_runs.get_mut(team_id)
@@ -3245,7 +3714,56 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             _ => self.resolve_team_telegram_destination(user_id, team_id).await,
         };
 
+        let is_actionable = matches!(kind, "approval_needed" | "decision" | "blocker" | "blocked");
+
         let Some(dest_chat) = reply_chat else {
+            if is_actionable {
+                let tok = self
+                    .bridge_repo
+                    .create_action_token(
+                        user_id,
+                        CustomTargetType::Team,
+                        team_id,
+                        "approve_continue",
+                        &serde_json::json!({}),
+                        None,
+                    )
+                    .await
+                    .ok();
+                let inbox_title = format!("[{} · {} 👑] {}", team.name, lead_name, badge);
+                if let Ok(inbox_row) = self
+                    .bridge_repo
+                    .create_action_inbox_item(CreateActionInboxParams {
+                        id: None,
+                        owner_user_id: user_id.to_owned(),
+                        category: "multiple_choice".to_owned(),
+                        title: inbox_title,
+                        summary: summary.to_owned(),
+                        details_json: serde_json::json!({
+                            "team_id": team_id,
+                            "team_name": team.name,
+                            "kind": kind,
+                            "options": ["Approve & Continue", "Hold / Review"],
+                            "recommended_index": 0,
+                        })
+                        .to_string(),
+                        target_type: Some("team".to_owned()),
+                        target_id: team_id.to_owned(),
+                        action_token: tok,
+                        telegram_chat_id: None,
+                        telegram_msg_id: None,
+                    })
+                    .await
+                {
+                    self.event_bus.broadcast(WebSocketMessage::new(
+                        "inbox:item_added",
+                        serde_json::json!({
+                            "user_id": user_id,
+                            "item": ActionInboxCardDto::from_row(inbox_row),
+                        }),
+                    ));
+                }
+            }
             return Ok(serde_json::json!({
                 "delivered_telegram": false,
                 "delivered_desktop": true,
@@ -3257,11 +3775,17 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             "**[{team_name} · {lead_name} 👑]** — _{badge}_\n\n{summary}",
             team_name = team.name
         );
-        let include_approve = kind == "approval_needed";
+        let include_approve = is_actionable;
         let include_stop = kind != "completed";
         let buttons = self
             .make_team_quick_buttons(user_id, team_id, include_approve, include_stop)
             .await;
+        let approve_tok = buttons
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|r| r.first())
+            .and_then(|b| b.action.strip_prefix("t:"))
+            .map(str::to_owned);
 
         let sent_ids = self
             .send_formatted_telegram_message(
@@ -3274,6 +3798,42 @@ impl TeamExternalBridgePort for TelegramTeamHub {
                 team_id,
             )
             .await?;
+
+        if is_actionable {
+            let inbox_title = format!("[{} · {} 👑] {}", team.name, lead_name, badge);
+            if let Ok(inbox_row) = self
+                .bridge_repo
+                .create_action_inbox_item(CreateActionInboxParams {
+                    id: None,
+                    owner_user_id: user_id.to_owned(),
+                    category: "multiple_choice".to_owned(),
+                    title: inbox_title,
+                    summary: summary.to_owned(),
+                    details_json: serde_json::json!({
+                        "team_id": team_id,
+                        "team_name": team.name,
+                        "kind": kind,
+                        "options": ["Approve & Continue", "Hold / Review"],
+                        "recommended_index": 0,
+                    })
+                    .to_string(),
+                    target_type: Some("team".to_owned()),
+                    target_id: team_id.to_owned(),
+                    action_token: approve_tok,
+                    telegram_chat_id: Some(dest_chat.clone()),
+                    telegram_msg_id: sent_ids.last().cloned(),
+                })
+                .await
+            {
+                self.event_bus.broadcast(WebSocketMessage::new(
+                    "inbox:item_added",
+                    serde_json::json!({
+                        "user_id": user_id,
+                        "item": ActionInboxCardDto::from_row(inbox_row),
+                    }),
+                ));
+            }
+        }
 
         let delivered_files = self
             .send_validated_outbound_files(
@@ -3359,6 +3919,7 @@ impl TeamExternalBridgePort for TelegramTeamHub {
                 source_files: files,
                 reply_to_id: None,
                 origin_telegram_chat: None,
+                wake_targets: None,
             })
             .await?;
 
@@ -3414,6 +3975,17 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         result_summary: Option<&str>,
         files: Vec<String>,
     ) -> Result<serde_json::Value, String> {
+        // Feature F19: Human-Only Done Guard
+        if let Some(s) = status {
+            let normalized = s.trim().to_lowercase();
+            if normalized == "done" || normalized == "completed" {
+                return Err(
+                    "Forbidden: Only human users can transition a task to Done. Agents may only transition tasks up to 'in_review' or 'blocked'."
+                        .to_string(),
+                );
+            }
+        }
+
         let task_dto = self
             .update_cross_team_task(
                 user_id,

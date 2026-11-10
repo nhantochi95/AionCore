@@ -465,16 +465,22 @@ async fn e2e_shared_room_routing_artifacts_max_hops_and_deleted_team_cleanup() {
         .unwrap();
     assert_eq!(del_team.status(), StatusCode::OK);
 
-    // Give spawned `TEAM_REMOVED_EVENT` watcher a brief tick to commit cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-
-    let room_after_del = app
-        .clone()
-        .oneshot(get_with_token(&format!("/api/shared-rooms/{room_id}"), &token))
-        .await
-        .unwrap();
-    assert_eq!(room_after_del.status(), StatusCode::OK);
-    let room_after_json = body_json(room_after_del).await["data"].clone();
+    // Poll until spawned `TEAM_REMOVED_EVENT` background watcher completes cleanup and reassigns host
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+    let mut room_after_json = serde_json::Value::Null;
+    while std::time::Instant::now() < deadline {
+        let room_after_del = app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/shared-rooms/{room_id}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(room_after_del.status(), StatusCode::OK);
+        room_after_json = body_json(room_after_del).await["data"].clone();
+        if room_after_json["host_team_id"].as_str() != Some(&chair_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let remaining_members = room_after_json["members"].as_array().unwrap();
     assert_eq!(remaining_members.len(), 2);
     assert_eq!(room_after_json["host_team_id"], be_id);
@@ -607,7 +613,8 @@ async fn e2e_cross_team_tasks_blocked_by_and_security_path_guards() {
     .await;
     assert_eq!(upd_status, StatusCode::OK, "noop update failed: {upd_json}");
 
-    let (done_status, _done_json) = call_runtime_team_tool(
+    // F19 Human-Only Done Guard: Agent cannot transition task to completed or done!
+    let (forbidden_status, _forbidden_json) = call_runtime_team_tool(
         &app,
         &services,
         &be_lead_conv,
@@ -620,7 +627,25 @@ async fn e2e_cross_team_tasks_blocked_by_and_security_path_guards() {
         }),
     )
     .await;
-    assert_eq!(done_status, StatusCode::OK);
+    assert_ne!(forbidden_status, StatusCode::OK, "Agent must not be permitted to transition task to completed/done");
+
+    // Human user finalizes the task via HTTP route
+    let human_done = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/shared-rooms/{room_id}/tasks/{task_a1_id}"),
+            json!({
+                "status": "completed",
+                "result_summary": "REST API shipped",
+                "files": [openapi_file.to_string_lossy()]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(human_done.status(), StatusCode::OK);
 
     let pending_fe = bridge_repo.list_pending_handoffs_for_team(&fe_id).await.unwrap();
     assert_eq!(pending_fe.len(), 1);
@@ -826,7 +851,7 @@ async fn torture_concurrent_action_token_replay_and_unpaired_group_silent_guard(
                 } else if resp
                     .toast
                     .as_deref()
-                    .is_some_and(|t| t.contains("đã được xử lý"))
+                    .is_some_and(|t| t.contains("already been processed") || t.contains("đã được xử lý"))
                 {
                     deduped_count += 1;
                 }

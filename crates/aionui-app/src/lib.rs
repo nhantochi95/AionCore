@@ -8,6 +8,7 @@
 pub mod bridge;
 mod config;
 mod router;
+pub mod routes;
 mod services;
 
 pub use config::{AppConfig, IdentityMode, derive_encryption_key};
