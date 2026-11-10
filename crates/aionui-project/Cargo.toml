@@ -27,6 +27,8 @@ ignore.workspace = true
 # plus platform trash for discarding untracked files non-destructively.
 git2.workspace = true
 trash.workspace = true
+regex.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

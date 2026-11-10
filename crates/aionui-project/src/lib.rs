@@ -20,6 +20,10 @@ pub mod types;
 
 pub use chat_files::ResolvedChatMessage;
 pub use routes::{ProjectRouterState, project_routes};
+pub use scm::{
+    GitWorktreeEngine, WorktreeConfig, WorktreeDiffDto, WorktreeError, WorktreeMergeResultDto,
+    sanitize_conventional_commit,
+};
 pub use service::ProjectService;
 pub use types::{
     AttachInput, FileOp, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView,

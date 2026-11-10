@@ -21,6 +21,7 @@ mod trash_sink;
 mod types;
 mod watch;
 mod wire;
+pub mod worktree;
 
 pub use actor::{ScmActor, ScmInbound, ScmSessionId, ScmWirePush};
 pub use error::ScmError;
@@ -28,6 +29,10 @@ pub use provider::{IScmHistory, IScmProvider, IScmStaging};
 pub use types::{
     ContentRef, DiffContent, FileRef, RepoRef, ResolvedRoot, ScmActionFailure, ScmActionOutcome, ScmCapabilities,
     ScmHead, ScmRepository, ScmRepositoryState, ScmResource, ScmResourceState, ScmStatus,
+};
+pub use worktree::{
+    GitWorktreeEngine, WorktreeConfig, WorktreeDiffDto, WorktreeError, WorktreeMergeResultDto,
+    sanitize_conventional_commit,
 };
 // The concrete git implementation stays module-private: callers will build it
 // through the stage-1 orchestration layer and consume only the trait objects it

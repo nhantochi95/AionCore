@@ -237,6 +237,183 @@ pub struct UpdateSharedRoomTaskParams {
     pub result_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, FromRow)]
+pub struct CustomGitWorktreeRow {
+    pub id: String,
+    pub lease_id: String,
+    pub owner_user_id: String,
+    pub room_id: Option<String>,
+    pub team_id: Option<String>,
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub status: String,
+    pub leftovers_ref: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl CustomGitWorktreeRow {
+    pub fn branch_name(&self) -> &str {
+        &self.branch
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateGitWorktreeParams {
+    pub id: Option<String>,
+    pub lease_id: String,
+    pub owner_user_id: String,
+    pub room_id: Option<String>,
+    pub team_id: Option<String>,
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_branch: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletType {
+    ApiKey,
+    CliSubscription,
+}
+
+impl WalletType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::CliSubscription => "cli_subscription",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "cli_subscription" | "cli" | "subscription" => Self::CliSubscription,
+            _ => Self::ApiKey,
+        }
+    }
+}
+
+pub fn classify_agent_wallet(
+    backend: Option<&str>,
+    auth_methods_json: Option<&str>,
+    has_custom_api_key: bool,
+) -> WalletType {
+    if has_custom_api_key {
+        return WalletType::ApiKey;
+    }
+    let b = backend.unwrap_or("").trim().to_lowercase();
+    if b == "codex" || b == "antigravity" || b == "gemini" || b == "gemini-cli" {
+        return WalletType::CliSubscription;
+    }
+    if b == "claude" {
+        if let Some(raw) = auth_methods_json {
+            if raw.contains("\"oauth\"") || raw.contains("subscription") {
+                return WalletType::CliSubscription;
+            }
+        }
+        // Claude CLI defaults to OAuth subscription when no custom API key is configured
+        return WalletType::CliSubscription;
+    }
+    WalletType::ApiKey
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, FromRow)]
+pub struct CustomActionInboxRow {
+    pub id: String,
+    pub owner_user_id: String,
+    pub category: String,
+    pub title: String,
+    pub summary: String,
+    pub details_json: String,
+    pub status: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub action_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub telegram_msg_id: Option<String>,
+    pub resolution_result: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl CustomActionInboxRow {
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.status == "resolved"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, FromRow)]
+pub struct CustomCostWalletRow {
+    pub owner_user_id: String,
+    pub api_key_budget_limit_usd: f64,
+    pub api_key_spent_usd: f64,
+    pub cli_subscription_runs_count: i64,
+    pub api_key_runs_count: i64,
+    pub soft_warning_triggered: i64,
+    pub hard_block_triggered: i64,
+    pub updated_at: i64,
+}
+
+impl CustomCostWalletRow {
+    pub fn is_soft_warning(&self) -> bool {
+        self.soft_warning_triggered == 1
+    }
+
+    pub fn is_hard_blocked(&self) -> bool {
+        self.hard_block_triggered == 1
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, FromRow)]
+pub struct CustomCostLedgerRow {
+    pub id: String,
+    pub owner_user_id: String,
+    pub run_id: String,
+    pub team_id: String,
+    pub agent_id: String,
+    pub wallet_type: String,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub cost_usd: f64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateActionInboxParams {
+    pub id: Option<String>,
+    pub owner_user_id: String,
+    pub category: String,
+    pub title: String,
+    pub summary: String,
+    pub details_json: String,
+    pub target_type: Option<String>,
+    pub target_id: String,
+    pub action_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub telegram_msg_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordCostRunParams {
+    pub owner_user_id: String,
+    pub run_id: String,
+    pub team_id: String,
+    pub agent_id: String,
+    pub wallet_type: String,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub cost_usd: f64,
+}
+
 /// Idempotently creates all fork-specific `custom_*` tables and indexes
 /// without modifying `_sqlx_migrations`, keeping upstream merges conflict-free.
 pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbError> {
@@ -399,6 +576,102 @@ pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbErro
         r#"
         CREATE INDEX IF NOT EXISTS idx_custom_shared_room_tasks_assignee
             ON custom_shared_room_tasks(to_team_id, status)
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_git_worktrees (
+            id TEXT PRIMARY KEY,
+            lease_id TEXT NOT NULL,
+            owner_user_id TEXT NOT NULL,
+            room_id TEXT,
+            team_id TEXT,
+            repo_path TEXT NOT NULL,
+            worktree_path TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            base_branch TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            leftovers_ref TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_git_worktrees_lease
+            ON custom_git_worktrees(lease_id)
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_git_worktrees_team
+            ON custom_git_worktrees(team_id, status)
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_git_worktrees_owner
+            ON custom_git_worktrees(owner_user_id, status)
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_git_worktrees_path
+            ON custom_git_worktrees(worktree_path)
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_git_worktrees_room
+            ON custom_git_worktrees(room_id, status)
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_action_inbox (
+            id TEXT PRIMARY KEY,
+            owner_user_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            target_type TEXT NOT NULL DEFAULT 'room',
+            target_id TEXT NOT NULL,
+            action_token TEXT,
+            telegram_chat_id TEXT,
+            telegram_msg_id TEXT,
+            resolution_result TEXT,
+            resolved_by TEXT,
+            resolved_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_action_inbox_pending
+            ON custom_action_inbox(owner_user_id, status, created_at DESC)
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_action_inbox_target
+            ON custom_action_inbox(target_type, target_id)
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_cost_wallets (
+            owner_user_id TEXT PRIMARY KEY,
+            api_key_budget_limit_usd REAL NOT NULL DEFAULT 50.0,
+            api_key_spent_usd REAL NOT NULL DEFAULT 0.0,
+            cli_subscription_runs_count INTEGER NOT NULL DEFAULT 0,
+            api_key_runs_count INTEGER NOT NULL DEFAULT 0,
+            soft_warning_triggered INTEGER NOT NULL DEFAULT 0,
+            hard_block_triggered INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_cost_ledger (
+            id TEXT PRIMARY KEY,
+            owner_user_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            team_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            wallet_type TEXT NOT NULL,
+            tokens_input INTEGER NOT NULL DEFAULT 0,
+            tokens_output INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0.0,
+            created_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_cost_ledger_team
+            ON custom_cost_ledger(owner_user_id, team_id, created_at DESC)
         "#,
     ];
 
@@ -1371,7 +1644,7 @@ impl SqliteCustomBridgeRepository {
 
             if current_host.flatten().as_deref() == Some(team_id) {
                 let replacement_host: Option<String> = sqlx::query_scalar(
-                    "SELECT team_id FROM custom_shared_room_members WHERE room_id = ? ORDER BY joined_at ASC LIMIT 1",
+                    "SELECT team_id FROM custom_shared_room_members WHERE room_id = ? ORDER BY joined_at ASC, rowid ASC LIMIT 1",
                 )
                 .bind(rid)
                 .fetch_optional(&mut *tx)
@@ -1743,6 +2016,647 @@ impl SqliteCustomBridgeRepository {
             .await?
             .ok_or_else(|| DbError::NotFound(format!("shared room task not found: {task_id}")))
     }
+
+    // -----------------------------------------------------------------------
+    // Git Worktree Lease Tracking (F07 & F23)
+    // -----------------------------------------------------------------------
+
+    pub async fn create_worktree_lease(
+        &self,
+        params: CreateGitWorktreeParams,
+    ) -> Result<CustomGitWorktreeRow, DbError> {
+        let now = aionui_common::now_ms();
+        let id = params.id.unwrap_or_else(|| params.lease_id.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO custom_git_worktrees (
+                id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                branch, base_branch, status, leftovers_ref, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(&params.lease_id)
+        .bind(&params.owner_user_id)
+        .bind(&params.room_id)
+        .bind(&params.team_id)
+        .bind(&params.repo_path)
+        .bind(&params.worktree_path)
+        .bind(&params.branch)
+        .bind(&params.base_branch)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        Ok(CustomGitWorktreeRow {
+            id,
+            lease_id: params.lease_id,
+            owner_user_id: params.owner_user_id,
+            room_id: params.room_id,
+            team_id: params.team_id,
+            repo_path: params.repo_path,
+            worktree_path: params.worktree_path,
+            branch: params.branch,
+            base_branch: params.base_branch,
+            status: "active".to_string(),
+            leftovers_ref: None,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn get_worktree_lease(
+        &self,
+        id_or_lease_id: &str,
+    ) -> Result<Option<CustomGitWorktreeRow>, DbError> {
+        sqlx::query_as::<_, CustomGitWorktreeRow>(
+            r#"
+            SELECT id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                   branch, base_branch, status, leftovers_ref, created_at, updated_at
+            FROM custom_git_worktrees
+            WHERE id = ? OR lease_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(id_or_lease_id)
+        .bind(id_or_lease_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn get_active_worktree_for_team(
+        &self,
+        team_id: &str,
+    ) -> Result<Option<CustomGitWorktreeRow>, DbError> {
+        sqlx::query_as::<_, CustomGitWorktreeRow>(
+            r#"
+            SELECT id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                   branch, base_branch, status, leftovers_ref, created_at, updated_at
+            FROM custom_git_worktrees
+            WHERE team_id = ? AND status = 'active'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn get_active_worktree_for_room(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<CustomGitWorktreeRow>, DbError> {
+        sqlx::query_as::<_, CustomGitWorktreeRow>(
+            r#"
+            SELECT id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                   branch, base_branch, status, leftovers_ref, created_at, updated_at
+            FROM custom_git_worktrees
+            WHERE room_id = ? AND status = 'active'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(room_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_worktrees(
+        &self,
+        owner_user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<CustomGitWorktreeRow>, DbError> {
+        match status {
+            Some(s) => sqlx::query_as::<_, CustomGitWorktreeRow>(
+                r#"
+                SELECT id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                       branch, base_branch, status, leftovers_ref, created_at, updated_at
+                FROM custom_git_worktrees
+                WHERE owner_user_id = ? AND status = ?
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .bind(owner_user_id)
+            .bind(s)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Query),
+            None => sqlx::query_as::<_, CustomGitWorktreeRow>(
+                r#"
+                SELECT id, lease_id, owner_user_id, room_id, team_id, repo_path, worktree_path,
+                       branch, base_branch, status, leftovers_ref, created_at, updated_at
+                FROM custom_git_worktrees
+                WHERE owner_user_id = ?
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .bind(owner_user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Query),
+        }
+    }
+
+    pub async fn update_worktree_status(
+        &self,
+        id_or_lease_id: &str,
+        status: &str,
+        leftovers_ref: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let res = sqlx::query(
+            r#"
+            UPDATE custom_git_worktrees
+            SET status = ?,
+                leftovers_ref = COALESCE(?, leftovers_ref),
+                updated_at = ?
+            WHERE id = ? OR lease_id = ?
+            "#,
+        )
+        .bind(status)
+        .bind(leftovers_ref)
+        .bind(now)
+        .bind(id_or_lease_id)
+        .bind(id_or_lease_id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_worktree_lease(&self, id_or_lease_id: &str) -> Result<bool, DbError> {
+        let res = sqlx::query("DELETE FROM custom_git_worktrees WHERE id = ? OR lease_id = ?")
+            .bind(id_or_lease_id)
+            .bind(id_or_lease_id)
+            .execute(&self.pool)
+            .await
+            .map_err(DbError::Query)?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    // --- Action Inbox Methods ---
+
+    pub async fn create_action_inbox_item(
+        &self,
+        p: CreateActionInboxParams,
+    ) -> Result<CustomActionInboxRow, DbError> {
+        let now = aionui_common::now_ms();
+        let id = p
+            .id
+            .unwrap_or_else(|| aionui_common::generate_prefixed_id("inbox"));
+        let target_type = p.target_type.unwrap_or_else(|| "room".to_string());
+
+        sqlx::query(
+            r#"
+            INSERT INTO custom_action_inbox (
+                id, owner_user_id, category, title, summary, details_json,
+                status, target_type, target_id, action_token, telegram_chat_id,
+                telegram_msg_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(&p.owner_user_id)
+        .bind(&p.category)
+        .bind(&p.title)
+        .bind(&p.summary)
+        .bind(&p.details_json)
+        .bind(&target_type)
+        .bind(&p.target_id)
+        .bind(&p.action_token)
+        .bind(&p.telegram_chat_id)
+        .bind(&p.telegram_msg_id)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_action_inbox_item(&id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(id))
+    }
+
+    pub async fn get_action_inbox_item(
+        &self,
+        id: &str,
+    ) -> Result<Option<CustomActionInboxRow>, DbError> {
+        sqlx::query_as::<_, CustomActionInboxRow>(
+            "SELECT * FROM custom_action_inbox WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_action_inbox_items(
+        &self,
+        owner_user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<CustomActionInboxRow>, DbError> {
+        match status {
+            Some(s) => sqlx::query_as::<_, CustomActionInboxRow>(
+                "SELECT * FROM custom_action_inbox WHERE owner_user_id = ? AND status = ? ORDER BY created_at DESC",
+            )
+            .bind(owner_user_id)
+            .bind(s)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Query),
+            None => sqlx::query_as::<_, CustomActionInboxRow>(
+                "SELECT * FROM custom_action_inbox WHERE owner_user_id = ? ORDER BY created_at DESC",
+            )
+            .bind(owner_user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Query),
+        }
+    }
+
+    pub async fn count_pending_inbox_items(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<i64, DbError> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM custom_action_inbox WHERE owner_user_id = ? AND status = 'pending'",
+        )
+        .bind(owner_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+        Ok(count)
+    }
+
+    /// Atomically transitions an inbox item from 'pending' to 'resolved'.
+    /// Returns Ok(true) if transition succeeded, or Ok(false) if it was already resolved.
+    pub async fn resolve_action_inbox_item(
+        &self,
+        id: &str,
+        resolution_result: &str,
+        resolved_by: &str,
+    ) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let res = sqlx::query(
+            r#"
+            UPDATE custom_action_inbox
+            SET status = 'resolved',
+                resolution_result = ?,
+                resolved_by = ?,
+                resolved_at = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            "#,
+        )
+        .bind(resolution_result)
+        .bind(resolved_by)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Atomically resolves an inbox item by action token (used by Telegram callback query).
+    pub async fn resolve_action_inbox_item_by_token(
+        &self,
+        token: &str,
+        resolution_result: &str,
+        resolved_by: &str,
+    ) -> Result<Option<CustomActionInboxRow>, DbError> {
+        let now = aionui_common::now_ms();
+        let res = sqlx::query(
+            r#"
+            UPDATE custom_action_inbox
+            SET status = 'resolved',
+                resolution_result = ?,
+                resolved_by = ?,
+                resolved_at = ?,
+                updated_at = ?
+            WHERE action_token = ? AND status = 'pending'
+            "#,
+        )
+        .bind(resolution_result)
+        .bind(resolved_by)
+        .bind(now)
+        .bind(now)
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        if res.rows_affected() > 0 {
+            sqlx::query_as::<_, CustomActionInboxRow>(
+                "SELECT * FROM custom_action_inbox WHERE action_token = ?",
+            )
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(DbError::Query)
+        } else {
+            Ok(None)
+        }
+    }
+
+    // --- Dual Cost Wallet & Ledger Methods ---
+
+    pub async fn get_or_create_cost_wallet(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<CustomCostWalletRow, DbError> {
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            r#"
+            INSERT INTO custom_cost_wallets (
+                owner_user_id, api_key_budget_limit_usd, api_key_spent_usd,
+                cli_subscription_runs_count, api_key_runs_count,
+                soft_warning_triggered, hard_block_triggered, updated_at
+            ) VALUES (?, 50.0, 0.0, 0, 0, 0, 0, ?)
+            ON CONFLICT(owner_user_id) DO NOTHING
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        sqlx::query_as::<_, CustomCostWalletRow>(
+            "SELECT * FROM custom_cost_wallets WHERE owner_user_id = ?",
+        )
+        .bind(owner_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn record_cost_run(
+        &self,
+        p: RecordCostRunParams,
+    ) -> Result<(CustomCostWalletRow, bool, bool), DbError> {
+        let now = aionui_common::now_ms();
+        let ledger_id = aionui_common::generate_prefixed_id("cld");
+
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO custom_cost_ledger (
+                id, owner_user_id, run_id, team_id, agent_id, wallet_type,
+                tokens_input, tokens_output, cost_usd, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&ledger_id)
+        .bind(&p.owner_user_id)
+        .bind(&p.run_id)
+        .bind(&p.team_id)
+        .bind(&p.agent_id)
+        .bind(&p.wallet_type)
+        .bind(p.tokens_input)
+        .bind(p.tokens_output)
+        .bind(p.cost_usd)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        let current = sqlx::query_as::<_, CustomCostWalletRow>(
+            "SELECT * FROM custom_cost_wallets WHERE owner_user_id = ?",
+        )
+        .bind(&p.owner_user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(DbError::Query)?
+        .unwrap_or(CustomCostWalletRow {
+            owner_user_id: p.owner_user_id.clone(),
+            api_key_budget_limit_usd: 50.0,
+            api_key_spent_usd: 0.0,
+            cli_subscription_runs_count: 0,
+            api_key_runs_count: 0,
+            soft_warning_triggered: 0,
+            hard_block_triggered: 0,
+            updated_at: now,
+        });
+
+        let is_cli = p.wallet_type == "cli_subscription";
+        let new_spent = if is_cli {
+            current.api_key_spent_usd
+        } else {
+            current.api_key_spent_usd + p.cost_usd
+        };
+        let new_cli_runs = if is_cli {
+            current.cli_subscription_runs_count + 1
+        } else {
+            current.cli_subscription_runs_count
+        };
+        let new_api_runs = if is_cli {
+            current.api_key_runs_count
+        } else {
+            current.api_key_runs_count + 1
+        };
+
+        let newly_soft_warned = !is_cli
+            && current.soft_warning_triggered == 0
+            && new_spent >= (0.8 * current.api_key_budget_limit_usd);
+
+        let newly_hard_blocked = !is_cli
+            && current.hard_block_triggered == 0
+            && new_spent >= (1.0 * current.api_key_budget_limit_usd);
+
+        let soft_flag = if newly_soft_warned || current.soft_warning_triggered == 1 {
+            1
+        } else {
+            0
+        };
+        let hard_flag = if newly_hard_blocked || current.hard_block_triggered == 1 {
+            1
+        } else {
+            0
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO custom_cost_wallets (
+                owner_user_id, api_key_budget_limit_usd, api_key_spent_usd,
+                cli_subscription_runs_count, api_key_runs_count,
+                soft_warning_triggered, hard_block_triggered, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_user_id) DO UPDATE SET
+                api_key_spent_usd = excluded.api_key_spent_usd,
+                cli_subscription_runs_count = excluded.cli_subscription_runs_count,
+                api_key_runs_count = excluded.api_key_runs_count,
+                soft_warning_triggered = excluded.soft_warning_triggered,
+                hard_block_triggered = excluded.hard_block_triggered,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&p.owner_user_id)
+        .bind(current.api_key_budget_limit_usd)
+        .bind(new_spent)
+        .bind(new_cli_runs)
+        .bind(new_api_runs)
+        .bind(soft_flag)
+        .bind(hard_flag)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        if newly_soft_warned {
+            let warn_id = format!("inbox_cst_80_{}", &ledger_id);
+            let title = format!(
+                "Soft Budget Warning: 80% API Key Cap Reached (${:.2} / ${:.2})",
+                new_spent, current.api_key_budget_limit_usd
+            );
+            let summary = "CLI subscription runs (Claude/Codex) remain free ($0.00). Only pay-per-token API key usage has reached 80% of limit.".to_string();
+            let details = serde_json::json!({
+                "budget_limit_usd": current.api_key_budget_limit_usd,
+                "spent_usd": new_spent,
+                "percentage": 80.0,
+                "wallet_type": "api_key",
+                "threshold": 80
+            })
+            .to_string();
+
+            sqlx::query(
+                r#"
+                INSERT INTO custom_action_inbox (
+                    id, owner_user_id, category, title, summary, details_json,
+                    status, target_type, target_id, created_at, updated_at
+                ) VALUES (?, ?, 'budget_warning', ?, ?, ?, 'pending', 'wallet', 'dual_cost_wallet', ?, ?)
+                "#,
+            )
+            .bind(warn_id)
+            .bind(&p.owner_user_id)
+            .bind(title)
+            .bind(summary)
+            .bind(details)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+        }
+
+        if newly_hard_blocked {
+            let block_id = format!("inbox_cst_100_{}", &ledger_id);
+            let title = format!(
+                "100% Hard Budget Fuse: Paused API Key Agents (${:.2} / ${:.2})",
+                new_spent, current.api_key_budget_limit_usd
+            );
+            let summary = "API Key budget reached 100%. Paid API Key agents are paused. CLI subscription runs ($0.00) continue executing normally.".to_string();
+            let details = serde_json::json!({
+                "budget_limit_usd": current.api_key_budget_limit_usd,
+                "spent_usd": new_spent,
+                "percentage": 100.0,
+                "wallet_type": "api_key",
+                "threshold": 100
+            })
+            .to_string();
+
+            sqlx::query(
+                r#"
+                INSERT INTO custom_action_inbox (
+                    id, owner_user_id, category, title, summary, details_json,
+                    status, target_type, target_id, created_at, updated_at
+                ) VALUES (?, ?, 'budget_warning', ?, ?, ?, 'pending', 'wallet', 'dual_cost_wallet', ?, ?)
+                "#,
+            )
+            .bind(block_id)
+            .bind(&p.owner_user_id)
+            .bind(title)
+            .bind(summary)
+            .bind(details)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+        }
+
+        tx.commit().await.map_err(DbError::Query)?;
+
+        let updated_row = self.get_or_create_cost_wallet(&p.owner_user_id).await?;
+        Ok((updated_row, newly_soft_warned, newly_hard_blocked))
+    }
+
+    pub async fn update_budget_limit(
+        &self,
+        owner_user_id: &str,
+        limit: f64,
+    ) -> Result<CustomCostWalletRow, DbError> {
+        let now = aionui_common::now_ms();
+        let current = self.get_or_create_cost_wallet(owner_user_id).await?;
+        let limit = limit.max(0.0);
+
+        let hard_flag = if current.api_key_spent_usd >= limit { 1 } else { 0 };
+        let soft_flag = if current.api_key_spent_usd >= 0.8 * limit { 1 } else { 0 };
+
+        sqlx::query(
+            r#"
+            UPDATE custom_cost_wallets
+            SET api_key_budget_limit_usd = ?,
+                soft_warning_triggered = ?,
+                hard_block_triggered = ?,
+                updated_at = ?
+            WHERE owner_user_id = ?
+            "#,
+        )
+        .bind(limit)
+        .bind(soft_flag)
+        .bind(hard_flag)
+        .bind(now)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_or_create_cost_wallet(owner_user_id).await
+    }
+
+    pub async fn reset_cost_wallet(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<CustomCostWalletRow, DbError> {
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            r#"
+            UPDATE custom_cost_wallets
+            SET api_key_spent_usd = 0.0,
+                cli_subscription_runs_count = 0,
+                api_key_runs_count = 0,
+                soft_warning_triggered = 0,
+                hard_block_triggered = 0,
+                updated_at = ?
+            WHERE owner_user_id = ?
+            "#,
+        )
+        .bind(now)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_or_create_cost_wallet(owner_user_id).await
+    }
+
+    pub async fn is_wallet_hard_blocked(&self, owner_user_id: &str) -> Result<bool, DbError> {
+        let wallet = self.get_or_create_cost_wallet(owner_user_id).await?;
+        Ok(wallet.hard_block_triggered == 1)
+    }
 }
 
 #[cfg(test)]
@@ -1885,5 +2799,318 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "completed");
         assert_eq!(updated.result_summary.as_deref(), Some("Done"));
+    }
+
+    #[tokio::test]
+    async fn custom_git_worktrees_crud_and_lifecycle_work() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteCustomBridgeRepository::new(db.pool().clone());
+
+        let lease = repo
+            .create_worktree_lease(CreateGitWorktreeParams {
+                id: None,
+                lease_id: "lease-wt-1".into(),
+                owner_user_id: "system_default_user".into(),
+                room_id: Some("room-1".into()),
+                team_id: Some("team-a".into()),
+                repo_path: "/workspace/repo".into(),
+                worktree_path: "/workspace/repo/.aionui/worktrees/lease-wt-1".into(),
+                branch: "wt/lease-wt-1".into(),
+                base_branch: "feat/hybrid-command-hub".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(lease.id, "lease-wt-1");
+        assert_eq!(lease.lease_id, "lease-wt-1");
+        assert_eq!(lease.status, "active");
+        assert_eq!(lease.branch_name(), "wt/lease-wt-1");
+
+        let fetched = repo.get_worktree_lease("lease-wt-1").await.unwrap().unwrap();
+        assert_eq!(fetched.worktree_path, "/workspace/repo/.aionui/worktrees/lease-wt-1");
+
+        let team_active = repo.get_active_worktree_for_team("team-a").await.unwrap().unwrap();
+        assert_eq!(team_active.lease_id, "lease-wt-1");
+
+        let room_active = repo.get_active_worktree_for_room("room-1").await.unwrap().unwrap();
+        assert_eq!(room_active.lease_id, "lease-wt-1");
+
+        let (idx_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_custom_git_worktrees_room'"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(idx_count, 1, "idx_custom_git_worktrees_room must exist in SQLite catalog");
+
+        let list = repo.list_worktrees("system_default_user", Some("active")).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let updated = repo
+            .update_worktree_status("lease-wt-1", "merged", Some("refs/aionui/leftovers/lease-wt-1_12345"))
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let fetched_updated = repo.get_worktree_lease("lease-wt-1").await.unwrap().unwrap();
+        assert_eq!(fetched_updated.status, "merged");
+        assert_eq!(
+            fetched_updated.leftovers_ref.as_deref(),
+            Some("refs/aionui/leftovers/lease-wt-1_12345")
+        );
+
+        assert!(repo.get_active_worktree_for_team("team-a").await.unwrap().is_none());
+
+        let deleted = repo.delete_worktree_lease("lease-wt-1").await.unwrap();
+        assert!(deleted);
+        assert!(repo.get_worktree_lease("lease-wt-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_action_inbox_lifecycle_and_atomic_resolution() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteCustomBridgeRepository::new(db.pool().clone());
+        let owner = "test_user_inbox";
+
+        let pending_init = repo.count_pending_inbox_items(owner).await.unwrap();
+        assert_eq!(pending_init, 0);
+
+        let card = repo
+            .create_action_inbox_item(CreateActionInboxParams {
+                id: Some("inbox_test_1".into()),
+                owner_user_id: owner.into(),
+                category: "worktree_merge".into(),
+                title: "Merge Worktree wt/feat-1".into(),
+                summary: "Squash merge worktree wt/feat-1".into(),
+                details_json: r#"{"lease_id":"lease-1"}"#.into(),
+                target_type: Some("room".into()),
+                target_id: "room-1".into(),
+                action_token: Some("tok_merge_123".into()),
+                telegram_chat_id: Some("-100123".into()),
+                telegram_msg_id: Some("456".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(card.id, "inbox_test_1");
+        assert_eq!(card.status, "pending");
+        assert!(card.is_pending());
+        assert!(!card.is_resolved());
+
+        let fetched = repo.get_action_inbox_item("inbox_test_1").await.unwrap().unwrap();
+        assert_eq!(fetched.title, "Merge Worktree wt/feat-1");
+
+        let pending_count = repo.count_pending_inbox_items(owner).await.unwrap();
+        assert_eq!(pending_count, 1);
+
+        let items = repo.list_action_inbox_items(owner, Some("pending")).await.unwrap();
+        assert_eq!(items.len(), 1);
+
+        // Atomic resolution: first attempt succeeds
+        let resolved = repo
+            .resolve_action_inbox_item("inbox_test_1", "approved", "desktop")
+            .await
+            .unwrap();
+        assert!(resolved, "First resolution should succeed");
+
+        // Atomic resolution idempotency: second attempt fails
+        let second_resolve = repo
+            .resolve_action_inbox_item("inbox_test_1", "approved", "telegram")
+            .await
+            .unwrap();
+        assert!(!second_resolve, "Second resolution must fail due to status != pending");
+
+        let updated_card = repo.get_action_inbox_item("inbox_test_1").await.unwrap().unwrap();
+        assert_eq!(updated_card.status, "resolved");
+        assert_eq!(updated_card.resolved_by.as_deref(), Some("desktop"));
+        assert_eq!(updated_card.resolution_result.as_deref(), Some("approved"));
+        assert!(updated_card.is_resolved());
+
+        let pending_after = repo.count_pending_inbox_items(owner).await.unwrap();
+        assert_eq!(pending_after, 0);
+
+        // Test token resolution for Telegram
+        let card2 = repo
+            .create_action_inbox_item(CreateActionInboxParams {
+                id: Some("inbox_test_2".into()),
+                owner_user_id: owner.into(),
+                category: "choice".into(),
+                title: "Choose Architecture".into(),
+                summary: "Option A vs B".into(),
+                details_json: r#"{"options":["A","B"]}"#.into(),
+                target_type: Some("room".into()),
+                target_id: "room-1".into(),
+                action_token: Some("tok_choice_xyz".into()),
+                telegram_chat_id: None,
+                telegram_msg_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(card2.status, "pending");
+
+        let tok_res = repo
+            .resolve_action_inbox_item_by_token("tok_choice_xyz", "option_a", "telegram")
+            .await
+            .unwrap();
+        assert!(tok_res.is_some());
+        assert_eq!(tok_res.unwrap().status, "resolved");
+
+        // Second token resolution returns None
+        let tok_res_again = repo
+            .resolve_action_inbox_item_by_token("tok_choice_xyz", "option_a", "telegram")
+            .await
+            .unwrap();
+        assert!(tok_res_again.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dual_cost_wallet_ledger_and_budget_fuse() {
+        // Classification tests
+        assert_eq!(
+            classify_agent_wallet(Some("claude"), None, false),
+            WalletType::CliSubscription
+        );
+        assert_eq!(
+            classify_agent_wallet(Some("claude"), Some(r#"{"type":"oauth"}"#), false),
+            WalletType::CliSubscription
+        );
+        assert_eq!(
+            classify_agent_wallet(Some("codex"), None, false),
+            WalletType::CliSubscription
+        );
+        assert_eq!(
+            classify_agent_wallet(Some("antigravity"), None, false),
+            WalletType::CliSubscription
+        );
+        assert_eq!(
+            classify_agent_wallet(Some("claude"), None, true),
+            WalletType::ApiKey
+        );
+        assert_eq!(
+            classify_agent_wallet(Some("openai"), None, false),
+            WalletType::ApiKey
+        );
+
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteCustomBridgeRepository::new(db.pool().clone());
+        let owner = "test_user_wallet";
+
+        let wallet = repo.get_or_create_cost_wallet(owner).await.unwrap();
+        assert_eq!(wallet.api_key_budget_limit_usd, 50.0);
+        assert_eq!(wallet.api_key_spent_usd, 0.0);
+        assert_eq!(wallet.cli_subscription_runs_count, 0);
+        assert_eq!(wallet.api_key_runs_count, 0);
+        assert_eq!(wallet.soft_warning_triggered, 0);
+        assert_eq!(wallet.hard_block_triggered, 0);
+
+        // 1. Record CLI Subscription run ($0.00 additional cost)
+        let (w1, soft1, hard1) = repo
+            .record_cost_run(RecordCostRunParams {
+                owner_user_id: owner.into(),
+                run_id: "run-cli-1".into(),
+                team_id: "team-1".into(),
+                agent_id: "claude-sub".into(),
+                wallet_type: "cli_subscription".into(),
+                tokens_input: 10_000,
+                tokens_output: 2_000,
+                cost_usd: 0.0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(w1.cli_subscription_runs_count, 1);
+        assert_eq!(w1.api_key_runs_count, 0);
+        assert_eq!(w1.api_key_spent_usd, 0.0);
+        assert!(!soft1);
+        assert!(!hard1);
+
+        // 2. Record API Key run ($30.00 out of $50.00 limit = 60%, below 80%)
+        let (w2, soft2, hard2) = repo
+            .record_cost_run(RecordCostRunParams {
+                owner_user_id: owner.into(),
+                run_id: "run-api-1".into(),
+                team_id: "team-1".into(),
+                agent_id: "gpt-paid".into(),
+                wallet_type: "api_key".into(),
+                tokens_input: 5_000,
+                tokens_output: 1_000,
+                cost_usd: 30.0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(w2.cli_subscription_runs_count, 1);
+        assert_eq!(w2.api_key_runs_count, 1);
+        assert_eq!(w2.api_key_spent_usd, 30.0);
+        assert!(!soft2);
+        assert!(!hard2);
+
+        // 3. Record second API Key run ($12.00, total $42.00 >= 80% of $50 = $40)
+        let (w3, soft3, hard3) = repo
+            .record_cost_run(RecordCostRunParams {
+                owner_user_id: owner.into(),
+                run_id: "run-api-2".into(),
+                team_id: "team-1".into(),
+                agent_id: "gpt-paid".into(),
+                wallet_type: "api_key".into(),
+                tokens_input: 2_000,
+                tokens_output: 500,
+                cost_usd: 12.0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(w3.api_key_spent_usd, 42.0);
+        assert!(soft3, "80% soft warning must trigger");
+        assert_eq!(w3.soft_warning_triggered, 1);
+        assert!(!hard3);
+        assert!(!repo.is_wallet_hard_blocked(owner).await.unwrap());
+
+        // Check Action Inbox received soft warning item
+        let inbox_items = repo.list_action_inbox_items(owner, Some("pending")).await.unwrap();
+        assert_eq!(inbox_items.len(), 1);
+        assert_eq!(inbox_items[0].category, "budget_warning");
+        assert!(inbox_items[0].title.contains("80%"));
+
+        // 4. Record third API Key run ($10.00, total $52.00 >= 100% of $50 = $50)
+        let (w4, soft4, hard4) = repo
+            .record_cost_run(RecordCostRunParams {
+                owner_user_id: owner.into(),
+                run_id: "run-api-3".into(),
+                team_id: "team-1".into(),
+                agent_id: "gpt-paid".into(),
+                wallet_type: "api_key".into(),
+                tokens_input: 1_500,
+                tokens_output: 400,
+                cost_usd: 10.0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(w4.api_key_spent_usd, 52.0);
+        assert!(!soft4, "Already soft warned previously");
+        assert!(hard4, "100% hard block must trigger");
+        assert_eq!(w4.hard_block_triggered, 1);
+        assert!(repo.is_wallet_hard_blocked(owner).await.unwrap());
+
+        // Check Action Inbox received hard fuse item
+        let inbox_items_all = repo.list_action_inbox_items(owner, Some("pending")).await.unwrap();
+        assert_eq!(inbox_items_all.len(), 2);
+        assert!(inbox_items_all.iter().any(|i| i.title.contains("100%")));
+
+        // 5. Update budget limit to $100 -> unblocks hard fuse ($52 < $100 and $52 < $80)
+        let w_updated = repo.update_budget_limit(owner, 100.0).await.unwrap();
+        assert_eq!(w_updated.api_key_budget_limit_usd, 100.0);
+        assert_eq!(w_updated.hard_block_triggered, 0);
+        assert_eq!(w_updated.soft_warning_triggered, 0);
+        assert!(!repo.is_wallet_hard_blocked(owner).await.unwrap());
+
+        // 6. Reset cost wallet
+        let w_reset = repo.reset_cost_wallet(owner).await.unwrap();
+        assert_eq!(w_reset.api_key_spent_usd, 0.0);
+        assert_eq!(w_reset.cli_subscription_runs_count, 0);
+        assert_eq!(w_reset.api_key_runs_count, 0);
+        assert_eq!(w_reset.soft_warning_triggered, 0);
+        assert_eq!(w_reset.hard_block_triggered, 0);
     }
 }
