@@ -1,5 +1,6 @@
 //! Telegram <-> Team Leader Bridge & Multi-Team Shared Rooms (Leader Hub).
 
+pub mod context_compactor;
 pub mod file_guard;
 pub mod hub;
 pub mod judge;

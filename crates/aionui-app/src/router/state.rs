@@ -143,6 +143,7 @@ pub struct ModuleStates {
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
+    pub team_hub: crate::routes::TeamHubRouterState,
     pub shared_room: crate::bridge::SharedRoomRouterState,
     pub worktree: crate::routes::WorktreeRouterState,
     pub inbox: crate::routes::InboxRouterState,
@@ -313,17 +314,32 @@ pub async fn build_module_states(
     let hub_provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let settings_repo: Arc<dyn ISettingsRepository> = Arc::new(SqliteSettingsRepository::new(pool.clone()));
     let telegram_team_hub = crate::bridge::TelegramTeamHub::new(
-        bridge_repo,
+        bridge_repo.clone(),
         channel_state.repo.clone(),
         channel_state.manager.clone(),
         team_state.service.clone(),
         services.conversation_repo.clone(),
-        hub_provider_repo,
+        hub_provider_repo.clone(),
         settings_repo,
         services.event_bus.clone(),
         encryption_key,
         services.data_dir.clone(),
     );
+    let team_hub_orchestrator = crate::bridge::context_compactor::TeamHubOrchestrator {
+        bridge_repo,
+        conversation_service: services.conversation_service.clone(),
+        conversation_repo: services.conversation_repo.clone(),
+        team_service: team_state.service.clone(),
+        team_repo: Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone())),
+        agent_registry: services.agent_registry.clone(),
+        agent_metadata_repo: Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        provider_repo: hub_provider_repo,
+        assistant_service: assistant.service.clone(),
+        event_bus: services.event_bus.clone(),
+        data_dir: services.data_dir.clone(),
+        slot_locks: Arc::new(dashmap::DashMap::new()),
+    };
+    telegram_team_hub.set_team_hub_orchestrator(team_hub_orchestrator.clone());
     telegram_team_hub.spawn_event_watcher();
     let _ = channel_state.team_bridge.set(telegram_team_hub.clone());
     channel_components
@@ -356,6 +372,9 @@ pub async fn build_module_states(
         skill: skill_state,
         channel: channel_state,
         team: team_state,
+        team_hub: crate::routes::TeamHubRouterState {
+            orchestrator: team_hub_orchestrator,
+        },
         worktree: crate::routes::WorktreeRouterState {
             bridge_repo: telegram_team_hub.bridge_repo().clone(),
             worktree_engine: std::sync::Arc::new(aionui_project::GitWorktreeEngine::new()),

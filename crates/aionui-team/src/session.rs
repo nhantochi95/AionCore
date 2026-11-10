@@ -31,7 +31,9 @@ use crate::ports::{
     SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
-use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
+use crate::prompts::{
+    build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload_with_workspace,
+};
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
@@ -441,13 +443,33 @@ impl TeamSession {
                         .unwrap_or_default();
                     (command, false)
                 } else {
-                    let mut wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
-                    if agent.role == TeammateRole::Lead
-                        && let Some(svc) = self.service.upgrade()
+                    let mut wake_body = build_wake_payload_with_workspace(
+                        &agent,
+                        &tasks,
+                        &claimed_unread,
+                        &current_slot_ids,
+                        Some(self.team.workspace.as_str()),
+                    );
+                    if let Some(svc) = self.service.upgrade()
                         && let Some(ext) = svc.external_bridge()
-                        && let Some(handoff_banner) = ext.pending_room_handoff_banner(&self.user_id, &self.team.id).await
                     {
-                        wake_body = format!("{handoff_banner}\n\n{wake_body}");
+                        if agent.role == TeammateRole::Lead
+                            && let Some(handoff_banner) =
+                                ext.pending_room_handoff_banner(&self.user_id, &self.team.id).await
+                        {
+                            wake_body = format!("{handoff_banner}\n\n{wake_body}");
+                        }
+                        if let Some(slot_handover) = ext
+                            .pending_slot_handover_banner(
+                                &self.user_id,
+                                &self.team.id,
+                                slot_id,
+                                &agent.conversation_id,
+                            )
+                            .await
+                        {
+                            wake_body = format!("{slot_handover}\n\n{wake_body}");
+                        }
                     }
                     let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                     let first_message = if needs_role_prompt {
@@ -532,6 +554,14 @@ impl TeamSession {
     /// trailing message for scheduler directives). Returns the leader slot_id
     /// that the caller should re-wake, if any; D7b wires that return value
     /// into the wake path. `is_error` is reserved for future status handling.
+    pub(crate) fn notify_slot_turn_settled(&self, slot_id: &str, conversation_id: &str) {
+        if let Some(svc) = self.service.upgrade()
+            && let Some(ext) = svc.external_bridge()
+        {
+            ext.on_slot_turn_settled(&self.user_id, &self.team.id, slot_id, conversation_id);
+        }
+    }
+
     pub async fn on_agent_finish(&self, conversation_id: &str, is_error: bool) -> Result<Option<String>, TeamError> {
         // Dedup: skip if another finish event already claimed this conversation
         // within the 5-second window (W4-D19a).

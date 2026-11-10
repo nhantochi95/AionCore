@@ -178,6 +178,7 @@ pub struct TelegramTeamHub {
     encryption_key: [u8; 32],
     data_dir: PathBuf,
     active_runs: DashMap<String, ActiveTeamRunTracker>,
+    orchestrator: std::sync::OnceLock<crate::bridge::context_compactor::TeamHubOrchestrator>,
 }
 
 impl TelegramTeamHub {
@@ -206,7 +207,16 @@ impl TelegramTeamHub {
             encryption_key,
             data_dir,
             active_runs: DashMap::new(),
+            orchestrator: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn set_team_hub_orchestrator(&self, orchestrator: crate::bridge::context_compactor::TeamHubOrchestrator) {
+        let _ = self.orchestrator.set(orchestrator);
+    }
+
+    pub fn team_hub_orchestrator(&self) -> Option<&crate::bridge::context_compactor::TeamHubOrchestrator> {
+        self.orchestrator.get()
     }
 
     pub fn bridge_repo(&self) -> &Arc<SqliteCustomBridgeRepository> {
@@ -915,7 +925,7 @@ impl TelegramTeamHub {
         }
     }
 
-    fn classify_team_lead_wallet(team: &TeamResponse) -> (String, WalletType) {
+    pub fn classify_team_lead_wallet(team: &TeamResponse) -> (String, WalletType) {
         let lead = team
             .assistants
             .iter()
@@ -930,9 +940,18 @@ impl TelegramTeamHub {
             return ("lead".to_owned(), WalletType::CliSubscription);
         };
 
-        let raw_backend = if !agent.backend.trim().is_empty() && !agent.backend.eq_ignore_ascii_case("custom") {
+        if agent.backend.trim().eq_ignore_ascii_case("aionrs") {
+            return (agent.slot_id.clone(), WalletType::ApiKey);
+        }
+
+        let raw_backend = if !agent.backend.trim().is_empty()
+            && !agent.backend.eq_ignore_ascii_case("custom")
+            && !agent.backend.eq_ignore_ascii_case("acp")
+        {
             agent.backend.trim()
-        } else if !agent.assistant_backend.trim().is_empty() && !agent.assistant_backend.eq_ignore_ascii_case("custom")
+        } else if !agent.assistant_backend.trim().is_empty()
+            && !agent.assistant_backend.eq_ignore_ascii_case("custom")
+            && !agent.assistant_backend.eq_ignore_ascii_case("acp")
         {
             agent.assistant_backend.trim()
         } else {
@@ -940,11 +959,13 @@ impl TelegramTeamHub {
         };
 
         let normalized = raw_backend.to_lowercase();
-        let backend_hint = if normalized.starts_with("claude") && !normalized.contains('/') {
+        let backend_hint = if normalized == "aionrs" || normalized.contains('/') {
+            "aionrs"
+        } else if normalized.starts_with("claude") {
             "claude"
-        } else if normalized.starts_with("codex") && !normalized.contains('/') {
+        } else if normalized.starts_with("codex") {
             "codex"
-        } else if normalized.starts_with("gemini") && !normalized.contains('/') {
+        } else if normalized.starts_with("gemini") {
             "gemini"
         } else if normalized.starts_with("antigravity") {
             "antigravity"
@@ -2980,6 +3001,259 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                 }))
             }
 
+            "/compact" => {
+                let bound_team_id = if let Some(b) = self
+                    .bridge_repo
+                    .resolve_channel_binding_for_chat(
+                        owner_user_id,
+                        "telegram",
+                        &msg.chat_id,
+                        msg.thread_id().as_deref(),
+                    )
+                    .await?
+                {
+                    (b.target_type == "team").then_some(b.target_id)
+                } else if !msg.is_group_chat() {
+                    self.bridge_repo
+                        .get_dm_target(owner_user_id, "telegram", &msg.chat_id)
+                        .await?
+                        .and_then(|d| (d.target_type == "team").then_some(d.target_id))
+                } else {
+                    None
+                };
+
+                let Some(team_id) = bound_team_id else {
+                    return Ok(Some(ActionResponse {
+                        text: Some(HubI18n::no_bound_team_info(locale).into()),
+                        parse_mode: None,
+                        buttons: None,
+                        keyboard: None,
+                        behavior: ActionBehavior::Send,
+                        toast: None,
+                        edit_message_id: None,
+                    }));
+                };
+
+                let Some(orch) = self.orchestrator.get() else {
+                    return Ok(None);
+                };
+
+                let team = self
+                    .team_service
+                    .get_team(owner_user_id, &team_id)
+                    .await
+                    .map_err(|e| ChannelError::PlatformApi(e.to_string()))?;
+
+                let compacted = orch
+                    .compact_team_context(
+                        owner_user_id,
+                        &team_id,
+                        crate::bridge::context_compactor::CompactTeamContextRequest::default(),
+                    )
+                    .await
+                    .map_err(|e| ChannelError::PlatformApi(format!("{e:?}")))?;
+
+                let avg_after = if compacted.context_status.slots.is_empty() {
+                    0
+                } else {
+                    let sum: i64 = compacted.context_status.slots.iter().map(|s| s.usage_percent).sum();
+                    sum / (compacted.context_status.slots.len() as i64)
+                };
+
+                let md = HubI18n::compact_completed_markdown(locale, &team.name, compacted.outcomes.len(), avg_after);
+                Ok(Some(ActionResponse {
+                    text: Some(markdown_to_telegram_html(&md)),
+                    parse_mode: Some(ParseMode::HTML),
+                    buttons: None,
+                    keyboard: None,
+                    behavior: ActionBehavior::Send,
+                    toast: None,
+                    edit_message_id: None,
+                }))
+            }
+
+            "/model" | "/models" => {
+                let bound_team_id = if let Some(b) = self
+                    .bridge_repo
+                    .resolve_channel_binding_for_chat(
+                        owner_user_id,
+                        "telegram",
+                        &msg.chat_id,
+                        msg.thread_id().as_deref(),
+                    )
+                    .await?
+                {
+                    (b.target_type == "team").then_some(b.target_id)
+                } else if !msg.is_group_chat() {
+                    self.bridge_repo
+                        .get_dm_target(owner_user_id, "telegram", &msg.chat_id)
+                        .await?
+                        .and_then(|d| (d.target_type == "team").then_some(d.target_id))
+                } else {
+                    None
+                };
+
+                let Some(team_id) = bound_team_id else {
+                    return Ok(Some(ActionResponse {
+                        text: Some(HubI18n::no_bound_team_info(locale).into()),
+                        parse_mode: None,
+                        buttons: None,
+                        keyboard: None,
+                        behavior: ActionBehavior::Send,
+                        toast: None,
+                        edit_message_id: None,
+                    }));
+                };
+
+                let Some(orch) = self.orchestrator.get() else {
+                    return Ok(None);
+                };
+
+                let team = self
+                    .team_service
+                    .get_team(owner_user_id, &team_id)
+                    .await
+                    .map_err(|e| ChannelError::PlatformApi(e.to_string()))?;
+
+                let catalog = orch
+                    .list_connected_models(owner_user_id)
+                    .await
+                    .map_err(|e| ChannelError::PlatformApi(format!("{e:?}")))?;
+
+                // Collect candidate (backend, provider_id, model_id, short_label)
+                let mut candidates: Vec<(String, Option<String>, String, String)> = Vec::new();
+                for cli in &catalog.cli_agents {
+                    for m in cli.models.iter().take(2) {
+                        let short = if m.id == cli.backend {
+                            cli.name.clone()
+                        } else {
+                            format!("{}/{}", cli.backend, m.id)
+                        };
+                        candidates.push((cli.backend.clone(), None, m.id.clone(), short));
+                    }
+                }
+                for prov in &catalog.api_providers {
+                    for m in prov.models.iter().take(3) {
+                        let short_model = m.id.rsplit('/').next().unwrap_or(&m.id);
+                        let short = format!("{}:{}", prov.name, short_model);
+                        candidates.push((
+                            "aionrs".to_owned(),
+                            prov.provider_id.clone().or_else(|| Some(prov.id.clone())),
+                            m.id.clone(),
+                            short,
+                        ));
+                    }
+                }
+
+                if candidates.is_empty() {
+                    return Ok(Some(ActionResponse {
+                        text: Some(markdown_to_telegram_html(HubI18n::no_connected_models_info(locale))),
+                        parse_mode: Some(ParseMode::HTML),
+                        buttons: None,
+                        keyboard: None,
+                        behavior: ActionBehavior::Send,
+                        toast: None,
+                        edit_message_id: None,
+                    }));
+                }
+
+                let mut rows: Vec<Vec<ActionButton>> = Vec::new();
+                for (backend, provider_id, model_id, short_label) in candidates.into_iter().take(8) {
+                    let short_capped: String = short_label.chars().take(22).collect();
+                    let all_tok = self
+                        .bridge_repo
+                        .create_action_token(
+                            owner_user_id,
+                            CustomTargetType::Team,
+                            &team_id,
+                            "switch_team_model",
+                            &serde_json::json!({
+                                "scope": "all",
+                                "backend": backend,
+                                "provider_id": provider_id,
+                                "model_id": model_id,
+                                "label": short_label,
+                            }),
+                            None,
+                        )
+                        .await?;
+                    let workers_tok = self
+                        .bridge_repo
+                        .create_action_token(
+                            owner_user_id,
+                            CustomTargetType::Team,
+                            &team_id,
+                            "switch_team_model",
+                            &serde_json::json!({
+                                "scope": "teammates_only",
+                                "backend": backend,
+                                "provider_id": provider_id,
+                                "model_id": model_id,
+                                "label": short_label,
+                            }),
+                            None,
+                        )
+                        .await?;
+
+                    rows.push(vec![
+                        ActionButton {
+                            label: HubI18n::btn_switch_all_members(locale, &short_capped),
+                            action: format!("t:{all_tok}"),
+                            params: None,
+                        },
+                        ActionButton {
+                            label: HubI18n::btn_switch_teammates_only(locale, &short_capped),
+                            action: format!("t:{workers_tok}"),
+                            params: None,
+                        },
+                    ]);
+                }
+
+                if let Ok(compact_tok) = self
+                    .bridge_repo
+                    .create_action_token(
+                        owner_user_id,
+                        CustomTargetType::Team,
+                        &team_id,
+                        "compact_team_now",
+                        &serde_json::json!({}),
+                        None,
+                    )
+                    .await
+                {
+                    rows.push(vec![ActionButton {
+                        label: HubI18n::btn_compact_now(locale).into(),
+                        action: format!("t:{compact_tok}"),
+                        params: None,
+                    }]);
+                }
+
+                let current_roster = team
+                    .assistants
+                    .iter()
+                    .map(|a| {
+                        let icon = if a.role.eq_ignore_ascii_case("lead") || a.role.eq_ignore_ascii_case("leader") {
+                            "👑"
+                        } else {
+                            "🤖"
+                        };
+                        format!("• {icon} **{}**: `{}/{}`", a.name, a.backend, a.model)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let prompt_md = HubI18n::model_picker_prompt(locale, &team.name, &current_roster);
+                Ok(Some(ActionResponse {
+                    text: Some(markdown_to_telegram_html(&prompt_md)),
+                    parse_mode: Some(ParseMode::HTML),
+                    buttons: Some(rows),
+                    keyboard: None,
+                    behavior: ActionBehavior::Send,
+                    toast: None,
+                    edit_message_id: None,
+                }))
+            }
+
             _ => Ok(None),
         }
     }
@@ -3167,7 +3441,8 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
 
             // Mutating one-shot actions guarded by `consume_action_token_once`
             "approve_continue" | "stop_run" | "retry_member" | "allow_more_hops"
-            | "worktree_merge" | "inbox_resolve" | "inbox_choice" | "budget_ack" => {
+            | "worktree_merge" | "inbox_resolve" | "inbox_choice" | "budget_ack"
+            | "switch_team_model" | "compact_team_now" => {
                 let consumed = self.bridge_repo.consume_action_token_once(token).await?;
                 if !consumed {
                     return Ok(ActionResponse {
@@ -3394,6 +3669,186 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                             behavior: ActionBehavior::Send,
                             toast: None,
                             edit_message_id: None,
+                        })
+                    }
+
+                    "compact_team_now" => {
+                        let orch = self
+                            .orchestrator
+                            .get()
+                            .ok_or_else(|| ChannelError::PlatformApi("TeamHubOrchestrator not initialized".into()))?;
+                        let team = self
+                            .team_service
+                            .get_team(owner_user_id, &row.target_id)
+                            .await
+                            .map_err(|e| ChannelError::PlatformApi(e.to_string()))?;
+                        let compacted = orch
+                            .compact_team_context(
+                                owner_user_id,
+                                &row.target_id,
+                                crate::bridge::context_compactor::CompactTeamContextRequest::default(),
+                            )
+                            .await
+                            .map_err(|e| ChannelError::PlatformApi(format!("{e:?}")))?;
+                        let avg_after = if compacted.context_status.slots.is_empty() {
+                            0
+                        } else {
+                            let sum: i64 = compacted.context_status.slots.iter().map(|s| s.usage_percent).sum();
+                            sum / (compacted.context_status.slots.len() as i64)
+                        };
+                        let html = markdown_to_telegram_html(&HubI18n::compact_completed_markdown(
+                            locale,
+                            &team.name,
+                            compacted.outcomes.len(),
+                            avg_after,
+                        ));
+                        if let Some(ref mid) = context.message_id {
+                            let base_chat = split_chat_and_thread(&context.chat_id).0;
+                            let _ = self
+                                .channel_manager
+                                .edit_message(
+                                    owner_user_id,
+                                    "telegram",
+                                    base_chat,
+                                    mid,
+                                    UnifiedOutgoingMessage {
+                                        message_type: OutgoingMessageType::Text,
+                                        text: Some(html.clone()),
+                                        parse_mode: Some(ParseMode::HTML),
+                                        buttons: None,
+                                        keyboard: None,
+                                        image_url: None,
+                                        file_url: None,
+                                        file_name: None,
+                                        media_actions: None,
+                                        reply_to_message_id: None,
+                                        silent: None,
+                                    },
+                                )
+                                .await;
+                        }
+                        Ok(ActionResponse {
+                            text: Some(html),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: if context.message_id.is_some() {
+                                ActionBehavior::Edit
+                            } else {
+                                ActionBehavior::Send
+                            },
+                            toast: None,
+                            edit_message_id: context.message_id.clone(),
+                        })
+                    }
+
+                    "switch_team_model" => {
+                        let orch = self
+                            .orchestrator
+                            .get()
+                            .ok_or_else(|| ChannelError::PlatformApi("TeamHubOrchestrator not initialized".into()))?;
+                        let scope = payload
+                            .get("scope")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("all")
+                            .to_owned();
+                        let backend = payload
+                            .get("backend")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let provider_id = payload
+                            .get("provider_id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        let model_id = payload
+                            .get("model_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let label = payload
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&model_id)
+                            .to_owned();
+
+                        let switched = orch
+                            .switch_team_models(
+                                owner_user_id,
+                                &row.target_id,
+                                crate::bridge::context_compactor::SwitchTeamModelsRequest {
+                                    scope: Some(scope.clone()),
+                                    target: Some(crate::bridge::context_compactor::ModelTargetSpec {
+                                        backend,
+                                        provider_id,
+                                        model_id,
+                                    }),
+                                    updates: Vec::new(),
+                                    force_interrupt: Some(false),
+                                },
+                            )
+                            .await
+                            .map_err(|e| ChannelError::PlatformApi(format!("{e:?}")))?;
+
+                        let switched_count = switched.results.iter().filter(|r| r.status == "switched").count();
+                        let queued_count = switched
+                            .results
+                            .iter()
+                            .filter(|r| r.status == "queued_after_turn")
+                            .count();
+                        let scope_label = if scope == "teammates_only" {
+                            HubI18n::scope_teammates_only_label(locale)
+                        } else {
+                            HubI18n::scope_all_members_label(locale)
+                        };
+                        let html = markdown_to_telegram_html(&HubI18n::model_switched_markdown(
+                            locale,
+                            &switched.team.name,
+                            scope_label,
+                            &label,
+                            switched_count,
+                            queued_count,
+                        ));
+
+                        if let Some(ref mid) = context.message_id {
+                            let base_chat = split_chat_and_thread(&context.chat_id).0;
+                            let _ = self
+                                .channel_manager
+                                .edit_message(
+                                    owner_user_id,
+                                    "telegram",
+                                    base_chat,
+                                    mid,
+                                    UnifiedOutgoingMessage {
+                                        message_type: OutgoingMessageType::Text,
+                                        text: Some(html.clone()),
+                                        parse_mode: Some(ParseMode::HTML),
+                                        buttons: None,
+                                        keyboard: None,
+                                        image_url: None,
+                                        file_url: None,
+                                        file_name: None,
+                                        media_actions: None,
+                                        reply_to_message_id: None,
+                                        silent: None,
+                                    },
+                                )
+                                .await;
+                        }
+
+                        Ok(ActionResponse {
+                            text: Some(html),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: if context.message_id.is_some() {
+                                ActionBehavior::Edit
+                            } else {
+                                ActionBehavior::Send
+                            },
+                            toast: None,
+                            edit_message_id: context.message_id.clone(),
                         })
                     }
 
@@ -4029,5 +4484,43 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         if let Some(mut entry) = self.active_runs.get_mut(team_id) {
             entry.delegated = true;
         }
+    }
+
+    async fn pending_slot_handover_banner(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        _conversation_id: &str,
+    ) -> Option<String> {
+        let anchor = self
+            .bridge_repo
+            .consume_pending_slot_handover(team_id, slot_id)
+            .await
+            .ok()??;
+        let trimmed = anchor.anchored_summary_md.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(format!("## Anchored Session Handover\n\n{trimmed}"))
+    }
+
+    fn on_slot_turn_settled(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        conversation_id: &str,
+    ) {
+        let Some(orch) = self.orchestrator.get().cloned() else {
+            return;
+        };
+        let uid = user_id.to_owned();
+        let tid = team_id.to_owned();
+        let sid = slot_id.to_owned();
+        let cid = conversation_id.to_owned();
+        tokio::spawn(async move {
+            orch.handle_slot_turn_settled(&uid, &tid, &sid, &cid).await;
+        });
     }
 }

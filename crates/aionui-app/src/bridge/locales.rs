@@ -658,6 +658,120 @@ impl HubI18n {
             ),
         }
     }
+
+    // --- Context Compaction & Connected Model Hot-Swap Locales ---
+
+    #[inline]
+    pub fn btn_compact_now(locale: HubLocale) -> &'static str {
+        match locale {
+            HubLocale::ViVn => "🧹 Nén ngữ cảnh ngay",
+            HubLocale::EnUs => "🧹 Compact Now",
+        }
+    }
+
+    #[inline]
+    pub fn btn_switch_all_members(locale: HubLocale, label: &str) -> String {
+        match locale {
+            HubLocale::ViVn => format!("👑 Tất cả: {label}"),
+            HubLocale::EnUs => format!("👑 All: {label}"),
+        }
+    }
+
+    #[inline]
+    pub fn btn_switch_teammates_only(locale: HubLocale, label: &str) -> String {
+        match locale {
+            HubLocale::ViVn => format!("🤖 Teammates: {label}"),
+            HubLocale::EnUs => format!("🤖 Workers: {label}"),
+        }
+    }
+
+    #[inline]
+    pub fn compact_completed_markdown(
+        locale: HubLocale,
+        team_name: &str,
+        slot_count: usize,
+        avg_after_pct: i64,
+    ) -> String {
+        match locale {
+            HubLocale::ViVn => format!(
+                "🧹 **[{team_name} · Đã nén ngữ cảnh]**\n• **Thành viên đã nén:** `{slot_count}` (gồm cả Leader & Teammates)\n• **Mức ngữ cảnh sau nén:** `~{avg_after_pct}%` (đã neo bản tóm tắt 5 mục an toàn)"
+            ),
+            HubLocale::EnUs => format!(
+                "🧹 **[{team_name} · Context Compacted]**\n• **Compacted members:** `{slot_count}` (Leader & Teammates)\n• **Post-compaction context:** `~{avg_after_pct}%` (5-section anchored handover saved)"
+            ),
+        }
+    }
+
+    #[inline]
+    pub fn model_picker_prompt(locale: HubLocale, team_name: &str, current_summary: &str) -> String {
+        match locale {
+            HubLocale::ViVn => format!(
+                "🔀 **[{team_name} · Đổi Model kết nối]**\n{current_summary}\n\nChọn chế độ đổi cho **Tất cả thành viên** (gồm Leader) hoặc **Chỉ Teammates** (giữ nguyên Model của Leader):"
+            ),
+            HubLocale::EnUs => format!(
+                "🔀 **[{team_name} · Switch Connected Models]**\n{current_summary}\n\nChoose **All Members** (including Leader) or **Workers Only** (keep Leader model):"
+            ),
+        }
+    }
+
+    #[inline]
+    pub fn no_connected_models_info(locale: HubLocale) -> &'static str {
+        match locale {
+            HubLocale::ViVn => "⚠️ Chưa phát hiện CLI OAuth đang Online hoặc API Provider nào đang bật trong AionUi.",
+            HubLocale::EnUs => "⚠️ No online CLI OAuth agents or enabled API providers found in AionUi.",
+        }
+    }
+
+    #[inline]
+    pub fn model_switched_markdown(
+        locale: HubLocale,
+        team_name: &str,
+        scope_label: &str,
+        target_label: &str,
+        switched_count: usize,
+        queued_count: usize,
+    ) -> String {
+        match locale {
+            HubLocale::ViVn => {
+                if queued_count > 0 {
+                    format!(
+                        "✅ **[{team_name} · Đã cập nhật Model]**\n• **Phạm vi:** {scope_label}\n• **Model mới:** `{target_label}`\n• **Kết quả:** Đổi ngay `{switched_count}` thành viên, xếp hàng chờ hết turn cho `{queued_count}` thành viên."
+                    )
+                } else {
+                    format!(
+                        "✅ **[{team_name} · Đã đổi Model thành công]**\n• **Phạm vi:** {scope_label}\n• **Model mới:** `{target_label}`\n• **Thành viên áp dụng:** `{switched_count}` (giữ nguyên lịch sử & neo ngữ cảnh)"
+                    )
+                }
+            }
+            HubLocale::EnUs => {
+                if queued_count > 0 {
+                    format!(
+                        "✅ **[{team_name} · Model Switch Updated]**\n• **Scope:** {scope_label}\n• **Target:** `{target_label}`\n• **Outcome:** Switched `{switched_count}` member(s) immediately, queued `{queued_count}` active member(s) after turn."
+                    )
+                } else {
+                    format!(
+                        "✅ **[{team_name} · Models Switched]**\n• **Scope:** {scope_label}\n• **Target:** `{target_label}`\n• **Updated members:** `{switched_count}` (chat history & anchored handover preserved)"
+                    )
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn scope_all_members_label(locale: HubLocale) -> &'static str {
+        match locale {
+            HubLocale::ViVn => "Tất cả thành viên (gồm Leader)",
+            HubLocale::EnUs => "All Members (including Leader)",
+        }
+    }
+
+    #[inline]
+    pub fn scope_teammates_only_label(locale: HubLocale) -> &'static str {
+        match locale {
+            HubLocale::ViVn => "Chỉ Teammates (giữ Leader)",
+            HubLocale::EnUs => "Teammates Only (keep Leader)",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -710,5 +824,22 @@ mod tests {
 
         let hard_vi = HubI18n::inbox_budget_hard_fuse_title(HubLocale::ViVn, 50.0, 50.0);
         assert!(hard_vi.contains("100%"));
+
+        // Compact & Model switch NFC checks
+        let samples = [
+            HubI18n::btn_compact_now(HubLocale::ViVn).to_owned(),
+            HubI18n::btn_switch_all_members(HubLocale::ViVn, "codex/gpt-5"),
+            HubI18n::btn_switch_teammates_only(HubLocale::ViVn, "aionrs/claude-sonnet-4"),
+            HubI18n::compact_completed_markdown(HubLocale::ViVn, "Alpha", 3, 12),
+            HubI18n::model_picker_prompt(HubLocale::ViVn, "Alpha", "3 slots"),
+            HubI18n::no_connected_models_info(HubLocale::ViVn).to_owned(),
+            HubI18n::model_switched_markdown(HubLocale::ViVn, "Alpha", "Tất cả", "codex", 3, 0),
+        ];
+        for s in &samples {
+            assert!(
+                !s.chars().any(|c| ('\u{0300}'..='\u{036F}').contains(&c)),
+                "Vietnamese string must be 100% Unicode NFC with zero combining marks: {s}"
+            );
+        }
     }
 }

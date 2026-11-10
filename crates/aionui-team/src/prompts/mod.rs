@@ -110,25 +110,136 @@ pub fn build_teammate_prompt_for_transport(
     })
 }
 
+pub const MAX_SINGLE_WAKE_MESSAGE_CHARS: usize = 2_400;
+pub const MAX_TOTAL_WAKE_UNREAD_CHARS: usize = 8_000;
+pub const WAKE_PREVIEW_HEAD_CHARS: usize = 1_400;
+pub const WAKE_PREVIEW_TAIL_CHARS: usize = 600;
+
+fn sanitize_handoff_msg_id(raw_id: &str) -> String {
+    let cleaned: String = raw_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    if cleaned.is_empty() {
+        "message".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+fn write_wake_overflow_handoff(
+    team_workspace: &str,
+    msg: &MailboxMessage,
+    type_label: &str,
+) -> Option<std::path::PathBuf> {
+    let ws = team_workspace.trim();
+    if ws.is_empty() {
+        return None;
+    }
+    let handoffs_dir = std::path::Path::new(ws).join(".aionui").join("handoffs");
+    if std::fs::create_dir_all(&handoffs_dir).is_err() {
+        return None;
+    }
+    let file_name = format!("{}.md", sanitize_handoff_msg_id(&msg.id));
+    let full_path = handoffs_dir.join(file_name);
+    let mut doc = format!(
+        "# Team Mailbox Handoff (`{}`)\n\n- **From:** `{}`\n- **To:** `{}`\n- **Type:** `{}`\n",
+        msg.id, msg.from_agent_id, msg.to_agent_id, type_label
+    );
+    if let Some(ref summary) = msg.summary {
+        doc.push_str(&format!("- **Summary:** {summary}\n"));
+    }
+    doc.push_str("\n---\n\n");
+    doc.push_str(&msg.content);
+    doc.push('\n');
+    if std::fs::write(&full_path, doc.as_bytes()).is_ok() {
+        Some(full_path)
+    } else {
+        None
+    }
+}
+
+fn format_budgeted_wake_message_body(
+    msg: &MailboxMessage,
+    type_label: &str,
+    used_unread_chars: &mut usize,
+    team_workspace: Option<&str>,
+) -> String {
+    let char_count = msg.content.chars().count();
+    let exceeds_single = char_count > MAX_SINGLE_WAKE_MESSAGE_CHARS;
+    let exceeds_total = used_unread_chars.saturating_add(char_count) > MAX_TOTAL_WAKE_UNREAD_CHARS;
+
+    if !exceeds_single && !exceeds_total {
+        *used_unread_chars = used_unread_chars.saturating_add(char_count);
+        return msg.content.clone();
+    }
+
+    let saved_path = team_workspace.and_then(|ws| write_wake_overflow_handoff(ws, msg, type_label));
+    let marker = match saved_path {
+        Some(path) => format!(
+            "\n...[truncated — full report saved to {} or via team_read_messages]...\n",
+            path.display()
+        ),
+        None => "\n...[truncated — full report saved via team_read_messages]...\n".to_owned(),
+    };
+
+    let (head_len, tail_len) = if char_count > WAKE_PREVIEW_HEAD_CHARS + WAKE_PREVIEW_TAIL_CHARS {
+        (WAKE_PREVIEW_HEAD_CHARS, WAKE_PREVIEW_TAIL_CHARS)
+    } else {
+        ((char_count / 2).min(700), (char_count / 4).min(300))
+    };
+
+    let preview = if head_len + tail_len >= char_count || char_count == 0 {
+        format!("{}{}", msg.content, marker)
+    } else {
+        let head: String = msg.content.chars().take(head_len).collect();
+        let tail: String = msg.content.chars().skip(char_count - tail_len).collect();
+        format!("{head}{marker}{tail}")
+    };
+
+    *used_unread_chars = used_unread_chars.saturating_add(preview.chars().count());
+    preview
+}
+
 pub fn build_wake_payload(
     agent: &TeamAgent,
     tasks: &[TeamTask],
     unread_messages: &[MailboxMessage],
     current_slot_ids: &HashSet<String>,
 ) -> String {
+    build_wake_payload_with_workspace(agent, tasks, unread_messages, current_slot_ids, None)
+}
+
+pub fn build_wake_payload_with_workspace(
+    agent: &TeamAgent,
+    tasks: &[TeamTask],
+    unread_messages: &[MailboxMessage],
+    current_slot_ids: &HashSet<String>,
+    team_workspace: Option<&str>,
+) -> String {
     let mut payload = String::with_capacity(2048);
 
     if !unread_messages.is_empty() {
         payload.push_str("## New Messages\n\n");
+        let mut used_unread_chars = 0usize;
         for msg in unread_messages {
             let type_label = match msg.msg_type {
                 MailboxMessageType::Message => "message",
                 MailboxMessageType::IdleNotification => "idle_notification",
                 MailboxMessageType::ShutdownRequest => "shutdown_request",
             };
+            let rendered_body =
+                format_budgeted_wake_message_body(msg, type_label, &mut used_unread_chars, team_workspace);
             payload.push_str(&format!(
                 "- From `{}` [{}]: {}\n",
-                msg.from_agent_id, type_label, msg.content,
+                msg.from_agent_id, type_label, rendered_body,
             ));
             if let Some(ref summary) = msg.summary {
                 payload.push_str(&format!("  Summary: {summary}\n"));
@@ -467,5 +578,34 @@ mod tests {
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
         let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
         assert!(payload.contains("short…"));
+    }
+
+    #[test]
+    fn wake_payload_budgeter_truncates_large_message_and_writes_handoff_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().into_owned();
+        let agent = make_lead();
+        let mut msg = make_message(
+            "w1",
+            &format!("HEAD_MARKER_{}_TAIL_MARKER", "x".repeat(3_200)),
+            MailboxMessageType::Message,
+        );
+        msg.id = "msg-overflow-42".into();
+
+        let payload = build_wake_payload_with_workspace(
+            &agent,
+            &[],
+            &[msg],
+            &roster(&["lead-1", "w1"]),
+            Some(&ws),
+        );
+
+        assert!(payload.contains("HEAD_MARKER_"));
+        assert!(payload.contains("_TAIL_MARKER"));
+        assert!(payload.contains("[truncated — full report saved to"));
+        let handoff_file = tmp.path().join(".aionui").join("handoffs").join("msg-overflow-42.md");
+        assert!(handoff_file.exists(), "handoff markdown file must exist");
+        let saved = std::fs::read_to_string(handoff_file).unwrap();
+        assert!(saved.contains(&"x".repeat(3_200)));
     }
 }

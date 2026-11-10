@@ -2390,6 +2390,136 @@ impl TeamSessionService {
         self.sessions.len()
     }
 
+    /// Re-arms `needs_role_prompt = true` on a slot's active scheduler so the next
+    /// wake injects the full Team Governance & Role prompt alongside any handover.
+    pub async fn mark_slot_needs_role_prompt(&self, team_id: &str, slot_id: &str) {
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            let _ = session.scheduler().require_role_prompt(slot_id).await;
+        }
+    }
+
+    /// Returns `true` when the given slot is actively executing an agent turn.
+    pub async fn is_slot_turn_running(&self, team_id: &str, slot_id: &str) -> bool {
+        let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) else {
+            return false;
+        };
+        if session
+            .work_coordinator()
+            .slot_snapshot(slot_id)
+            .is_some_and(|snapshot| snapshot.active_batch.is_some())
+        {
+            return true;
+        }
+        matches!(
+            session.scheduler().get_status(slot_id).await,
+            Ok(crate::types::TeammateStatus::Working
+                | crate::types::TeammateStatus::Thinking
+                | crate::types::TeammateStatus::ToolUse)
+        )
+    }
+
+    /// Safely stops or detaches a slot's worker task for context compaction or cross-engine model hot-swap
+    /// without altering legacy `clear_agent_context` rules (supports both Lead and Teammate, ACP and Aionrs).
+    ///
+    /// Returns `Ok(false)` when the slot is currently mid-turn and `force_interrupt == false`
+    /// (caller should queue the maintenance op for turn settle). Returns `Ok(true)` once stopped/refreshed.
+    pub async fn interrupt_or_restart_slot_for_maintenance(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        force_interrupt: bool,
+    ) -> Result<bool, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let latest_agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+
+        let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) else {
+            self.task_manager
+                .kill_and_wait(&latest_agent.conversation_id, Some(AgentKillReason::TeamContextReset))
+                .await;
+            return Ok(true);
+        };
+
+        let is_running = session
+            .work_coordinator()
+            .slot_snapshot(slot_id)
+            .is_some_and(|snapshot| snapshot.active_batch.is_some());
+
+        if is_running && !force_interrupt {
+            return Ok(false);
+        }
+
+        if is_running
+            && let Some(snapshot) = session.work_coordinator().slot_snapshot(slot_id)
+            && let Some(batch) = snapshot.active_batch
+        {
+            if let Some(turn_id) = snapshot.active_turn_id {
+                let _ = session
+                    .cancellation_port()
+                    .cancel_agent_turn(user_id, &latest_agent.conversation_id, &turn_id)
+                    .await;
+            }
+            session
+                .work_coordinator()
+                .cancel_batch(&batch, "maintenance_interrupt");
+        }
+
+        self.task_manager
+            .kill_and_wait(&latest_agent.conversation_id, Some(AgentKillReason::TeamContextReset))
+            .await;
+
+        let _ = session
+            .scheduler()
+            .update_agent_engine_and_model(
+                slot_id,
+                &latest_agent.backend,
+                &latest_agent.model,
+                latest_agent.assistant_id.clone(),
+            )
+            .await;
+
+        session.member_runtimes().reset_failed_to_absent(slot_id);
+
+        if let Ok(transport) = self.provisioner().team_tool_transport(user_id, &latest_agent).await
+            && let Ok(mcp_res) = self
+                .conversation_port
+                .resolve_conversation_mcp_snapshot(
+                    user_id,
+                    &latest_agent.conversation_id,
+                    latest_agent.assistant_id.as_deref(),
+                )
+                .await
+        {
+            match transport {
+                TeamToolTransport::Mcp => {
+                    let _ = self
+                        .provisioner()
+                        .write_team_mcp_runtime_config(
+                            user_id,
+                            &latest_agent,
+                            session.mcp_stdio_config(slot_id),
+                            false,
+                            &mcp_res,
+                        )
+                        .await;
+                }
+                TeamToolTransport::CliAssumed => {
+                    let _ = self
+                        .provisioner()
+                        .write_team_cli_runtime_config(user_id, &latest_agent, false, &mcp_res)
+                        .await;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);

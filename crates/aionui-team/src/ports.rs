@@ -67,6 +67,25 @@ pub trait TeamExternalBridgePort: Send + Sync {
     async fn pending_room_handoff_banner(&self, user_id: &str, team_id: &str) -> Option<String>;
 
     fn on_team_delegation(&self, team_id: &str);
+
+    async fn pending_slot_handover_banner(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+        _conversation_id: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    fn on_slot_turn_settled(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+        _conversation_id: &str,
+    ) {
+    }
 }
 
 /// Resolves Team tool capability without exposing backend-specific descriptors

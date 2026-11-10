@@ -155,6 +155,21 @@ impl MemberRuntimeRegistry {
         &self.session_generation
     }
 
+    /// Clear a `Failed` entry back to `Absent` so a cross-engine model switch
+    /// can lazily start the replacement backend on the next message.
+    pub(crate) fn reset_failed_to_absent(&self, agent_id: &str) -> bool {
+        let mut entries = self.lock_entries();
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        if matches!(entries.get(agent_id), Some(MemberRuntimeEntry::Failed { .. })) {
+            entries.remove(agent_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Test-only helper: seed a slot straight to `Ready` without running an
     /// attach. Production code reaches `Ready` exclusively through the single
     /// attach path (`reserve_attach` → `commit_ready`); leader-only warmup left

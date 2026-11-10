@@ -338,6 +338,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Team routes protected by auth middleware
     let team_authenticated =
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let team_hub_authenticated = crate::routes::team_hub_routes(states.team_hub)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let shared_room_authenticated = crate::bridge::shared_room_routes(states.shared_room)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let worktree_authenticated = crate::routes::worktree_routes(states.worktree)
@@ -424,6 +426,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(skill_runtime)
         .merge(channel_authenticated)
         .merge(team_authenticated)
+        .merge(team_hub_authenticated)
         .merge(shared_room_authenticated)
         .merge(worktree_authenticated)
         .merge(inbox_authenticated)

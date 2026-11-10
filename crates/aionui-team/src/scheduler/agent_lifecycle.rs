@@ -85,4 +85,35 @@ impl TeammateManager {
         debug!(team_id = %self.team_id, slot_id, model, "agent model updated");
         Ok(())
     }
+
+    pub async fn update_agent_engine_and_model(
+        &self,
+        slot_id: &str,
+        backend: &str,
+        model: &str,
+        assistant_id: Option<String>,
+    ) -> Result<(), TeamError> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        slot.agent.backend = backend.to_owned();
+        slot.agent.model = model.to_owned();
+        if assistant_id.is_some() {
+            slot.agent.assistant_id = assistant_id;
+        }
+        slot.needs_role_prompt = true;
+        if slot.status == TeammateStatus::Error {
+            slot.status = TeammateStatus::Idle;
+            slot.agent.status = Some(TeammateStatus::Idle);
+        }
+        debug!(
+            team_id = %self.team_id,
+            slot_id,
+            backend,
+            model,
+            "agent engine and model updated with role prompt re-armed"
+        );
+        Ok(())
+    }
 }

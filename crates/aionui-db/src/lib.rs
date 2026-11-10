@@ -67,12 +67,14 @@ pub use repository::{
 };
 
 pub use custom_bridge_schema::{
-    CUSTOM_BRIDGE_SCHEMA_VERSION, CreateGitWorktreeParams, CreateSharedRoomMessageParams, CreateSharedRoomParams,
-    CreateSharedRoomTaskParams, CustomChannelActionTokenRow, CustomChannelBindingRow, CustomChannelDmTargetRow,
-    CustomChannelMsgRouteRow, CustomGitWorktreeRow, CustomSharedRoomMemberRow, CustomSharedRoomMessageRow,
-    CustomSharedRoomRow, CustomSharedRoomTaskRow, CustomStreamMode, CustomTargetNotifyPrefRow, CustomTargetType,
-    DEFAULT_ACTION_TOKEN_TTL_MS, SqliteCustomBridgeRepository, UpdateSharedRoomParams, UpdateSharedRoomTaskParams,
-    UpsertChannelBindingParams, ensure_custom_bridge_tables,
+    AnchorMailboxSourceRow, AnchorMessageSourceRow, AnchorTeamTaskSourceRow, CUSTOM_BRIDGE_SCHEMA_VERSION,
+    CreateGitWorktreeParams, CreateSharedRoomMessageParams, CreateSharedRoomParams, CreateSharedRoomTaskParams,
+    CustomChannelActionTokenRow, CustomChannelBindingRow, CustomChannelDmTargetRow, CustomChannelMsgRouteRow,
+    CustomGitWorktreeRow, CustomSharedRoomMemberRow, CustomSharedRoomMessageRow, CustomSharedRoomRow,
+    CustomSharedRoomTaskRow, CustomStreamMode, CustomTargetNotifyPrefRow, CustomTargetType,
+    CustomTeamContextAnchorRow, CustomTeamContextPrefRow, CustomTeamSlotSwapRow, DEFAULT_ACTION_TOKEN_TTL_MS,
+    SqliteCustomBridgeRepository, UpdateSharedRoomParams, UpdateSharedRoomTaskParams, UpsertChannelBindingParams,
+    UpsertTeamContextAnchorParams, ensure_custom_bridge_tables,
 };
 
 // Re-export sqlx pool type for downstream crates

@@ -321,6 +321,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 }
                 let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
                 finalize_scheduler_turn(ctx).await;
+                ctx.session
+                    .notify_slot_turn_settled(&ctx.slot_id, &input.conversation_id);
                 return ExecuteResult::ContinueDraining;
             }
             warn!(
@@ -379,6 +381,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
     }
 
     finalize_scheduler_turn(ctx).await;
+    ctx.session
+        .notify_slot_turn_settled(&ctx.slot_id, &input.conversation_id);
     ExecuteResult::ContinueDraining
 }
 

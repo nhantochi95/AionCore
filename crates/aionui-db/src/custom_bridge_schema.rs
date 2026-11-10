@@ -414,6 +414,88 @@ pub struct RecordCostRunParams {
     pub cost_usd: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, FromRow)]
+pub struct CustomTeamContextAnchorRow {
+    pub team_id: String,
+    pub slot_id: String,
+    pub conversation_id: String,
+    pub anchored_summary_md: String,
+    pub files_touched_json: String,
+    pub last_compacted_msg_id: Option<String>,
+    pub compaction_count: i64,
+    pub pending_handover: i64,
+    pub updated_at: i64,
+}
+
+impl CustomTeamContextAnchorRow {
+    pub fn has_pending_handover(&self) -> bool {
+        self.pending_handover != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertTeamContextAnchorParams {
+    pub team_id: String,
+    pub slot_id: String,
+    pub conversation_id: String,
+    pub anchored_summary_md: String,
+    pub files_touched_json: String,
+    pub last_compacted_msg_id: Option<String>,
+    pub compaction_count: i64,
+    pub pending_handover: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, FromRow)]
+pub struct CustomTeamContextPrefRow {
+    pub team_id: String,
+    pub auto_compact_enabled: i64,
+    pub threshold_pct: i64,
+    pub updated_at: i64,
+}
+
+impl CustomTeamContextPrefRow {
+    pub fn is_auto_compact_enabled(&self) -> bool {
+        self.auto_compact_enabled != 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, FromRow)]
+pub struct CustomTeamSlotSwapRow {
+    pub team_id: String,
+    pub slot_id: String,
+    pub target_backend: String,
+    pub target_provider_id: Option<String>,
+    pub target_model_id: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AnchorMessageSourceRow {
+    pub id: String,
+    pub msg_id: Option<String>,
+    pub r#type: String,
+    pub content: String,
+    pub position: Option<String>,
+    pub hidden: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AnchorMailboxSourceRow {
+    pub from_agent_id: String,
+    pub to_agent_id: String,
+    pub content: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AnchorTeamTaskSourceRow {
+    pub id: String,
+    pub subject: String,
+    pub status: String,
+    pub owner: Option<String>,
+    pub blocked_by: String,
+}
+
 /// Idempotently creates all fork-specific `custom_*` tables and indexes
 /// without modifying `_sqlx_migrations`, keeping upstream merges conflict-free.
 pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbError> {
@@ -672,6 +754,43 @@ pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbErro
         r#"
         CREATE INDEX IF NOT EXISTS idx_custom_cost_ledger_team
             ON custom_cost_ledger(owner_user_id, team_id, created_at DESC)
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_team_context_anchors (
+            team_id TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            anchored_summary_md TEXT NOT NULL DEFAULT '',
+            files_touched_json TEXT NOT NULL DEFAULT '[]',
+            last_compacted_msg_id TEXT,
+            compaction_count INTEGER NOT NULL DEFAULT 0,
+            pending_handover INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (team_id, slot_id)
+        )
+        "#,
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_custom_team_context_anchors_conv
+            ON custom_team_context_anchors(conversation_id)
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_team_context_prefs (
+            team_id TEXT PRIMARY KEY,
+            auto_compact_enabled INTEGER NOT NULL DEFAULT 1,
+            threshold_pct INTEGER NOT NULL DEFAULT 80,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_team_slot_swaps (
+            team_id TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            target_backend TEXT NOT NULL,
+            target_provider_id TEXT,
+            target_model_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (team_id, slot_id)
+        )
         "#,
     ];
 
@@ -1603,6 +1722,24 @@ impl SqliteCustomBridgeRepository {
         .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
+
+        sqlx::query("DELETE FROM custom_team_context_anchors WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+
+        sqlx::query("DELETE FROM custom_team_context_prefs WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+
+        sqlx::query("DELETE FROM custom_team_slot_swaps WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
 
         let mut affected_room_ids: Vec<String> = sqlx::query_scalar(
             r#"
@@ -2656,6 +2793,602 @@ impl SqliteCustomBridgeRepository {
     pub async fn is_wallet_hard_blocked(&self, owner_user_id: &str) -> Result<bool, DbError> {
         let wallet = self.get_or_create_cost_wallet(owner_user_id).await?;
         Ok(wallet.hard_block_triggered == 1)
+    }
+
+    // -----------------------------------------------------------------------
+    // Team Context Compaction Anchors, Prefs & Cross-Engine Hot-Swaps
+    // -----------------------------------------------------------------------
+
+    pub async fn get_team_context_anchor(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<CustomTeamContextAnchorRow>, DbError> {
+        sqlx::query_as::<_, CustomTeamContextAnchorRow>(
+            r#"
+            SELECT team_id, slot_id, conversation_id, anchored_summary_md, files_touched_json,
+                   last_compacted_msg_id, compaction_count, pending_handover, updated_at
+            FROM custom_team_context_anchors
+            WHERE team_id = ? AND slot_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_team_context_anchors(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<CustomTeamContextAnchorRow>, DbError> {
+        sqlx::query_as::<_, CustomTeamContextAnchorRow>(
+            r#"
+            SELECT team_id, slot_id, conversation_id, anchored_summary_md, files_touched_json,
+                   last_compacted_msg_id, compaction_count, pending_handover, updated_at
+            FROM custom_team_context_anchors
+            WHERE team_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn upsert_team_context_anchor(
+        &self,
+        params: UpsertTeamContextAnchorParams,
+    ) -> Result<CustomTeamContextAnchorRow, DbError> {
+        let now = aionui_common::now_ms();
+        let pending_flag = if params.pending_handover { 1_i64 } else { 0_i64 };
+        sqlx::query(
+            r#"
+            INSERT INTO custom_team_context_anchors (
+                team_id, slot_id, conversation_id, anchored_summary_md, files_touched_json,
+                last_compacted_msg_id, compaction_count, pending_handover, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(team_id, slot_id) DO UPDATE SET
+                conversation_id = excluded.conversation_id,
+                anchored_summary_md = excluded.anchored_summary_md,
+                files_touched_json = excluded.files_touched_json,
+                last_compacted_msg_id = excluded.last_compacted_msg_id,
+                compaction_count = excluded.compaction_count,
+                pending_handover = excluded.pending_handover,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&params.team_id)
+        .bind(&params.slot_id)
+        .bind(&params.conversation_id)
+        .bind(&params.anchored_summary_md)
+        .bind(&params.files_touched_json)
+        .bind(&params.last_compacted_msg_id)
+        .bind(params.compaction_count)
+        .bind(pending_flag)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_team_context_anchor(&params.team_id, &params.slot_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("context anchor {}:{}", params.team_id, params.slot_id)))
+    }
+
+    pub async fn consume_pending_slot_handover(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<CustomTeamContextAnchorRow>, DbError> {
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+        let res = sqlx::query(
+            r#"
+            UPDATE custom_team_context_anchors
+            SET pending_handover = 0, updated_at = ?
+            WHERE team_id = ? AND slot_id = ? AND pending_handover = 1
+            "#,
+        )
+        .bind(now)
+        .bind(team_id)
+        .bind(slot_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        if res.rows_affected() == 0 {
+            tx.rollback().await.map_err(DbError::Query)?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query_as::<_, CustomTeamContextAnchorRow>(
+            r#"
+            SELECT team_id, slot_id, conversation_id, anchored_summary_md, files_touched_json,
+                   last_compacted_msg_id, compaction_count, pending_handover, updated_at
+            FROM custom_team_context_anchors
+            WHERE team_id = ? AND slot_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        tx.commit().await.map_err(DbError::Query)?;
+        Ok(row)
+    }
+
+    pub async fn get_or_default_team_context_pref(
+        &self,
+        team_id: &str,
+    ) -> Result<CustomTeamContextPrefRow, DbError> {
+        let existing = sqlx::query_as::<_, CustomTeamContextPrefRow>(
+            r#"
+            SELECT team_id, auto_compact_enabled, threshold_pct, updated_at
+            FROM custom_team_context_prefs
+            WHERE team_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        if let Some(row) = existing {
+            return Ok(row);
+        }
+
+        Ok(CustomTeamContextPrefRow {
+            team_id: team_id.to_owned(),
+            auto_compact_enabled: 1,
+            threshold_pct: 80,
+            updated_at: aionui_common::now_ms(),
+        })
+    }
+
+    pub async fn upsert_team_context_pref(
+        &self,
+        team_id: &str,
+        auto_compact_enabled: bool,
+        threshold_pct: i64,
+    ) -> Result<CustomTeamContextPrefRow, DbError> {
+        let now = aionui_common::now_ms();
+        let enabled_flag = if auto_compact_enabled { 1_i64 } else { 0_i64 };
+        let clamped_threshold = threshold_pct.clamp(40, 99);
+        sqlx::query(
+            r#"
+            INSERT INTO custom_team_context_prefs (
+                team_id, auto_compact_enabled, threshold_pct, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(team_id) DO UPDATE SET
+                auto_compact_enabled = excluded.auto_compact_enabled,
+                threshold_pct = excluded.threshold_pct,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(team_id)
+        .bind(enabled_flag)
+        .bind(clamped_threshold)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_or_default_team_context_pref(team_id).await
+    }
+
+    pub async fn get_pending_slot_swap(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<CustomTeamSlotSwapRow>, DbError> {
+        sqlx::query_as::<_, CustomTeamSlotSwapRow>(
+            r#"
+            SELECT team_id, slot_id, target_backend, target_provider_id, target_model_id, created_at
+            FROM custom_team_slot_swaps
+            WHERE team_id = ? AND slot_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_pending_slot_swaps(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<CustomTeamSlotSwapRow>, DbError> {
+        sqlx::query_as::<_, CustomTeamSlotSwapRow>(
+            r#"
+            SELECT team_id, slot_id, target_backend, target_provider_id, target_model_id, created_at
+            FROM custom_team_slot_swaps
+            WHERE team_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn upsert_pending_slot_swap(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        target_backend: &str,
+        target_provider_id: Option<&str>,
+        target_model_id: &str,
+    ) -> Result<CustomTeamSlotSwapRow, DbError> {
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            r#"
+            INSERT INTO custom_team_slot_swaps (
+                team_id, slot_id, target_backend, target_provider_id, target_model_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(team_id, slot_id) DO UPDATE SET
+                target_backend = excluded.target_backend,
+                target_provider_id = excluded.target_provider_id,
+                target_model_id = excluded.target_model_id,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .bind(target_backend)
+        .bind(target_provider_id)
+        .bind(target_model_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        self.get_pending_slot_swap(team_id, slot_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("pending slot swap {team_id}:{slot_id}")))
+    }
+
+    pub async fn take_pending_slot_swap(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<CustomTeamSlotSwapRow>, DbError> {
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+        let row = sqlx::query_as::<_, CustomTeamSlotSwapRow>(
+            r#"
+            SELECT team_id, slot_id, target_backend, target_provider_id, target_model_id, created_at
+            FROM custom_team_slot_swaps
+            WHERE team_id = ? AND slot_id = ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        if row.is_some() {
+            sqlx::query("DELETE FROM custom_team_slot_swaps WHERE team_id = ? AND slot_id = ?")
+                .bind(team_id)
+                .bind(slot_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+        }
+
+        tx.commit().await.map_err(DbError::Query)?;
+        Ok(row)
+    }
+
+    pub async fn clear_pending_slot_swap(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<bool, DbError> {
+        let res = sqlx::query("DELETE FROM custom_team_slot_swaps WHERE team_id = ? AND slot_id = ?")
+            .bind(team_id)
+            .bind(slot_id)
+            .execute(&self.pool)
+            .await
+            .map_err(DbError::Query)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Atomically rebinds a conversation's engine (`conversations.type`, `model`, `extra`, `updated_at`),
+    /// updates/creates `acp_session` (`session_id = NULL`, clears `runtime.context_usage`),
+    /// and synchronizes `conversation_assistant_snapshots.agent_id` in a single SQLite transaction.
+    pub async fn rebind_conversation_engine(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        new_type: &str,
+        new_model_json: Option<&str>,
+        new_extra_json: &str,
+    ) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+
+        let upd = sqlx::query(
+            r#"
+            UPDATE conversations
+            SET type = ?, model = ?, extra = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            "#,
+        )
+        .bind(new_type)
+        .bind(new_model_json)
+        .bind(new_extra_json)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        if upd.rows_affected() == 0 {
+            tx.rollback().await.map_err(DbError::Query)?;
+            return Ok(false);
+        }
+
+        let extra_val: serde_json::Value =
+            serde_json::from_str(new_extra_json).unwrap_or_else(|_| serde_json::json!({}));
+        let extra_agent_id = extra_val
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let extra_agent_source = extra_val
+            .get("agent_source")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("builtin");
+        let extra_model_id = extra_val
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let existing_cfg: Option<String> = sqlx::query_scalar(
+            "SELECT session_config FROM acp_session WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        let mut cfg_json: serde_json::Value = existing_cfg
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = cfg_json.as_object_mut() {
+            let rt = obj
+                .entry("runtime")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(rt_obj) = rt.as_object_mut() {
+                rt_obj.remove("context_usage");
+                if let Some(mid) = extra_model_id {
+                    rt_obj.insert("current_model_id".into(), serde_json::Value::String(mid.to_owned()));
+                } else {
+                    rt_obj.remove("current_model_id");
+                }
+            }
+        }
+        let cleaned_cfg_str = serde_json::to_string(&cfg_json).unwrap_or_else(|_| "{}".into());
+
+        if existing_cfg.is_some() {
+            if !extra_agent_id.is_empty() {
+                sqlx::query(
+                    r#"
+                    UPDATE acp_session
+                    SET agent_source = ?, agent_id = ?, session_id = NULL, session_config = ?, last_active_at = ?
+                    WHERE conversation_id = ?
+                    "#,
+                )
+                .bind(extra_agent_source)
+                .bind(extra_agent_id)
+                .bind(&cleaned_cfg_str)
+                .bind(now)
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE acp_session
+                    SET session_id = NULL, session_config = ?, last_active_at = ?
+                    WHERE conversation_id = ?
+                    "#,
+                )
+                .bind(&cleaned_cfg_str)
+                .bind(now)
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+            }
+        } else if (new_type == "acp" || new_type == "antigravity") && !extra_agent_id.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO acp_session (
+                    conversation_id, agent_source, agent_id, session_id, session_status, session_config, last_active_at
+                ) VALUES (?, ?, ?, NULL, 'idle', ?, ?)
+                "#,
+            )
+            .bind(conversation_id)
+            .bind(extra_agent_source)
+            .bind(extra_agent_id)
+            .bind(&cleaned_cfg_str)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+        }
+
+        if !extra_agent_id.is_empty() {
+            sqlx::query(
+                r#"
+                UPDATE conversation_assistant_snapshots
+                SET agent_id = ?, resolved_model_id = COALESCE(?, resolved_model_id)
+                WHERE conversation_id = ?
+                "#,
+            )
+            .bind(extra_agent_id)
+            .bind(extra_model_id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+        }
+
+        tx.commit().await.map_err(DbError::Query)?;
+        Ok(true)
+    }
+
+    /// Clears `acp_session.session_id = NULL` and removes `runtime.context_usage` from `session_config`
+    /// on rollover so the next turn opens `SessionSpec::Fresh` with a reset token gauge.
+    pub async fn clear_acp_context_usage_on_rollover(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await.map_err(DbError::Query)?;
+
+        let existing_cfg: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT a.session_config
+            FROM acp_session a
+            WHERE a.conversation_id = ?
+              AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.user_id = ?)
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        let Some(raw_cfg) = existing_cfg else {
+            tx.rollback().await.map_err(DbError::Query)?;
+            return Ok(false);
+        };
+
+        let mut cfg_json: serde_json::Value =
+            serde_json::from_str(&raw_cfg).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(rt_obj) = cfg_json
+            .as_object_mut()
+            .and_then(|o| o.get_mut("runtime"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            rt_obj.remove("context_usage");
+        }
+        let cleaned_cfg = serde_json::to_string(&cfg_json).unwrap_or_else(|_| "{}".into());
+
+        let upd = sqlx::query(
+            r#"
+            UPDATE acp_session
+            SET session_id = NULL, session_config = ?, last_active_at = ?
+            WHERE conversation_id = ?
+            "#,
+        )
+        .bind(cleaned_cfg)
+        .bind(now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
+        tx.commit().await.map_err(DbError::Query)?;
+        Ok(upd.rows_affected() > 0)
+    }
+
+    pub async fn list_conversation_messages_for_anchor(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<AnchorMessageSourceRow>, DbError> {
+        sqlx::query_as::<_, AnchorMessageSourceRow>(
+            r#"
+            SELECT id, msg_id, type, content, position, hidden
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_recent_slot_mailbox_for_anchor(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AnchorMailboxSourceRow>, DbError> {
+        sqlx::query_as::<_, AnchorMailboxSourceRow>(
+            r#"
+            SELECT from_agent_id, to_agent_id, content, summary
+            FROM mailbox
+            WHERE team_id = ? AND (to_agent_id = ? OR from_agent_id = ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(slot_id)
+        .bind(slot_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn list_active_team_tasks_for_anchor(
+        &self,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AnchorTeamTaskSourceRow>, DbError> {
+        sqlx::query_as::<_, AnchorTeamTaskSourceRow>(
+            r#"
+            SELECT id, subject, status, owner, blocked_by
+            FROM team_tasks
+            WHERE team_id = ? AND status != 'deleted'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(team_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Query)
+    }
+
+    pub async fn count_conversation_messages(&self, conversation_id: &str) -> Result<i64, DbError> {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::Query)
+    }
+
+    pub async fn get_latest_conversation_message_id(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        sqlx::query_scalar(
+            "SELECT id FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Query)
     }
 }
 
