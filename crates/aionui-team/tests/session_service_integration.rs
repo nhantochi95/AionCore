@@ -3147,7 +3147,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert!(!got.workspace.trim().is_empty(), "teams.workspace must be set");
     assert!(
-        got.workspace.contains("/conversations/acp-temp-"),
+        got.workspace.contains("/conversations/acp-temp-") || got.workspace.contains(r"\conversations\acp-temp-"),
         "unexpected auto workspace: {}",
         got.workspace
     );
@@ -5573,7 +5573,9 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert!(
         got.workspace
-            .contains(&format!("/conversations/team-temp-{}", created.id)),
+            .contains(&format!("/conversations/team-temp-{}", created.id))
+            || got.workspace
+                .contains(&format!(r"\conversations\team-temp-{}", created.id)),
         "unexpected team temp workspace: {}",
         got.workspace
     );
@@ -5688,6 +5690,8 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
     assert!(
         got.workspace
             .contains(&format!("/conversations/team-temp-{}", created.id))
+            || got.workspace
+                .contains(&format!(r"\conversations\team-temp-{}", created.id))
     );
     let added_extra = conv_repo.get_extra(&added.conversation_id).unwrap();
     assert_eq!(

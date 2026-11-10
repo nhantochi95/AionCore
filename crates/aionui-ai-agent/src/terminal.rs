@@ -399,7 +399,11 @@ mod tests {
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id = reg.create(params("echo", &["hello_term"])).await.unwrap();
+        #[cfg(unix)]
+        let p = params("echo", &["hello_term"]);
+        #[cfg(windows)]
+        let p = params("cmd", &["/C", "echo hello_term"]);
+        let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(!exit.signaled);
@@ -412,7 +416,10 @@ mod tests {
     #[tokio::test]
     async fn output_byte_limit_truncates_from_front() {
         let reg = TerminalRegistry::new("conv-t", None);
+        #[cfg(unix)]
         let mut p = params("sh", &["-c", "printf 'AAAA'; printf 'BBBB'"]);
+        #[cfg(windows)]
+        let mut p = params("powershell", &["-NoProfile", "-Command", "[Console]::Write('AAAABBBB')"]);
         p.output_byte_limit = Some(4);
         let id = reg.create(p).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
@@ -424,7 +431,11 @@ mod tests {
     #[tokio::test]
     async fn kill_terminates_long_command_with_signal() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id = reg.create(params("sleep", &["30"])).await.unwrap();
+        #[cfg(unix)]
+        let p = params("sleep", &["30"]);
+        #[cfg(windows)]
+        let p = params("powershell", &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        let id = reg.create(p).await.unwrap();
         assert!(reg.kill(&id, "test").await);
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert!(exit.signaled || exit.exit_code.is_none() || exit.exit_code != Some(0));
@@ -437,8 +448,15 @@ mod tests {
     #[tokio::test]
     async fn release_is_idempotent_and_kill_all_clears() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id1 = reg.create(params("sleep", &["30"])).await.unwrap();
-        let _id2 = reg.create(params("sleep", &["30"])).await.unwrap();
+        #[cfg(unix)]
+        let (p1, p2) = (params("sleep", &["30"]), params("sleep", &["30"]));
+        #[cfg(windows)]
+        let (p1, p2) = (
+            params("powershell", &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]),
+            params("powershell", &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]),
+        );
+        let id1 = reg.create(p1).await.unwrap();
+        let _id2 = reg.create(p2).await.unwrap();
         assert!(reg.release(&id1).await);
         assert!(!reg.release(&id1).await);
         reg.kill_all().await;
@@ -457,7 +475,10 @@ mod tests {
     #[tokio::test]
     async fn bare_compound_command_runs_through_shell() {
         let reg = TerminalRegistry::new("conv-t", None);
+        #[cfg(unix)]
         let mut p = params("true && echo shell_interpreted", &[]);
+        #[cfg(windows)]
+        let mut p = params("cd . && echo shell_interpreted", &[]);
         p.args = vec![];
         let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
@@ -467,6 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn background_child_holding_stdout_does_not_hang_exit() {
         // B6: `sh -c 'sleep 30 &'` — the parent exits immediately but the
         // backgrounded child inherits the stdout pipe, so the read side never
@@ -492,19 +514,28 @@ mod tests {
         // process on the machine, which made this test flaky.
         let dir = tempfile::TempDir::new().unwrap();
         let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
+        #[cfg(unix)]
         let id = reg.create(params("pwd", &[])).await.unwrap();
+        #[cfg(windows)]
+        let id = reg.create(params("cd", &[])).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
         // `pwd` prints the resolved path (on macOS temp_dir lives under
         // /var -> /private/var), so compare against the canonicalized full path
         // rather than only the trailing directory name.
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         let expected = canonical.to_str().unwrap();
-        let snap = wait_for_output_contains(&reg, &id, expected).await;
-        assert_eq!(
-            snap.output.trim(),
-            expected,
-            "pwd should report the default cwd; output: {}",
-            snap.output
+        let target = if cfg!(windows) {
+            expected.strip_prefix(r"\\?\").unwrap_or(expected)
+        } else {
+            expected
+        };
+        let snap = wait_for_output_contains(&reg, &id, target).await;
+        let clean_output = snap.output.trim().strip_prefix(r"\\?\").unwrap_or(snap.output.trim());
+        assert!(
+            clean_output.eq_ignore_ascii_case(target),
+            "cwd should report the default cwd; output: {}, target: {}",
+            snap.output,
+            target
         );
     }
 
