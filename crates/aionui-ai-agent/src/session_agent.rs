@@ -1751,9 +1751,16 @@ fn clear_stale_model(
 /// mislabel any third backend. Antigravity needs none of it, so it shares this
 /// module's helpers (`spec_mode_model`, the MCP fold, `assemble_spawn_env`,
 /// `spawn_catalog_writeback`) without entering that path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AntigravityRuntimeOptions {
+    pub warm_acp: bool,
+    pub isolate_default_customizations: bool,
+}
+
 pub async fn build_antigravity_instance(
     inputs: SessionBuildInputs<'_>,
     spawner: Arc<dyn aionui_process::Spawner>,
+    options: AntigravityRuntimeOptions,
 ) -> Result<crate::agent_task::AgentInstance, AgentError> {
     use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
 
@@ -1836,6 +1843,8 @@ pub async fn build_antigravity_instance(
         // agy is layer 2, so this carries only the allow-list entries (one
         // `--add-dir` per enabled skill) and never a plugin flag.
         extra_args: skill_delivery.plan.extra_args.clone(),
+        antigravity_warm_acp: options.warm_acp,
+        antigravity_isolate_default_customizations: options.isolate_default_customizations,
         ..Default::default()
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
@@ -3696,10 +3705,20 @@ async fn persist_context_usage(
     if let Some(cost) = cost_usd {
         usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
     }
-    // The detail line must survive a reload too — the renderer reads `_meta` off
-    // the GET /usage snapshot exactly as it does off a live frame. Merged like
-    // `size`/`cost`: only replaced when the incoming turn actually reported one.
-    if !breakdown.is_empty() {
+    static USAGE_META_SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    let prev_seq = usage
+        .get("_meta")
+        .and_then(|m| m.get("seq"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    // The detail line and Team Economy telemetry must survive a reload too —
+    // persist `_meta` with a monotonic `seq` whenever the turn reported real
+    // input/output or breakdown tokens, and clear stale `_meta` when a bare
+    // occupancy-only `usage_update` arrives on a subsequent turn.
+    if !breakdown.is_empty() || *input_tokens > 0 || *output_tokens > 0 {
+        let next_seq = prev_seq
+            .saturating_add(1)
+            .max(USAGE_META_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         usage.insert(
             "_meta".into(),
             serde_json::json!({
@@ -3708,8 +3727,11 @@ async fn persist_context_usage(
                 "cached_read_tokens": breakdown.cached_read_tokens,
                 "cached_write_tokens": breakdown.cached_write_tokens,
                 "thought_tokens": breakdown.thought_tokens,
+                "seq": next_seq,
             }),
         );
+    } else {
+        usage.remove("_meta");
     }
     let json = match serde_json::to_string(&usage) {
         Ok(j) => j,
@@ -6208,6 +6230,39 @@ mod persist_tests {
             stored["cost"]["amount"], 0.5,
             "a costless update must not blank the cost"
         );
+    }
+
+    #[tokio::test]
+    async fn persist_context_usage_writes_meta_even_when_cache_and_thought_are_zero() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &SessionEvent::UsageDelta {
+                input_tokens: 13_811,
+                output_tokens: 425,
+                total_tokens: 14_236,
+                cost_usd: None,
+                context_window: Some(200_000),
+                breakdown: Default::default(),
+            },
+        )
+        .await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 14_236);
+        assert_eq!(stored["_meta"]["input_tokens"], 13_811);
+        assert_eq!(stored["_meta"]["output_tokens"], 425);
+        assert_eq!(stored["_meta"]["cached_read_tokens"], 0);
+        let seq1 = stored["_meta"]["seq"].as_i64().expect("meta seq stamped");
+        assert!(seq1 > 0);
+
+        // A subsequent bare usage_update (0 input/output, empty breakdown) clears stale _meta
+        // so Team Economy settlement never re-bills Turn 1 tokens onto Turn 2.
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(18_500, None, None)).await;
+        let after_bare = stored_usage(repo.as_ref()).await;
+        assert_eq!(after_bare["used"], 18_500);
+        assert!(after_bare.get("_meta").is_none(), "bare usage_update must clear stale _meta");
     }
 
     /// A `/compact` turn ends with an all-zero `usage` object (live-captured on

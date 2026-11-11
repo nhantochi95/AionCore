@@ -68,6 +68,36 @@ pub trait TeamExternalBridgePort: Send + Sync {
 
     fn on_team_delegation(&self, team_id: &str);
 
+    async fn has_pending_slot_handover(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+        _conversation_id: &str,
+    ) -> bool {
+        false
+    }
+
+    async fn slot_requires_fresh_role_prompt(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        conversation_id: &str,
+    ) -> bool {
+        self.has_pending_slot_handover(user_id, team_id, slot_id, conversation_id)
+            .await
+    }
+
+    async fn rearm_slot_handover(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+        _conversation_id: &str,
+    ) {
+    }
+
     async fn pending_slot_handover_banner(
         &self,
         _user_id: &str,
@@ -85,6 +115,55 @@ pub trait TeamExternalBridgePort: Send + Sync {
         _slot_id: &str,
         _conversation_id: &str,
     ) {
+    }
+
+    fn has_shared_room_binding(&self, _user_id: &str, _team_id: &str) -> bool {
+        true
+    }
+
+    fn on_slot_wake_delivered(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+        _conversation_id: &str,
+        _delivered_chars: usize,
+        _coalesced_wakes_saved: u64,
+    ) {
+    }
+
+    async fn room_read_delta(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        room_id: Option<&str>,
+        limit: usize,
+        since_msg_id: Option<&str>,
+        include_completed_tasks: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mut value = self.room_read(user_id, team_id, room_id, limit).await?;
+        if let Some(cursor) = since_msg_id.map(str::trim).filter(|c| !c.is_empty())
+            && let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut)
+            && let Some(pos) = messages.iter().position(|item| {
+                item.get("id")
+                    .or_else(|| item.get("message_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(cursor)
+            })
+        {
+            *messages = messages.split_off(pos + 1);
+        }
+        if !include_completed_tasks
+            && let Some(tasks) = value.get_mut("tasks").and_then(serde_json::Value::as_array_mut)
+        {
+            tasks.retain(|task| {
+                !matches!(
+                    task.get("status").and_then(serde_json::Value::as_str),
+                    Some("completed" | "done" | "cancelled")
+                )
+            });
+        }
+        Ok(value)
     }
 }
 

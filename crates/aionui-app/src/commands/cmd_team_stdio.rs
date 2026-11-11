@@ -199,6 +199,26 @@ struct TaskUpdateParams {
     /// New dependency list.
     #[serde(default)]
     blocked_by: Option<Vec<String>>,
+    /// Optional completion/status message atomically delivered to the Team Lead in the same call.
+    #[serde(default)]
+    reply_message: Option<String>,
+    /// Optional workspace file paths attached to reply_message when reporting to the Team Lead.
+    #[serde(default)]
+    reply_files: Vec<String>,
+}
+
+impl TaskUpdateParams {
+    fn into_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": self.task_id,
+            "status": self.status,
+            "description": self.description,
+            "owner": self.owner,
+            "blocked_by": self.blocked_by,
+            "reply_message": self.reply_message,
+            "reply_files": self.reply_files,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -297,9 +317,15 @@ struct RoomReadParams {
     /// Optional Shared Room ID or name.
     #[serde(default)]
     room_id: Option<String>,
-    /// Maximum recent messages to return.
+    /// Maximum recent messages to return (defaults to 12 unread/recent messages).
     #[serde(default)]
     limit: Option<usize>,
+    /// Optional message ID cursor to return only newer messages.
+    #[serde(default)]
+    since_msg_id: Option<String>,
+    /// Include completed/cancelled tasks (false by default to save context tokens).
+    #[serde(default)]
+    include_completed_tasks: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -344,7 +370,7 @@ struct RoomTaskCreateParams {
 struct RoomTaskUpdateParams {
     /// Cross-team task ID to update.
     task_id: String,
-    /// Updated cross-team task status: pending, in_progress, completed, cancelled.
+    /// Updated cross-team task status: pending, in_progress, in_review, blocked, cancelled (completed is human-only).
     #[serde(default)]
     status: Option<String>,
     /// Concise deliverable summary.
@@ -409,7 +435,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, and recommended assistant\n- Include each teammate's responsibility and recommended assistant\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id from the available assistants catalog.\nDo not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
+        description = "Create a new teammate agent to join the team.\n\nUse only when the user explicitly approved the proposed lineup or explicitly asked to create a teammate immediately.\nBefore calling this tool in normal planning: briefly state why teammates help, present a table (name, responsibility, recommended assistant), remind the user they can adjust or replace teammates later, and wait for approval in a later user message.\nAlways pass assistant_id from team_list_assistants; do not pass a model."
     )]
     async fn spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -438,25 +464,15 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_task_update",
-        description = "Update an existing task on the team task board."
+        description = "Update an existing task on the team task board (and optionally deliver a 1-shot reply_message to the Team Lead in the same atomic call)."
     )]
     async fn task_update(&self, Parameters(params): Parameters<TaskUpdateParams>) -> CallToolResult {
-        self.forward_to_tcp(
-            "team_task_update",
-            &serde_json::json!({
-                "task_id": params.task_id,
-                "status": params.status,
-                "description": params.description,
-                "owner": params.owner,
-                "blocked_by": params.blocked_by,
-            }),
-        )
-        .await
+        self.forward_to_tcp("team_task_update", &params.into_json()).await
     }
 
     #[tool(
         name = "team_task_list",
-        description = "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views."
+        description = "List tasks on the team task board. Pass {} for up to 50 tasks, or use owner/status/include_deleted/limit for filtered views."
     )]
     async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
         self.forward_to_tcp("team_task_list", &params.into_json()).await
@@ -542,16 +558,23 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_room_read",
-        description = "Read recent messages and cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only."
+        description = "Read delta messages and open cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only."
     )]
     async fn room_read(&self, Parameters(params): Parameters<RoomReadParams>) -> CallToolResult {
         let mut args = serde_json::Map::new();
         if let Some(room_id) = params.room_id {
             args.insert("room_id".into(), serde_json::Value::String(room_id));
         }
-        if let Some(limit) = params.limit {
-            args.insert("limit".into(), serde_json::json!(limit));
+        if let Some(since_msg_id) = params.since_msg_id {
+            args.insert("since_msg_id".into(), serde_json::Value::String(since_msg_id));
         }
+        if let Some(include_completed_tasks) = params.include_completed_tasks {
+            args.insert(
+                "include_completed_tasks".into(),
+                serde_json::Value::Bool(include_completed_tasks),
+            );
+        }
+        args.insert("limit".into(), serde_json::json!(params.limit.unwrap_or(12)));
         self.forward_to_tcp("team_room_read", &serde_json::Value::Object(args))
             .await
     }
@@ -602,7 +625,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_room_task_update",
-        description = "Update the status, result summary, or output artifacts of a cross-team task in a Shared Room. Marking completed automatically unblocks and wakes dependent teams. Lead only."
+        description = "Update cross-team task status, summary, or output artifacts in a Shared Room. Agents should set status=\"in_review\" when ready for human Done approval (which unblocks dependent teams) or \"blocked\" on blockers. Lead only."
     )]
     async fn room_task_update(&self, Parameters(params): Parameters<RoomTaskUpdateParams>) -> CallToolResult {
         let mut args = serde_json::Map::new();
@@ -1409,5 +1432,74 @@ mod tests {
         };
         assert_eq!(code, CliBoundaryCode::McpToolRemoteError);
         assert_eq!(upstream_code, Some(json!(-32000)));
+    }
+
+    #[tokio::test]
+    async fn task_update_forwards_atomic_reply_message_and_reply_files_over_tcp() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let init_raw = read_frame(&mut sock).await.unwrap();
+            let init_val: serde_json::Value = serde_json::from_slice(&init_raw).unwrap();
+            assert_eq!(init_val["method"], "initialize");
+            write_frame(
+                &mut sock,
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "ok": true }
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+
+            let call_raw = read_frame(&mut sock).await.unwrap();
+            let call_val: serde_json::Value = serde_json::from_slice(&call_raw).unwrap();
+            write_frame(
+                &mut sock,
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "content": [{ "type": "text", "text": "{\"status\":\"completed\",\"reply_sent\":true}" }],
+                        "isError": false
+                    }
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+            call_val
+        });
+
+        let stdio = TeamStdioServer {
+            port,
+            token: "tok-1".into(),
+            slot_id: "slot-worker-1".into(),
+        };
+        let params: TaskUpdateParams = serde_json::from_value(json!({
+            "task_id": "task-42",
+            "status": "completed",
+            "reply_message": "Status: DONE\nDeliverables: crates/foo.rs",
+            "reply_files": ["crates/foo.rs"]
+        }))
+        .unwrap();
+        let res = stdio.task_update(Parameters(params)).await;
+        assert_eq!(res.is_error, Some(false));
+
+        let captured = server_handle.await.unwrap();
+        assert_eq!(captured["params"]["name"], "team_task_update");
+        assert_eq!(captured["params"]["arguments"]["task_id"], "task-42");
+        assert_eq!(captured["params"]["arguments"]["status"], "completed");
+        assert_eq!(
+            captured["params"]["arguments"]["reply_message"],
+            "Status: DONE\nDeliverables: crates/foo.rs"
+        );
+        assert_eq!(captured["params"]["arguments"]["reply_files"], json!(["crates/foo.rs"]));
     }
 }

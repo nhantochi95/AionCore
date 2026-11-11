@@ -331,7 +331,7 @@ async fn handle_method(
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id, scheduler, team_id, caller_slot_id, prompt_dump).await,
+        "tools/list" => handle_tools_list(request.id, scheduler, service, team_id, caller_slot_id, prompt_dump).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -352,13 +352,13 @@ async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id:
 async fn handle_tools_list(
     id: Option<u64>,
     scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
     team_id: &str,
     caller_slot_id: &str,
     prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
     let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
-    let empty_service = Weak::new();
-    let executor = TeamToolExecutor::new(scheduler, &empty_service);
+    let executor = TeamToolExecutor::new(scheduler, service);
     let context = TeamToolContext {
         team_id: team_id.to_owned(),
         caller_slot_id: caller_slot_id.to_owned(),
@@ -709,10 +709,17 @@ async fn exec_room_read(
 ) -> Result<String, ToolCallError> {
     let input: RoomReadInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
-    let limit = input.limit.unwrap_or(30).clamp(1, 100);
+    let limit = input.limit.unwrap_or(12).clamp(1, 50);
     let (ext, user_id) = resolve_external_bridge_and_user(service, team_id, caller_role, "team_room_read").await?;
     let value = ext
-        .room_read(&user_id, team_id, input.room_id.as_deref(), limit)
+        .room_read_delta(
+            &user_id,
+            team_id,
+            input.room_id.as_deref(),
+            limit,
+            input.since_msg_id.as_deref(),
+            input.include_completed_tasks.unwrap_or(false),
+        )
         .await
         .map_err(ToolCallError::from_message)?;
     json_text(&value)
@@ -787,10 +794,13 @@ async fn exec_room_task_update(
         return Err(ToolCallError::from_message("Invalid params: task_id must not be empty"));
     }
     if let Some(status) = input.status.as_deref()
-        && !matches!(status, "pending" | "in_progress" | "completed" | "cancelled")
+        && !matches!(
+            status,
+            "pending" | "in_progress" | "in_review" | "blocked" | "completed" | "cancelled"
+        )
     {
         return Err(ToolCallError::from_message(
-            "Invalid params: status must be pending, in_progress, completed, or cancelled",
+            "Invalid params: status must be pending, in_progress, in_review, blocked, completed, or cancelled",
         ));
     }
     let (ext, user_id) =
@@ -857,7 +867,8 @@ async fn exec_read_messages(
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))?;
     let page = inbox_page(peek.messages, since_message_id)?;
-    let rendered = render_inbox_page(page);
+    let team_workspace = service.team_workspace_for_session(team_id);
+    let rendered = render_inbox_page_with_workspace(page, team_workspace.as_deref());
 
     // `batch_id` is `None` when no turn owned the slot at peek time (e.g. a CLI
     // read outside a turn); nothing can be acknowledged, so every row stays unread.
@@ -900,7 +911,12 @@ fn inbox_page(messages: Vec<MailboxMessage>, since_message_id: Option<&str>) -> 
     })
 }
 
+#[cfg(test)]
 fn render_inbox_page(page: InboxPage) -> RenderedInbox {
+    render_inbox_page_with_workspace(page, None)
+}
+
+fn render_inbox_page_with_workspace(page: InboxPage, team_workspace: Option<&str>) -> RenderedInbox {
     let InboxPage {
         messages,
         total_unread_count,
@@ -911,10 +927,19 @@ fn render_inbox_page(page: InboxPage) -> RenderedInbox {
     let messages = messages
         .into_iter()
         .map(|message| {
+            let type_label = match message.msg_type {
+                crate::types::MailboxMessageType::Message => "message",
+                crate::types::MailboxMessageType::IdleNotification => "idle_notification",
+                crate::types::MailboxMessageType::ShutdownRequest => "shutdown_request",
+            };
             let (content, content_truncated) = truncate_inbox_content(&message.content);
-            if content_truncated {
-                // Left out of the acknowledged set on purpose — see RenderedInbox.
+            let saved_handoff = if content_truncated {
+                team_workspace
+                    .and_then(|ws| crate::prompts::write_mailbox_overflow_handoff(ws, &message, type_label))
             } else {
+                None
+            };
+            if !content_truncated || saved_handoff.is_some() {
                 observable_message_ids.push(message.id.clone());
             }
             last_message_id = Some(message.id.clone());
@@ -928,7 +953,18 @@ fn render_inbox_page(page: InboxPage) -> RenderedInbox {
                 "created_at": message.created_at,
             });
             if content_truncated {
-                item["note"] = json!(INBOX_TRUNCATION_NOTE);
+                match saved_handoff {
+                    Some(path) => {
+                        let path_str = path.to_string_lossy().into_owned();
+                        item["handoff_path"] = json!(path_str.clone());
+                        item["note"] = json!(format!(
+                            "Content exceeded the inbox preview limit; full message saved to {path_str}. Read that file directly."
+                        ));
+                    }
+                    None => {
+                        item["note"] = json!(INBOX_TRUNCATION_NOTE);
+                    }
+                }
             }
             item
         })
@@ -1158,6 +1194,7 @@ fn task_json(task: &TeamTask) -> Value {
     })
 }
 
+const DEFAULT_TASK_LIST_LIMIT: usize = 50;
 const MAX_TASK_LIST_LIMIT: usize = 200;
 
 #[derive(Debug)]
@@ -1192,7 +1229,7 @@ fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallErro
             ));
         }
         Some(value) => Some((value as usize).min(MAX_TASK_LIST_LIMIT)),
-        None => None,
+        None => Some(DEFAULT_TASK_LIST_LIMIT),
     };
     Ok(TaskListFilters {
         owner: input.owner,
@@ -1435,7 +1472,42 @@ async fn exec_task_update(
         }
     }
 
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
+    let mut reply_sent = false;
+    let mut reply_target: Option<String> = None;
+    if let Some(reply_text) = input.reply_message.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Some(lead_slot_id) = scheduler.find_lead_slot_id().await
+        && lead_slot_id != caller_slot_id
+    {
+        let files_opt = (!input.reply_files.is_empty()).then(|| input.reply_files.clone());
+        if let Some(svc) = service.upgrade() {
+            svc.send_agent_message_from_agent(team_id, caller_slot_id, &lead_slot_id, reply_text, files_opt)
+                .await
+                .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        } else {
+            scheduler
+                .mailbox
+                .write_with_files(
+                    team_id,
+                    &lead_slot_id,
+                    caller_slot_id,
+                    crate::types::MailboxMessageType::Message,
+                    reply_text,
+                    None,
+                    files_opt.as_deref(),
+                )
+                .await
+                .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        }
+        reply_sent = true;
+        reply_target = Some(lead_slot_id);
+    }
+
+    let mut response = json!({ "status": "ok", "task": task_json(&task) });
+    if reply_sent {
+        response["reply_sent"] = json!(true);
+        response["reply_target"] = json!(reply_target);
+    }
+    json_text(&response)
 }
 
 async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
@@ -1946,6 +2018,22 @@ mod tests {
             rendered.value["messages"][0].get("note").is_none(),
             "untruncated rows carry no note"
         );
+    }
+
+    #[test]
+    fn truncated_messages_with_workspace_save_handoff_file_and_acknowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().into_owned();
+        let long_content = "y".repeat(MAX_INBOX_CONTENT_CHARS + 50);
+        let page = inbox_page(vec![inbox_message(7, long_content.clone())], None).expect("page builds");
+        let rendered = render_inbox_page_with_workspace(page, Some(&ws));
+
+        assert_eq!(rendered.observable_message_ids, vec!["message-07".to_owned()]);
+        let msg_json = &rendered.value["messages"][0];
+        assert_eq!(msg_json["content_truncated"], true);
+        let handoff_path = msg_json["handoff_path"].as_str().expect("handoff_path present");
+        let saved = std::fs::read_to_string(handoff_path).expect("handoff file readable");
+        assert!(saved.contains(&long_content));
     }
 
     #[test]

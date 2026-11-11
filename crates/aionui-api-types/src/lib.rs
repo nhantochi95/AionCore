@@ -220,8 +220,10 @@ pub use team_tools::{
     TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
     TEAM_TOOLS_SCHEMA_VERSION, TeamToolCall, TeamToolCliEnvelope, TeamToolCliMeta, TeamToolContextResponse,
     TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
-    TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
-    team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+    TeamToolRuntimeBatchCallRequest, TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport,
+    cli_command_for_tool,
+    is_shared_room_tool_name, team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_context,
+    team_tool_descriptors_for_role, tool_name_for_cli_path,
 };
 pub use websocket::WebSocketMessage;
 

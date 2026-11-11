@@ -12,17 +12,18 @@
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Extension, Json, Path, State};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 
 use aionui_api_types::ApiResponse;
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 pub use crate::bridge::context_compactor::{
-    CompactTeamContextRequest, CompactTeamContextResponse, ConnectedEngineCatalogItemDto, ConnectedModelOptionDto,
-    ConnectedModelsCatalogDto, ModelTargetSpec, PerSlotModelUpdate, QuickCreateMemberRequest,
-    QuickCreateMemberResponse, SlotCompactionOutcomeDto, SlotContextStatusDto, SlotModelSwitchResultDto,
-    SwitchTeamModelsRequest, SwitchTeamModelsResponse, TeamContextStatusResponse, TeamHubOrchestrator,
+    ApplyQuotaPresetRequest, CompactTeamContextRequest, CompactTeamContextResponse, ConnectedEngineCatalogItemDto,
+    ConnectedModelOptionDto, ConnectedModelsCatalogDto, ModelTargetSpec, PerSlotModelUpdate, QuickCreateMemberRequest,
+    QuickCreateMemberResponse, QuotaRoutingPresetDto, SlotCompactionOutcomeDto, SlotContextStatusDto,
+    SlotModelSwitchResultDto, SwitchTeamModelsRequest, SwitchTeamModelsResponse, TeamContextStatusResponse,
+    TeamHubOrchestrator,
 };
 
 #[derive(Clone)]
@@ -36,7 +37,15 @@ pub fn team_hub_routes(state: TeamHubRouterState) -> Router {
         .route("/api/team-hub/quick-member", post(post_quick_member))
         .route("/api/team-hub/teams/{id}/context-status", get(get_team_context_status))
         .route("/api/team-hub/teams/{id}/compact", post(post_compact_team_context))
+        .route(
+            "/api/team-hub/teams/{id}/economy-prefs",
+            patch(patch_team_economy_prefs).post(patch_team_economy_prefs),
+        )
         .route("/api/team-hub/teams/{id}/switch-models", post(post_switch_team_models))
+        .route(
+            "/api/team-hub/teams/{id}/apply-quota-preset",
+            post(post_apply_quota_preset),
+        )
         .with_state(state)
 }
 
@@ -98,5 +107,39 @@ async fn post_switch_team_models(
         serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("Invalid JSON body: {e}")))?
     };
     let resp = state.orchestrator.switch_team_models(&user.id, &id, req).await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+/// `PATCH|POST /api/team-hub/teams/{id}/economy-prefs`
+async fn patch_team_economy_prefs(
+    State(state): State<TeamHubRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<ApiResponse<TeamContextStatusResponse>>, ApiError> {
+    let mut req: CompactTeamContextRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        CompactTeamContextRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("Invalid JSON body: {e}")))?
+    };
+    req.mode = Some("prefs_only".to_owned());
+    req.slot_id = None;
+    let resp = state.orchestrator.compact_team_context(&user.id, &id, req).await?;
+    Ok(Json(ApiResponse::ok(resp.context_status)))
+}
+
+/// `POST /api/team-hub/teams/{id}/apply-quota-preset`
+async fn post_apply_quota_preset(
+    State(state): State<TeamHubRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<ApiResponse<SwitchTeamModelsResponse>>, ApiError> {
+    let req: ApplyQuotaPresetRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        ApplyQuotaPresetRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("Invalid JSON body: {e}")))?
+    };
+    let resp = state.orchestrator.apply_quota_preset(&user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }

@@ -31,8 +31,11 @@ use crate::ports::{
     SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
+use dashmap::{DashMap, DashSet};
+
 use crate::prompts::{
-    build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload_with_workspace,
+    TaskBoardDigestCursor, WakePayloadOptions, build_lead_prompt_for_transport, build_teammate_prompt_for_transport,
+    build_wake_payload_with_options,
 };
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
@@ -62,6 +65,11 @@ pub struct WakeInput {
     pub unread: Vec<crate::types::MailboxMessage>,
     /// Role of the wake target.
     pub agent_role: TeammateRole,
+    /// Whether this wake consumed `needs_role_prompt` (so an unsettled/cancelled
+    /// turn can re-arm it before the next retry).
+    pub consumed_role_prompt: bool,
+    /// Consumed one-shot handover banner to restore if this wake never settles.
+    pub consumed_slot_handover: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +102,30 @@ pub(crate) enum PrepareBatchResult {
 pub struct SpawnAgentRequest {
     pub name: String,
     pub assistant_id: Option<String>,
+}
+
+fn is_ephemeral_idle_signal(message: &MailboxMessage) -> bool {
+    message.msg_type == MailboxMessageType::IdleNotification
+        && message.summary.as_deref() != Some("Interrupted by user")
+}
+
+fn format_compact_roster_line(members: &[TeamAgent]) -> String {
+    if members.is_empty() {
+        return "none".to_owned();
+    }
+    members
+        .iter()
+        .map(|member| {
+            format!(
+                "{} (slot_id={}, role={}, status={})",
+                member.name,
+                member.slot_id,
+                member.role,
+                member.status.unwrap_or(TeammateStatus::Idle)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub struct TeamSession {
@@ -142,6 +174,15 @@ pub struct TeamSession {
     /// Reset only by constructing a fresh `TeamSession` during a new restore,
     /// reconnect, or explicit re-ensure lifecycle.
     recovery_scan_completed: AtomicBool,
+    /// Per-slot task-board digest cursors for delta wake summaries.
+    task_board_cursors: DashMap<String, TaskBoardDigestCursor>,
+    /// Slots whose wake prompt has already emitted the static workspace path once.
+    workspace_injected_slots: DashSet<String>,
+    /// Lead slots whose Turn-1 wake prompt has already emitted the 1-line roster.
+    initial_roster_injected_slots: DashSet<String>,
+    /// Handover banners restored after an aborted/failed wake turn so compaction
+    /// context is never dropped if the first wake fails to start or is cancelled.
+    restored_slot_handovers: DashMap<String, String>,
 }
 
 impl TeamSession {
@@ -213,6 +254,24 @@ impl TeamSession {
             task_board.clone(),
             broadcaster.clone(),
         ));
+        let external_bridge = service.upgrade().and_then(|svc| svc.external_bridge().cloned());
+        for agent in &team.agents {
+            let requires_fresh_role_prompt = match external_bridge.as_ref() {
+                Some(ext) => {
+                    ext.slot_requires_fresh_role_prompt(&user_id, &team.id, &agent.slot_id, &agent.conversation_id)
+                        .await
+                }
+                None => false,
+            };
+            if !requires_fresh_role_prompt
+                && mailbox
+                    .has_consumed_substantive_turn(&team.id, &agent.slot_id)
+                    .await
+                    .unwrap_or(false)
+            {
+                scheduler.set_needs_role_prompt(&agent.slot_id, false).await;
+            }
+        }
 
         let auth_token = aionui_common::generate_id();
         let mcp_server = TeamMcpServer::start_with_prompt_dump(
@@ -254,6 +313,10 @@ impl TeamSession {
             member_runtimes,
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
+            task_board_cursors: DashMap::new(),
+            workspace_injected_slots: DashSet::new(),
+            initial_roster_injected_slots: DashSet::new(),
+            restored_slot_handovers: DashMap::new(),
         })
     }
 
@@ -273,6 +336,45 @@ impl TeamSession {
 
     pub fn user_id(&self) -> &str {
         &self.user_id
+    }
+
+    pub fn team_workspace(&self) -> Option<&str> {
+        (!self.team.workspace.trim().is_empty()).then_some(self.team.workspace.as_str())
+    }
+
+    pub(crate) fn reset_slot_prompt_state(&self, slot_id: &str) {
+        self.task_board_cursors.remove(slot_id);
+        self.workspace_injected_slots.remove(slot_id);
+        self.initial_roster_injected_slots.remove(slot_id);
+    }
+
+    pub(crate) fn restore_slot_handover_banner(&self, slot_id: &str, banner: String) {
+        if !banner.trim().is_empty() {
+            self.restored_slot_handovers.insert(slot_id.to_owned(), banner);
+        }
+    }
+
+    pub(crate) async fn restore_slot_handover_banner_durable(&self, slot_id: &str, banner: String) {
+        let non_empty = !banner.trim().is_empty();
+        self.restore_slot_handover_banner(slot_id, banner);
+        if non_empty
+            && let Some(ext) = self.service.upgrade().and_then(|svc| svc.external_bridge().cloned())
+        {
+            let conv_id = self
+                .scheduler
+                .get_agent(slot_id)
+                .await
+                .map(|a| a.conversation_id)
+                .unwrap_or_default();
+            ext.rearm_slot_handover(&self.user_id, &self.team.id, slot_id, &conv_id)
+                .await;
+        }
+    }
+
+    pub(crate) async fn should_hold_lead_wake_for_parallel_workers(&self, slot_id: &str) -> bool {
+        self.scheduler.is_lead_slot(slot_id).await
+            && self.work_coordinator.should_coalesce_lead_wake(slot_id)
+            && self.scheduler.has_working_teammates().await
     }
 
     pub fn scheduler(&self) -> &Arc<TeammateManager> {
@@ -332,7 +434,16 @@ impl TeamSession {
         service.provisioner().team_tool_transport(&self.user_id, agent).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
+        self.prepare_next_batch_with_coalescing(slot_id, false).await
+    }
+
+    pub(crate) async fn prepare_next_batch_with_coalescing(
+        &self,
+        slot_id: &str,
+        held_for_coalescing: bool,
+    ) -> Result<PrepareBatchResult, TeamError> {
         if self.start_pending_mcp_refresh(slot_id) {
             return Ok(PrepareBatchResult::Blocked);
         }
@@ -359,8 +470,8 @@ impl TeamSession {
         }
 
         // Only intents already queued before this snapshot are eligible for stale
-        // cleanup. A concurrently committed intent may not appear in the snapshot,
-        // but must remain claimable for the authoritative post-claim reread below.
+        // cleanup. Ephemeral `IdleNotification` rows are partitioned out so they
+        // never synthesize phantom `RecoveryDrain` LLM turns on the leader.
         let stale_candidates = self.work_coordinator.mailbox_reconcile_candidates(slot_id);
         let unread = self
             .mailbox
@@ -369,10 +480,18 @@ impl TeamSession {
             .into_iter()
             .filter(|message| message.from_agent_id != slot_id)
             .collect::<Vec<_>>();
-        let unread_ids = unread.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
+        let mut substantive_unread_ids = Vec::with_capacity(unread.len());
+        let mut ephemeral_idle_ids = Vec::new();
+        for message in &unread {
+            if is_ephemeral_idle_signal(message) {
+                ephemeral_idle_ids.push(message.id.clone());
+            } else {
+                substantive_unread_ids.push(message.id.clone());
+            }
+        }
         self.work_coordinator.reconcile_mailbox_snapshot(
             slot_id,
-            &unread_ids,
+            &substantive_unread_ids,
             target_role_for(agent.role),
             &stale_candidates,
         );
@@ -421,14 +540,15 @@ impl TeamSession {
                         return Err(error);
                     }
                 };
-                let current_slot_ids = self
-                    .scheduler
-                    .list_agents()
-                    .await
-                    .into_iter()
-                    .map(|member| member.slot_id)
+                if !ephemeral_idle_ids.is_empty() {
+                    let _ = self.mailbox.mark_read_batch(&self.team.id, &ephemeral_idle_ids).await;
+                }
+                let members = self.scheduler.list_agents().await;
+                let current_slot_ids = members
+                    .iter()
+                    .map(|member| member.slot_id.clone())
                     .collect();
-                let (first_message, needs_role_prompt) = if batch.is_command {
+                let (first_message, needs_role_prompt, consumed_slot_handover) = if batch.is_command {
                     // ELECTRON-3RN: a recognized slash command turn is sent bare —
                     // the turn's first content block is the raw command so the
                     // backend's native slash dispatch (e.g. codex
@@ -441,49 +561,76 @@ impl TeamSession {
                         .first()
                         .map(|message| message.content.clone())
                         .unwrap_or_default();
-                    (command, false)
+                    (command, false, None)
                 } else {
-                    let mut wake_body = build_wake_payload_with_workspace(
-                        &agent,
-                        &tasks,
-                        &claimed_unread,
-                        &current_slot_ids,
-                        Some(self.team.workspace.as_str()),
-                    );
-                    if let Some(svc) = self.service.upgrade()
-                        && let Some(ext) = svc.external_bridge()
-                    {
-                        if agent.role == TeammateRole::Lead
-                            && let Some(handoff_banner) =
-                                ext.pending_room_handoff_banner(&self.user_id, &self.team.id).await
-                        {
-                            wake_body = format!("{handoff_banner}\n\n{wake_body}");
-                        }
-                        if let Some(slot_handover) = ext
-                            .pending_slot_handover_banner(
-                                &self.user_id,
-                                &self.team.id,
-                                slot_id,
-                                &agent.conversation_id,
-                            )
-                            .await
-                        {
-                            wake_body = format!("{slot_handover}\n\n{wake_body}");
-                        }
+                    let external_bridge = self.service.upgrade().and_then(|svc| svc.external_bridge().cloned());
+                    let slot_handover = match self.restored_slot_handovers.remove(slot_id) {
+                        Some((_, restored)) => Some(restored),
+                        None => match external_bridge.as_ref() {
+                            Some(ext) => {
+                                ext.pending_slot_handover_banner(
+                                    &self.user_id,
+                                    &self.team.id,
+                                    slot_id,
+                                    &agent.conversation_id,
+                                )
+                                .await
+                            }
+                            None => None,
+                        },
+                    };
+                    if slot_handover.is_some() {
+                        // A pending compaction/model-swap handover starts a fresh context
+                        // window: reset per-slot prompt state BEFORE building `wake_body`
+                        // and force `needs_role_prompt = true` so `## Team Coordination Tools`
+                        // and the workspace/roster banners are never lost.
+                        self.reset_slot_prompt_state(slot_id);
                     }
-                    let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
-                    let first_message = if needs_role_prompt {
-                        let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
+                    let scheduled_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
+                    let needs_role_prompt = scheduled_role_prompt || slot_handover.is_some();
+
+                    let include_workspace_banner = self.workspace_injected_slots.insert(slot_id.to_owned());
+                    let initial_roster = (agent.role == TeammateRole::Lead
+                        && self.initial_roster_injected_slots.insert(slot_id.to_owned()))
+                    .then(|| format_compact_roster_line(&members));
+                    let wake_body = {
+                        let mut cursor_entry = self.task_board_cursors.entry(slot_id.to_owned()).or_default();
+                        build_wake_payload_with_options(
+                            &agent,
+                            &tasks,
+                            &claimed_unread,
+                            &current_slot_ids,
+                            WakePayloadOptions {
+                                team_workspace: Some(self.team.workspace.as_str()),
+                                include_workspace_banner,
+                                initial_roster_line: initial_roster.as_deref(),
+                                pending_roster_notes: &[],
+                                cursor: Some(&mut cursor_entry),
+                            },
+                        )
+                    };
+                    let mut first_message = if needs_role_prompt {
+                        let tool_transport = match self.team_tool_transport_for_agent(&agent).await {
+                            Ok(transport) => transport,
+                            Err(error) => {
+                                self.reset_slot_prompt_state(slot_id);
+                                self.scheduler.set_needs_role_prompt(slot_id, true).await;
+                                if let Some(banner) = slot_handover {
+                                    self.restore_slot_handover_banner_durable(slot_id, banner).await;
+                                }
+                                self.work_coordinator.retry_start(&batch, "batch_prepare_failed");
+                                return Err(error);
+                            }
+                        };
                         let role_prompt = match agent.role {
                             TeammateRole::Lead => build_lead_prompt_for_transport(
                                 &agent,
                                 &self.team.name,
-                                &self.scheduler.list_agents().await,
+                                &members,
                                 &[],
                                 tool_transport,
                             ),
                             TeammateRole::Teammate => {
-                                let members = self.scheduler.list_agents().await;
                                 build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
                             }
                         };
@@ -491,7 +638,35 @@ impl TeamSession {
                     } else {
                         wake_body
                     };
-                    (first_message, needs_role_prompt)
+                    // Append dynamic room/slot handover banners AFTER static role_prompt
+                    // and wake_body so provider prefix KV-cache remains byte-identical.
+                    if let Some(ext) = external_bridge.as_ref() {
+                        if agent.role == TeammateRole::Lead
+                            && let Some(handoff_banner) =
+                                ext.pending_room_handoff_banner(&self.user_id, &self.team.id).await
+                        {
+                            first_message = format!("{first_message}\n\n{handoff_banner}");
+                        }
+                        if let Some(ref banner) = slot_handover {
+                            first_message = format!("{first_message}\n\n{banner}");
+                        }
+                        let coalesced_wakes_saved = if held_for_coalescing {
+                            claimed_unread.len().saturating_sub(1) as u64
+                        } else {
+                            0
+                        };
+                        ext.on_slot_wake_delivered(
+                            &self.user_id,
+                            &self.team.id,
+                            slot_id,
+                            &agent.conversation_id,
+                            first_message.chars().count(),
+                            coalesced_wakes_saved,
+                        );
+                    } else if let Some(ref banner) = slot_handover {
+                        first_message = format!("{first_message}\n\n{banner}");
+                    }
+                    (first_message, needs_role_prompt, slot_handover)
                 };
 
                 match dump_team_wake_prompt(
@@ -528,17 +703,34 @@ impl TeamSession {
                         first_message,
                         unread: claimed_unread,
                         agent_role: agent.role,
+                        consumed_role_prompt: needs_role_prompt,
+                        consumed_slot_handover,
                     },
                 })
             }
             ReconcileDecision::SettleSignals(intent_ids) => Ok(PrepareBatchResult::SettleSignals { intent_ids }),
             ReconcileDecision::WaitingForCompletion => Ok(PrepareBatchResult::WaitingForCompletion),
             ReconcileDecision::Blocked(_) => Ok(PrepareBatchResult::Blocked),
-            ReconcileDecision::Quiescent => Ok(PrepareBatchResult::Quiescent),
+            ReconcileDecision::Quiescent => {
+                if !ephemeral_idle_ids.is_empty() {
+                    let _ = self.mailbox.mark_read_batch(&self.team.id, &ephemeral_idle_ids).await;
+                }
+                Ok(PrepareBatchResult::Quiescent)
+            }
         }
     }
 
     pub(crate) async fn handle_signal_intents(&self, slot_id: &str, intent_ids: &[String]) {
+        if let Ok(unread) = self.mailbox.peek_unread(&self.team.id, slot_id).await {
+            let idle_ids = unread
+                .into_iter()
+                .filter(|message| message.from_agent_id != slot_id && is_ephemeral_idle_signal(&message))
+                .map(|message| message.id)
+                .collect::<Vec<_>>();
+            if !idle_ids.is_empty() {
+                let _ = self.mailbox.mark_read_batch(&self.team.id, &idle_ids).await;
+            }
+        }
         if self.work_coordinator.complete_signals(slot_id, intent_ids) != CommitResult::Committed {
             warn!(
                 team_id = %self.team.id,
@@ -582,22 +774,29 @@ impl TeamSession {
         // `on_agent_finish` remains callable for aionrs resume and test scenarios.
         // `begin_finalize` dedup prevents double finalization.
 
-        if is_error {
+        let wake_target = if is_error {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
-        }
-
-        let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
+            self.scheduler.maybe_wake_leader_when_all_idle().await?
+        } else {
+            self.scheduler.finalize_turn(&slot_id).await?
+        };
 
         // Clear the dedup window unconditionally once finalize has run.
         self.scheduler.clear_finalized_turn(conversation_id);
 
-        // Re-wake self if there are still unread messages in mailbox.
-        // This handles the case where messages arrived while the agent was
-        // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
-        // when isLoading becomes false, poll mailbox and submit if non-empty.
+        // Re-wake self if there are still substantive unread messages in mailbox.
+        // Ephemeral IdleNotification rows are settle signals, not actionable turns.
         if wake_target.as_deref() != Some(&slot_id) {
-            let has_unread = self.mailbox.has_unread(&self.team.id, &slot_id).await.unwrap_or(false);
-            if has_unread {
+            let has_substantive_unread = self
+                .mailbox
+                .peek_unread(&self.team.id, &slot_id)
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .any(|msg| msg.from_agent_id != slot_id && !is_ephemeral_idle_signal(msg))
+                })
+                .unwrap_or(false);
+            if has_substantive_unread {
                 return Ok(Some(slot_id));
             }
         }
@@ -881,7 +1080,7 @@ impl TeamSession {
         Ok(())
     }
 
-    pub(crate) async fn send_agent_message_from_agent(
+    pub async fn send_agent_message_from_agent(
         &self,
         from_slot_id: &str,
         to_slot_id: &str,
@@ -1119,18 +1318,29 @@ impl TeamSession {
             if agent.role != TeammateRole::Lead {
                 continue;
             }
-            let unread = self
+            let unread_rows = self
                 .mailbox
                 .peek_unread(&self.team.id, &agent.slot_id)
                 .await?
                 .into_iter()
                 .filter(|message| message.from_agent_id != agent.slot_id)
-                .map(|message| message.id)
                 .collect::<Vec<_>>();
-            if unread.is_empty() {
+            let mut substantive_ids = Vec::new();
+            let mut ephemeral_idle_ids = Vec::new();
+            for message in unread_rows {
+                if is_ephemeral_idle_signal(&message) {
+                    ephemeral_idle_ids.push(message.id);
+                } else {
+                    substantive_ids.push(message.id);
+                }
+            }
+            if !ephemeral_idle_ids.is_empty() {
+                let _ = self.mailbox.mark_read_batch(&self.team.id, &ephemeral_idle_ids).await;
+            }
+            if substantive_ids.is_empty() {
                 continue;
             }
-            for message_id in unread {
+            for message_id in substantive_ids {
                 self.enqueue_system_work(&agent.slot_id, WorkSource::RecoveryDrain, Some(message_id), None)
                     .await?;
             }
@@ -1460,7 +1670,7 @@ impl TeamSession {
                 "team_system",
                 MailboxMessageType::Message,
                 &format!(
-                    "The user manually added teammate '{}' (slot_id={}, assistant_id={}, model={}). Call team_members to get the latest roster before delegating work.",
+                    "The user manually added teammate '{}' (slot_id={}, assistant_id={}, model={}). Use this slot_id directly when delegating work.",
                     agent.name,
                     agent.slot_id,
                     agent.assistant_id.as_deref().unwrap_or(""),
@@ -1471,6 +1681,9 @@ impl TeamSession {
             .await?;
         self.project_team_system_message(&agent.slot_id, &agent.conversation_id, &welcome.id, &welcome.content)
             .await;
+        // Acknowledge the UI-projected welcome row immediately so manually added
+        // teammates stay Idle at zero token cost until first real task/message.
+        self.mailbox.mark_read_batch(&self.team.id, &[welcome.id]).await?;
         let lead_agent = self.scheduler.get_agent(&lead_slot_id).await?;
         self.project_team_system_message(
             &lead_slot_id,
@@ -1480,15 +1693,17 @@ impl TeamSession {
         )
         .await;
 
-        self.enqueue_system_work(&agent.slot_id, WorkSource::SpawnWelcome, Some(welcome.id), None)
+        // Only wake the lead immediately when a team run is actively executing;
+        // idle UI roster edits remain unread and deliver lazily on the next turn.
+        if self.team_run_manager.current_active_run_id().is_some() {
+            self.enqueue_system_work(
+                &lead_slot_id,
+                WorkSource::TeamMembershipChanged,
+                Some(leader_notice.id),
+                None,
+            )
             .await?;
-        self.enqueue_system_work(
-            &lead_slot_id,
-            WorkSource::TeamMembershipChanged,
-            Some(leader_notice.id),
-            None,
-        )
-        .await?;
+        }
         Ok(())
     }
 
@@ -1506,7 +1721,7 @@ impl TeamSession {
                 "team_system",
                 MailboxMessageType::Message,
                 &format!(
-                    "Teammate '{}' was removed from the team (slot_id={}, assistant_id={}, model={}). Call team_members to get the latest roster before delegating work.",
+                    "Teammate '{}' was removed from the team (slot_id={}, assistant_id={}, model={}).",
                     removed.name,
                     removed.slot_id,
                     removed.assistant_id.as_deref().unwrap_or(""),
@@ -1519,8 +1734,10 @@ impl TeamSession {
         self.project_team_system_message(&lead_slot_id, &lead_agent.conversation_id, &notice.id, &notice.content)
             .await;
 
-        self.enqueue_system_work(&lead_slot_id, WorkSource::TeamMembershipChanged, Some(notice.id), None)
-            .await?;
+        if self.team_run_manager.current_active_run_id().is_some() {
+            self.enqueue_system_work(&lead_slot_id, WorkSource::TeamMembershipChanged, Some(notice.id), None)
+                .await?;
+        }
 
         Ok(())
     }
@@ -1949,44 +2166,10 @@ impl TeamSession {
         let reservation = self.reserve_dynamic_member_attach(&new_agent);
 
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
-        // the new slot immediately.
+        // the new slot immediately. Newly spawned teammates remain Idle at
+        // zero token cost until the Lead assigns a task or sends a message,
+        // which injects their role prompt on their first real turn.
         self.scheduler.add_agent(&new_agent).await;
-
-        // Step 6: welcome message. The mailbox write is the source of truth —
-        // if the wake never fires (e.g. warmup raced), the next caller-triggered
-        // wake will still drain this entry.
-        let welcome_message = match self
-            .mailbox
-            .write(
-                &self.team.id,
-                &new_agent.slot_id,
-                caller_slot_id,
-                MailboxMessageType::Message,
-                "You have been spawned as a teammate. Read your mailbox and wait for instructions.",
-                None,
-            )
-            .await
-        {
-            Ok(message) => message,
-            Err(err) => {
-                if let Some(service) = self.service.upgrade() {
-                    let _ = service
-                        .remove_agent(&self.user_id, &self.team.id, &new_agent.slot_id)
-                        .await;
-                } else {
-                    let _ = self.scheduler.remove_agent(&new_agent.slot_id).await;
-                }
-                return Err(err);
-            }
-        };
-
-        self.enqueue_system_work(
-            &new_agent.slot_id,
-            WorkSource::SpawnWelcome,
-            Some(welcome_message.id),
-            Some(caller_slot_id.to_owned()),
-        )
-        .await?;
 
         // Step 7: attach the CLI process and register the finish subscriber
         // in a background task. This involves spawning the CLI process and
@@ -2053,7 +2236,7 @@ impl TeamSession {
             .peek_unread(&self.team.id, slot_id)
             .await?
             .into_iter()
-            .filter(|message| message.from_agent_id != slot_id)
+            .filter(|message| message.from_agent_id != slot_id && !is_ephemeral_idle_signal(message))
             .collect();
         Ok(AgentInboxPeek { messages, batch_id })
     }
@@ -2764,6 +2947,7 @@ mod tests {
             id: "t1".into(),
             name: "Test Team".into(),
             workspace: "/tmp/test-team".into(),
+            workspace_mode: "shared".into(),
             agents: vec![
                 TeamAgent {
                     slot_id: "lead-1".into(),
@@ -4490,6 +4674,164 @@ mod tests {
             !recorder.names().iter().any(|n| n == "team.agentSpawned"),
             "team.agentSpawned must not be emitted when guard rejects the caller; saw {:?}",
             recorder.names()
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn peek_agent_messages_filters_ephemeral_idle_signals() {
+        let session = start_session_with_lead_backend("antigravity").await;
+        session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::IdleNotification,
+                "idle",
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "Real task completion summary",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(peek.messages.len(), 1, "idle signal noise must be hidden from team_read_messages");
+        assert_eq!(peek.messages[0].content, "Real task completion summary");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn compacted_slot_handover_forces_role_prompt_and_survives_rollback() {
+        let session = Arc::new(start_session_with_lead_backend("antigravity").await);
+        register_test_event_loop(&session, "lead-1");
+
+        // Turn 1 consumes the initial `needs_role_prompt` flag.
+        session
+            .mailbox
+            .write("t1", "lead-1", "user", MailboxMessageType::Message, "Initial request", None)
+            .await
+            .unwrap();
+        let PrepareBatchResult::Execute {
+            batch: batch1,
+            input: wake1,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("wake 1 must execute");
+        };
+        assert!(wake1.consumed_role_prompt);
+        assert!(wake1.first_message.contains("## Team Coordination Tools"));
+        let completion1 = session.work_coordinator().complete_batch_with_ack(&batch1);
+        session
+            .mailbox
+            .mark_read_batch("t1", &completion1.ack_message_ids)
+            .await
+            .unwrap();
+
+        // Simulate post-compaction handover banner queued after Turn 1 already ran.
+        session.restore_slot_handover_banner(
+            "lead-1",
+            "## Anchored Session Handover (Compaction #1)\nPreserved summary.".into(),
+        );
+        session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "user",
+                MailboxMessageType::Message,
+                "Post-compact follow-up",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let PrepareBatchResult::Execute {
+            batch: batch2,
+            input: wake2,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("wake 2 must execute");
+        };
+        assert!(wake2.consumed_role_prompt, "compacted fresh session must re-inject role_prompt");
+        assert!(
+            wake2.first_message.contains("## Team Coordination Tools"),
+            "compacted turn must carry Team Coordination Tools syntax"
+        );
+        assert!(
+            wake2.first_message.contains("## Anchored Session Handover (Compaction #1)"),
+            "compacted turn must carry Anchored Session Handover"
+        );
+
+        // Simulate turn start failure -> rollback must restore BOTH role_prompt and handover!
+        session.reset_slot_prompt_state("lead-1");
+        session.scheduler.set_needs_role_prompt("lead-1", true).await;
+        if let Some(banner) = wake2.consumed_slot_handover {
+            session.restore_slot_handover_banner("lead-1", banner);
+        }
+        session.work_coordinator().fail_batch(&batch2, "turn_failed");
+
+        let PrepareBatchResult::Execute { input: wake2_retry, .. } =
+            session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("wake 2 retry must execute");
+        };
+        assert!(wake2_retry.first_message.contains("## Team Coordination Tools"));
+        assert!(wake2_retry.first_message.contains("## Anchored Session Handover (Compaction #1)"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn task_update_with_reply_message_delivers_atomic_reply_to_lead() {
+        let session = start_session_with_lead_backend("antigravity").await;
+        let created = session
+            .task_board
+            .create_task("t1", "Audit endpoint", Some("Check auth"), Some("worker-1"), &[])
+            .await
+            .unwrap();
+
+        let args = serde_json::json!({
+            "task_id": created.id,
+            "status": "completed",
+            "reply_message": "Audit complete: all 3 routes verified.",
+            "reply_files": ["d:/work/audit.md"],
+        });
+        let raw = crate::mcp::server::dispatch_tool(
+            "team_task_update",
+            &args,
+            &session.scheduler,
+            &Weak::<TeamSessionService>::new(),
+            "t1",
+            "worker-1",
+            crate::types::TeammateRole::Teammate,
+        )
+        .await
+        .expect("atomic task_update + reply_message must succeed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["task"]["status"], "completed");
+        assert_eq!(parsed["reply_sent"], true);
+        assert_eq!(parsed["reply_target"], "lead-1");
+
+        let lead_unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(lead_unread.len(), 1);
+        assert_eq!(lead_unread[0].from_agent_id, "worker-1");
+        assert_eq!(lead_unread[0].content, "Audit complete: all 3 routes verified.");
+        assert_eq!(
+            lead_unread[0].files.as_deref(),
+            Some(&["d:/work/audit.md".to_string()][..])
         );
         session.stop();
     }

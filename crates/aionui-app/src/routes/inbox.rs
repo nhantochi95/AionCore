@@ -102,18 +102,41 @@ pub struct ResolveActionInboxResponse {
     pub resolved_at: i64,
 }
 
+#[derive(Clone)]
+struct InboxCombinedState {
+    core: InboxRouterState,
+    hub: Option<Arc<crate::bridge::TelegramTeamHub>>,
+}
+
 pub fn inbox_routes(state: InboxRouterState) -> Router {
     Router::new()
         .route("/api/inbox", get(list_inbox))
         .route("/api/inbox/{id}/resolve", post(resolve_inbox))
-        .with_state(state)
+        .with_state(InboxCombinedState {
+            core: state,
+            hub: None,
+        })
+}
+
+pub fn inbox_routes_with_hub(
+    state: InboxRouterState,
+    hub: Arc<crate::bridge::TelegramTeamHub>,
+) -> Router {
+    Router::new()
+        .route("/api/inbox", get(list_inbox))
+        .route("/api/inbox/{id}/resolve", post(resolve_inbox))
+        .with_state(InboxCombinedState {
+            core: state,
+            hub: Some(hub),
+        })
 }
 
 /// GET /api/inbox
 async fn list_inbox(
-    State(state): State<InboxRouterState>,
+    State(combined): State<InboxCombinedState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<ActionInboxListResponse>>, ApiError> {
+    let state = &combined.core;
     let rows = state
         .bridge_repo
         .list_action_inbox_items(&user.id, None)
@@ -131,11 +154,12 @@ async fn list_inbox(
 
 /// POST /api/inbox/{id}/resolve
 async fn resolve_inbox(
-    State(state): State<InboxRouterState>,
+    State(combined): State<InboxCombinedState>,
     Extension(user): Extension<CurrentUser>,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<ResolveActionInboxRequest>,
 ) -> Result<Json<ApiResponse<ResolveActionInboxResponse>>, ApiError> {
+    let state = &combined.core;
     let card = state
         .bridge_repo
         .get_action_inbox_item(&id)
@@ -257,6 +281,98 @@ async fn resolve_inbox(
                 .bridge_repo
                 .extend_room_hops_allowance(&card.target_id, grant)
                 .await;
+        }
+        "quota_fallback" | "quota_alert" if req.action == "approve" => {
+            let team_id = details
+                .get("team_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(card.target_id.as_str());
+            let slot_id_opt = details
+                .get("slot_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            let explicit_target = req
+                .payload
+                .as_ref()
+                .or_else(|| details.get("fallback_target"));
+            if let Some(ref hub) = combined.hub {
+                let _ = hub
+                    .execute_quota_fallback_resolution(&user.id, team_id, slot_id_opt, explicit_target)
+                    .await;
+            }
+        }
+        "approve_done" => {
+            let room_id = details
+                .get("room_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| (card.target_type == "room").then_some(card.target_id.as_str()))
+                .unwrap_or_default()
+                .to_owned();
+            let task_id_opt = details
+                .get("task_id")
+                .or_else(|| details.get("cross_team_task_id"))
+                .and_then(|v| v.as_str())
+                .or_else(|| (card.target_type == "task").then_some(card.target_id.as_str()));
+
+            if let Some(task_id) = task_id_opt {
+                let target_status = if req.action == "approve" {
+                    Some("completed")
+                } else if req.action == "reject" {
+                    Some("in_progress")
+                } else {
+                    None
+                };
+                if let Some(next_status) = target_status
+                    && let Ok(updated_task) = state
+                        .bridge_repo
+                        .update_shared_room_task(
+                            task_id,
+                            aionui_db::UpdateSharedRoomTaskParams {
+                                status: Some(next_status.to_owned()),
+                                description: None,
+                                blocked_by_json: None,
+                                artifact_paths_json: None,
+                                result_summary: None,
+                            },
+                        )
+                        .await
+                {
+                    let resolved_room_id = if room_id.is_empty() {
+                        updated_task.room_id.clone()
+                    } else {
+                        room_id
+                    };
+                    let task_dto = if let Some(ref hub) = combined.hub {
+                        hub.hydrate_room_task_dto(&user.id, updated_task).await
+                    } else {
+                        let mut fallback_names = std::collections::HashMap::new();
+                        if let Some(to_name) = details
+                            .get("to_team_name")
+                            .or_else(|| details.get("team_name"))
+                            .and_then(|v| v.as_str())
+                        {
+                            fallback_names.insert(updated_task.to_team_id.clone(), to_name.to_owned());
+                        }
+                        if let (Some(fid), Some(fname)) = (
+                            updated_task.from_team_id.as_ref(),
+                            details.get("from_team_name").and_then(|v| v.as_str()),
+                        ) {
+                            fallback_names.insert(fid.clone(), fname.to_owned());
+                        }
+                        crate::bridge::TelegramTeamHub::map_room_task_dto(updated_task, &fallback_names)
+                    };
+                    state.event_bus.broadcast(WebSocketMessage::new(
+                        "sharedRoom.taskChanged",
+                        serde_json::json!({
+                            "user_id": user.id,
+                            "room_id": resolved_room_id,
+                            "task": task_dto,
+                            "resolved_via": "inbox",
+                        }),
+                    ));
+                }
+            }
         }
         "budget_warning" if req.action == "extend" => {
             let extend_usd = req

@@ -58,16 +58,15 @@ impl TaskBoard {
         owner: Option<&str>,
         blocked_by: &[String],
     ) -> Result<TeamTask, TeamError> {
+        let mut resolved_blocked_by = Vec::with_capacity(blocked_by.len());
         for dep_id in blocked_by {
-            let dep = self.repo.find_task_by_id(&self.user_id, team_id, dep_id).await?;
-            if dep.is_none() {
-                return Err(TeamError::BlockedTaskNotFound(dep_id.clone()));
-            }
+            let resolved_dep_id = self.resolve_dependency_task_id(team_id, dep_id).await?;
+            resolved_blocked_by.push(resolved_dep_id);
         }
 
         let task_id = generate_id();
         let now = now_ms();
-        let blocked_by_json = serde_json::to_string(blocked_by)?;
+        let blocked_by_json = serde_json::to_string(&resolved_blocked_by)?;
 
         let row = TeamTaskRow {
             id: task_id.clone(),
@@ -85,7 +84,7 @@ impl TaskBoard {
 
         self.repo.create_task(&self.user_id, &row).await?;
 
-        for dep_id in blocked_by {
+        for dep_id in &resolved_blocked_by {
             self.repo
                 .append_to_blocks(&self.user_id, team_id, dep_id, &task_id)
                 .await?;
@@ -101,33 +100,43 @@ impl TaskBoard {
     }
 
     pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
-        let existing = self
-            .repo
-            .find_task_by_id(&self.user_id, team_id, task_id)
-            .await?
-            .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+        let existing = self.resolve_task_row(team_id, task_id).await?;
+        let resolved_task_id = existing.id.clone();
+
+        let resolved_blocked_by = match update.blocked_by.as_ref() {
+            Some(dep_ids) => {
+                let mut resolved = Vec::with_capacity(dep_ids.len());
+                for dep_id in dep_ids {
+                    resolved.push(self.resolve_dependency_task_id(team_id, dep_id).await?);
+                }
+                Some(serde_json::to_string(&resolved)?)
+            }
+            None => None,
+        };
 
         let params = UpdateTaskParams {
             status: update.status.map(|s| s.to_string()),
             description: update.description.clone(),
             owner: update.owner.clone(),
-            blocked_by: update.blocked_by.as_ref().map(serde_json::to_string).transpose()?,
+            blocked_by: resolved_blocked_by,
             metadata: update.metadata.as_ref().map(serde_json::to_string).transpose()?,
         };
 
-        self.repo.update_task(&self.user_id, team_id, task_id, &params).await?;
+        self.repo
+            .update_task(&self.user_id, team_id, &resolved_task_id, &params)
+            .await?;
 
         if update.status == Some(TaskStatus::Completed) {
-            self.check_unblocks(team_id, task_id, &existing).await?;
+            self.check_unblocks(team_id, &resolved_task_id, &existing).await?;
         }
 
         let updated = self
             .repo
-            .find_task_by_id(&self.user_id, team_id, task_id)
+            .find_task_by_id(&self.user_id, team_id, &resolved_task_id)
             .await?
-            .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+            .ok_or_else(|| TeamError::TaskNotFound(resolved_task_id.clone()))?;
 
-        debug!(team_id, task_id, "task updated");
+        debug!(team_id, task_id = %resolved_task_id, "task updated");
 
         let task = TeamTask::from_row(&updated).map_err(TeamError::Json)?;
         // Deletion is modeled as an update to `status=deleted`, not a separate
@@ -136,6 +145,48 @@ impl TaskBoard {
             events.broadcast_task_changed(task_to_response(&task), TeamTaskChange::Updated);
         }
         Ok(task)
+    }
+
+    /// Resolves an exact task UUID or an unambiguous `>= 8`-character short ID
+    /// (prefix or UUIDv7 random suffix, tolerating trailing `…` or `...`).
+    async fn resolve_task_row(&self, team_id: &str, raw_id: &str) -> Result<TeamTaskRow, TeamError> {
+        let normalized = normalize_task_id_input(raw_id);
+        if normalized.is_empty() {
+            return Err(TeamError::TaskNotFound(raw_id.to_owned()));
+        }
+
+        if let Some(exact) = self.repo.find_task_by_id(&self.user_id, team_id, normalized).await? {
+            return Ok(exact);
+        }
+
+        if normalized.chars().count() >= 8 {
+            let needle = normalized.to_ascii_lowercase();
+            let rows = self.repo.list_tasks(&self.user_id, team_id).await?;
+            let matches: Vec<TeamTaskRow> = rows
+                .into_iter()
+                .filter(|row| {
+                    let lower = row.id.to_ascii_lowercase();
+                    lower.starts_with(&needle) || lower.ends_with(&needle)
+                })
+                .collect();
+            return match matches.len() {
+                0 => Err(TeamError::TaskNotFound(raw_id.to_owned())),
+                1 => Ok(matches.into_iter().next().expect("checked len == 1")),
+                count => Err(TeamError::InvalidRequest(format!(
+                    "Ambiguous task_id '{raw_id}' matches {count} tasks; provide a longer prefix or full UUID"
+                ))),
+            };
+        }
+
+        Err(TeamError::TaskNotFound(raw_id.to_owned()))
+    }
+
+    async fn resolve_dependency_task_id(&self, team_id: &str, raw_dep_id: &str) -> Result<String, TeamError> {
+        match self.resolve_task_row(team_id, raw_dep_id).await {
+            Ok(row) => Ok(row.id),
+            Err(TeamError::TaskNotFound(_)) => Err(TeamError::BlockedTaskNotFound(raw_dep_id.to_owned())),
+            Err(other) => Err(other),
+        }
     }
 
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
@@ -173,6 +224,14 @@ impl TaskBoard {
         }
         Ok(())
     }
+}
+
+fn normalize_task_id_input(raw_id: &str) -> &str {
+    raw_id
+        .trim()
+        .trim_end_matches("...")
+        .trim_end_matches('…')
+        .trim()
 }
 
 #[cfg(test)]
@@ -568,5 +627,82 @@ mod tests {
 
         let tasks = board.list_tasks("t1").await.unwrap();
         assert_eq!(tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_and_blocked_by_accept_8char_task_id_prefix() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let board = TaskBoard::new(repo);
+
+        let task_a = create_simple_task(&board, "t1", "Prefix Task A").await;
+        let short_a = crate::prompts::wake_summary::short_task_id(&task_a.id);
+        assert_eq!(short_a.len(), 8);
+
+        // Create downstream task referencing A by its 8-char wake-summary short ID
+        let task_b = board
+            .create_task("t1", "Downstream B", None, None, std::slice::from_ref(&short_a))
+            .await
+            .unwrap();
+        assert_eq!(task_b.blocked_by, vec![task_a.id.clone()]);
+
+        // Update A via 8-char short ID (and tolerate trailing ellipsis) to completed -> unblocks B
+        let short_with_ellipsis = format!("{short_a}…");
+        let updated_a = board
+            .update_task(
+                "t1",
+                &short_with_ellipsis,
+                &TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated_a.id, task_a.id);
+        assert_eq!(updated_a.status, TaskStatus::Completed);
+
+        let tasks = board.list_tasks("t1").await.unwrap();
+        let refreshed_b = tasks.iter().find(|t| t.id == task_b.id).unwrap();
+        assert!(refreshed_b.blocked_by.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_8char_prefix_is_rejected() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let now = now_ms();
+        for suffix in ["1111", "2222"] {
+            repo.create_task(
+                "system_default_user",
+                &TeamTaskRow {
+                    id: format!("deadbeef-{suffix}-4000-8000-000000000000"),
+                    team_id: "t1".into(),
+                    subject: format!("Task {suffix}"),
+                    description: None,
+                    status: "pending".into(),
+                    owner: None,
+                    blocked_by: "[]".into(),
+                    blocks: "[]".into(),
+                    metadata: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let board = TaskBoard::new(repo);
+        let err = board
+            .update_task(
+                "t1",
+                "deadbeef",
+                &TaskUpdate {
+                    status: Some(TaskStatus::InProgress),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::InvalidRequest(msg) if msg.contains("Ambiguous task_id")));
     }
 }

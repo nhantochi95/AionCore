@@ -1565,6 +1565,36 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Returns `true` when `slot_id` is ready, idle, has no urgent `Foreground`
+    /// or `Control` work waiting, and has at least one `Directed` or `Background`
+    /// mailbox-backed intent that can safely coalesce while sibling teammates are
+    /// still actively working.
+    pub(crate) fn should_coalesce_lead_wake(&self, slot_id: &str) -> bool {
+        let state = self.lock_state();
+        let Some(slot) = state.slots.get(slot_id) else {
+            return false;
+        };
+        if slot.removed
+            || slot.paused
+            || slot.active.is_some()
+            || !matches!(slot.runtime_constraint, RuntimeConstraint::Ready)
+        {
+            return false;
+        }
+        if !slot.foreground.is_empty() || !slot.control.is_empty() {
+            return false;
+        }
+        slot.directed
+            .iter()
+            .chain(slot.background.iter())
+            .any(|intent_id| {
+                state
+                    .intents
+                    .get(intent_id)
+                    .is_some_and(|intent| !intent.state.is_terminal() && intent.mailbox_message_id.is_some())
+            })
+    }
+
     fn validate_enqueue_constraint(slot_id: &str, slot: &SlotState) -> Result<(), TeamError> {
         if slot.removed {
             return Err(TeamError::InvalidRequest(format!("Team slot was removed: {slot_id}")));

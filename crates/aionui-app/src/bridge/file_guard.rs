@@ -342,6 +342,105 @@ pub fn stage_room_artifacts_batch(
     })
 }
 
+/// Async wrapper around [`stage_room_artifacts_batch`] that offloads blocking filesystem
+/// validation, canonicalization, and multi-workspace copies onto Tokio's blocking pool.
+pub async fn stage_room_artifacts_batch_async(
+    room_id: String,
+    source_files: Vec<String>,
+    source_team_workspace: Option<String>,
+    data_dir: PathBuf,
+    recipient_workspaces: Vec<String>,
+    allow_user_local_files: bool,
+) -> Result<StagedArtifactBatch, String> {
+    if source_files.is_empty() {
+        return Ok(StagedArtifactBatch::default());
+    }
+    tokio::task::spawn_blocking(move || {
+        stage_room_artifacts_batch(
+            &room_id,
+            &source_files,
+            source_team_workspace.as_deref(),
+            &data_dir,
+            &recipient_workspaces,
+            allow_user_local_files,
+        )
+    })
+    .await
+    .map_err(|e| format!("Artifact staging join error: {e}"))?
+}
+
+/// Async wrapper around [`stage_room_artifacts_and_sync_inbox`] using `spawn_blocking`.
+pub async fn stage_room_artifacts_and_sync_inbox_async(
+    room_id: String,
+    source_files: Vec<String>,
+    source_team_workspace: Option<String>,
+    data_dir: PathBuf,
+    recipient_workspaces: Vec<String>,
+) -> Result<Vec<StagedRoomArtifact>, String> {
+    Ok(stage_room_artifacts_batch_async(
+        room_id,
+        source_files,
+        source_team_workspace,
+        data_dir,
+        recipient_workspaces,
+        false,
+    )
+    .await?
+    .artifacts)
+}
+
+/// Offload oversized inline Shared Room message text (`> 2,400` chars) to a Markdown file in
+/// `<data_dir>/shared-rooms/<room_id>/artifacts/msg_<msg_id>.md` and copy into each recipient's
+/// `<workspace>/.shared-inbox/<room_id>/msg_<msg_id>.md` on Tokio's blocking pool.
+pub async fn stage_room_oversized_message_async(
+    room_id: String,
+    msg_id: String,
+    content: String,
+    data_dir: PathBuf,
+    recipient_workspaces: Vec<String>,
+) -> Result<(String, HashMap<String, String>), String> {
+    tokio::task::spawn_blocking(move || {
+        let safe_room = sanitize_file_name(&room_id);
+        let safe_msg = sanitize_file_name(&format!("msg_{msg_id}.md"));
+        let artifacts_dir = data_dir.join("shared-rooms").join(&safe_room).join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir)
+            .map_err(|e| format!("Failed to create room artifacts dir: {e}"))?;
+        let staged_dest = artifacts_dir.join(&safe_msg);
+        std::fs::write(&staged_dest, content.as_bytes())
+            .map_err(|e| format!("Failed to write staged room message: {e}"))?;
+        let canonical_staged = dunce::canonicalize(&staged_dest)
+            .unwrap_or_else(|_| staged_dest.clone())
+            .to_string_lossy()
+            .into_owned();
+
+        let mut per_ws = HashMap::new();
+        for ws in recipient_workspaces {
+            let trimmed = ws.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let inbox_dir = PathBuf::from(trimmed).join(".shared-inbox").join(&safe_room);
+            let delivered = if std::fs::create_dir_all(&inbox_dir).is_ok() {
+                let dest = inbox_dir.join(&safe_msg);
+                if std::fs::copy(&staged_dest, &dest).is_ok() {
+                    dunce::canonicalize(&dest)
+                        .unwrap_or(dest)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    canonical_staged.clone()
+                }
+            } else {
+                canonical_staged.clone()
+            };
+            per_ws.insert(trimmed.to_owned(), delivered);
+        }
+        Ok((canonical_staged, per_ws))
+    })
+    .await
+    .map_err(|e| format!("Oversized message staging join error: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

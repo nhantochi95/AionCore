@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -131,6 +132,9 @@ pub struct AgentLoopContext {
     pub registry: Arc<EventLoopRegistry>,
 }
 
+const LEAD_WAKE_COALESCE_DEBOUNCE: Duration = Duration::from_millis(1_500);
+const LEAD_WAKE_COALESCE_MAX_CAP: Duration = Duration::from_millis(4_500);
+
 fn is_retryable_start_skip(error: &AgentTurnExecutionError) -> bool {
     matches!(error, AgentTurnExecutionError::Skipped { reason } if reason.contains("already running"))
 }
@@ -156,7 +160,29 @@ async fn run_event_loop(
             if *shutdown_rx.borrow() {
                 return;
             }
-            match ctx.session.prepare_next_batch(&ctx.slot_id).await {
+            let mut held_for_coalescing = false;
+            if ctx.session.should_hold_lead_wake_for_parallel_workers(&ctx.slot_id).await {
+                held_for_coalescing = true;
+                let coalesce_started = Instant::now();
+                while ctx.session.should_hold_lead_wake_for_parallel_workers(&ctx.slot_id).await {
+                    let elapsed = coalesce_started.elapsed();
+                    if elapsed >= LEAD_WAKE_COALESCE_MAX_CAP {
+                        break;
+                    }
+                    let wait_for = LEAD_WAKE_COALESCE_DEBOUNCE.min(LEAD_WAKE_COALESCE_MAX_CAP.saturating_sub(elapsed));
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.wait_for(|stopped| *stopped) => return,
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(wait_for) => break,
+                    }
+                }
+            }
+            match ctx
+                .session
+                .prepare_next_batch_with_coalescing(&ctx.slot_id, held_for_coalescing)
+                .await
+            {
                 Ok(PrepareBatchResult::Execute { batch, input }) => {
                     if execute_and_finalize(&ctx, *batch, input).await == ExecuteResult::WaitForSignal {
                         break;
@@ -279,14 +305,22 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             }
         })
     });
+    let WakeInput {
+        conversation_id,
+        first_message,
+        unread: _,
+        agent_role,
+        consumed_role_prompt,
+        consumed_slot_handover,
+    } = input;
     let request = AgentTurnRequest {
         team_run_id: batch.team_run_ids.first().cloned(),
         team_id: ctx.team_id.clone(),
         slot_id: ctx.slot_id.clone(),
-        role: target_role_for(input.agent_role),
-        conversation_id: input.conversation_id.clone(),
+        role: target_role_for(agent_role),
+        conversation_id: conversation_id.clone(),
         user_id: ctx.user_id.clone(),
-        content: input.first_message,
+        content: first_message,
         files,
         source: AgentTurnSource::Mailbox {
             unread_count: unread_message_ids.len(),
@@ -298,11 +332,13 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
     let outcome = match ctx.turn_port.run_agent_turn(request).await {
         Ok(outcome) => outcome,
         Err(error) if !started_seen.load(Ordering::SeqCst) && is_retryable_start_skip(&error) => {
+            restore_unsettled_prompt_state(ctx, consumed_role_prompt, consumed_slot_handover).await;
             ctx.session.work_coordinator().retry_start(&batch, "already_running");
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
             return ExecuteResult::WaitForSignal;
         }
         Err(error) => {
+            restore_unsettled_prompt_state(ctx, consumed_role_prompt, consumed_slot_handover).await;
             if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
                 // The turn never reached `mark_started`, so neither the interrupting
                 // caller (it had no turn_id) nor the late-start callback claimed this
@@ -322,7 +358,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
                 finalize_scheduler_turn(ctx).await;
                 ctx.session
-                    .notify_slot_turn_settled(&ctx.slot_id, &input.conversation_id);
+                    .notify_slot_turn_settled(&ctx.slot_id, &conversation_id);
                 return ExecuteResult::ContinueDraining;
             }
             warn!(
@@ -335,14 +371,22 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
             finalize_failed_delivery(ctx, &batch, &failure).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
+            finalize_error_settle(ctx).await;
+            ctx.session
+                .notify_slot_turn_settled(&ctx.slot_id, &conversation_id);
             return ExecuteResult::ContinueDraining;
         }
     };
 
-    let (terminal_status, terminal_team_run_ids) = if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+    let is_cancelled = ctx.session.work_coordinator().is_batch_cancelled(&batch);
+    let is_success = outcome.status.is_success();
+    if is_cancelled || !is_success {
+        restore_unsettled_prompt_state(ctx, consumed_role_prompt, consumed_slot_handover).await;
+    }
+    let (terminal_status, terminal_team_run_ids) = if is_cancelled {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
         (None, batch.team_run_ids.clone())
-    } else if outcome.status.is_success() {
+    } else if is_success {
         let completion = ctx.session.work_coordinator().complete_batch_with_ack(&batch);
         if completion.commit_result == CommitResult::Committed {
             mark_message_ids_read(ctx, &batch, &completion.ack_message_ids).await;
@@ -369,7 +413,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     team_id: ctx.team_id.clone(),
                     team_run_id: team_run_id.clone(),
                     slot_id: ctx.slot_id.clone(),
-                    role: target_role_for(input.agent_role),
+                    role: target_role_for(agent_role),
                     conversation_id: outcome.conversation_id.clone(),
                     turn_id: outcome.turn_id.clone(),
                     status: status.clone(),
@@ -380,10 +424,37 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
     }
 
-    finalize_scheduler_turn(ctx).await;
+    if is_cancelled || is_success {
+        finalize_scheduler_turn(ctx).await;
+    } else {
+        finalize_error_settle(ctx).await;
+    }
     ctx.session
-        .notify_slot_turn_settled(&ctx.slot_id, &input.conversation_id);
+        .notify_slot_turn_settled(&ctx.slot_id, &conversation_id);
     ExecuteResult::ContinueDraining
+}
+
+async fn restore_unsettled_prompt_state(
+    ctx: &AgentLoopContext,
+    consumed_role_prompt: bool,
+    consumed_slot_handover: Option<String>,
+) {
+    if consumed_role_prompt {
+        ctx.session.reset_slot_prompt_state(&ctx.slot_id);
+        ctx.scheduler.set_needs_role_prompt(&ctx.slot_id, true).await;
+    }
+    if let Some(banner) = consumed_slot_handover {
+        ctx.session.restore_slot_handover_banner_durable(&ctx.slot_id, banner).await;
+    }
+}
+
+async fn notify_lead_if_all_teammates_settled(ctx: &AgentLoopContext) {
+    if !ctx.scheduler.has_working_teammates().await
+        && let Some(lead_slot_id) = ctx.scheduler.find_lead_slot_id().await
+        && lead_slot_id != ctx.slot_id
+    {
+        ctx.registry.notify(&lead_slot_id);
+    }
 }
 
 async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
@@ -411,6 +482,38 @@ async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
             "scheduler turn finalization failed"
         ),
     }
+    notify_lead_if_all_teammates_settled(ctx).await;
+}
+
+/// Settle a failed turn WITHOUT calling `mark_idle` so `TeammateStatus::Error`
+/// is preserved and no false `"idle"` mailbox row is emitted, while still
+/// waking/flushing the leader when all teammates have reached a settled state.
+async fn finalize_error_settle(ctx: &AgentLoopContext) {
+    match ctx.scheduler.maybe_wake_leader_when_all_idle().await {
+        Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
+            if let Err(error) = ctx
+                .session
+                .enqueue_leader_settle_signal(&wake_target, WorkSource::IdleNotification)
+                .await
+            {
+                warn!(
+                    team_id = %ctx.team_id,
+                    slot_id = %ctx.slot_id,
+                    wake_target,
+                    error = %error,
+                    "leader error-settle signal enqueue failed"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            error = %error,
+            "scheduler error-settle check failed"
+        ),
+    }
+    notify_lead_if_all_teammates_settled(ctx).await;
 }
 
 async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {

@@ -1239,3 +1239,30 @@ fn command_during_running_batch_queues_without_preemption() {
     assert!(second.is_command);
     assert_eq!(second.mailbox_message_ids, vec!["c2"]);
 }
+
+#[test]
+fn should_coalesce_lead_wake_holds_directed_or_background_but_flushes_foreground_and_control() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    assert!(!coordinator.should_coalesce_lead_wake("lead-1"));
+
+    // Pure signal intent (IdleNotification without mailbox_message_id) does NOT coalesce.
+    let signal_lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::IdleNotification,
+            binding: CausalBinding::Background,
+        })
+        .unwrap();
+    coordinator.commit_enqueue(&signal_lease, None).unwrap();
+    assert!(!coordinator.should_coalesce_lead_wake("lead-1"));
+
+    // Directed worker report message CAN coalesce while sibling teammates are working.
+    enqueue(&coordinator, WorkSource::McpSendMessage, "report-1");
+    assert!(coordinator.should_coalesce_lead_wake("lead-1"));
+
+    // Urgent Foreground user message immediately disables coalescing (0ms flush).
+    enqueue(&coordinator, WorkSource::UserMessage, "user-1");
+    assert!(!coordinator.should_coalesce_lead_wake("lead-1"));
+}

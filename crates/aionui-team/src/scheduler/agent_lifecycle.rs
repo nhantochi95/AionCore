@@ -97,12 +97,15 @@ impl TeammateManager {
         let slot = slots
             .get_mut(slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let engine_changed = slot.agent.backend != backend;
         slot.agent.backend = backend.to_owned();
         slot.agent.model = model.to_owned();
         if assistant_id.is_some() {
             slot.agent.assistant_id = assistant_id;
         }
-        slot.needs_role_prompt = true;
+        if engine_changed {
+            slot.needs_role_prompt = true;
+        }
         if slot.status == TeammateStatus::Error {
             slot.status = TeammateStatus::Idle;
             slot.agent.status = Some(TeammateStatus::Idle);

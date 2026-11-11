@@ -340,11 +340,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let team_hub_authenticated = crate::routes::team_hub_routes(states.team_hub)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let shared_room_hub = states.shared_room.hub.clone();
     let shared_room_authenticated = crate::bridge::shared_room_routes(states.shared_room)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let worktree_authenticated = crate::routes::worktree_routes(states.worktree)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-    let inbox_authenticated = crate::routes::inbox_routes(states.inbox)
+    let inbox_authenticated = crate::routes::inbox_routes_with_hub(states.inbox, shared_room_hub)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let wallets_authenticated = crate::routes::wallets_routes(states.wallets)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));

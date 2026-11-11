@@ -19,6 +19,7 @@ mod conn;
 mod models;
 mod skills;
 mod translate;
+pub(crate) mod warm_acp;
 mod wire;
 
 pub use conn::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};

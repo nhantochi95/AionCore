@@ -119,15 +119,12 @@ pub struct CreateRoomTaskRequest {
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct UpdateRoomTaskRequest {
-    #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub result_summary: Option<String>,
-    #[serde(default)]
     pub files: Vec<String>,
 }
 
@@ -375,6 +372,7 @@ async fn send_message(
             reply_to_id: req.reply_to_id,
             origin_telegram_chat: None,
             wake_targets: req.wake_targets,
+            live_steering: req.live_steering.unwrap_or(false),
         })
         .await
         .map_err(ApiError::BadRequest)?;
@@ -472,9 +470,13 @@ async fn update_task(
     State(state): State<SharedRoomRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(path): Path<RoomTaskPath>,
-    body: Result<Json<UpdateRoomTaskRequest>, JsonRejection>,
+    body: axum::body::Bytes,
 ) -> Result<Json<ApiResponse<SharedRoomTaskDto>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let req: UpdateRoomTaskRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        UpdateRoomTaskRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("Invalid JSON body: {e}")))?
+    };
     let _ = state
         .hub
         .bridge_repo()

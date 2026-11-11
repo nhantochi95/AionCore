@@ -98,6 +98,27 @@ impl TeammateManager {
         Ok(())
     }
 
+    pub async fn set_needs_role_prompt(&self, slot_id: &str, needed: bool) {
+        let mut slots = self.slots.lock().await;
+        if let Some(slot) = slots.get_mut(slot_id) {
+            slot.needs_role_prompt = needed;
+        }
+    }
+
+    pub async fn is_lead_slot(&self, slot_id: &str) -> bool {
+        let slots = self.slots.lock().await;
+        slots
+            .get(slot_id)
+            .is_some_and(|slot| slot.agent.role == TeammateRole::Lead)
+    }
+
+    pub async fn has_working_teammates(&self) -> bool {
+        let slots = self.slots.lock().await;
+        slots
+            .values()
+            .any(|slot| slot.agent.role == TeammateRole::Teammate && !is_settled(slot.status))
+    }
+
     pub(crate) async fn maybe_wake_leader_when_all_idle(&self) -> Result<Option<String>, TeamError> {
         let slots = self.slots.lock().await;
 

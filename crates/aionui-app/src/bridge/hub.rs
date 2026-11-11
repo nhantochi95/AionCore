@@ -22,7 +22,8 @@ use aionui_channel::types::{
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::custom_bridge_schema::{
-    CreateActionInboxParams, RecordCostRunParams, WalletType, classify_agent_wallet,
+    CreateActionInboxParams, RecordCostRunParams, SlotWalletFacts, WalletType, classify_slot_wallet_facts,
+    estimate_api_token_cost_usd,
 };
 use aionui_db::{
     CreateSharedRoomMessageParams, CreateSharedRoomTaskParams, CustomSharedRoomMessageRow, CustomSharedRoomRow,
@@ -44,11 +45,11 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::file_guard::{
     StagedRoomArtifact, is_image_file_name, sanitize_file_name, save_inbound_telegram_attachment,
-    stage_room_artifacts_batch, validate_outbound_file_path,
+    stage_room_artifacts_batch_async, stage_room_oversized_message_async, validate_outbound_file_path,
 };
 use crate::bridge::judge::{
-    ParticipatingTeam, RoomRoutingInput, RoutedTarget, is_task_blocked,
-    is_team_blocked_by_dependencies, mention_slug, resolve_room_targets, validate_task_dependencies,
+    ParticipatingTeam, RoomRoutingHeuristics, RoomRoutingInput, RoutedTarget, is_task_blocked,
+    is_team_blocked_by_dependencies, mention_slug, resolve_room_targets_smart, validate_task_dependencies,
 };
 use crate::bridge::locales::{HubI18n, HubLocale};
 use crate::routes::inbox::ActionInboxCardDto;
@@ -164,6 +165,15 @@ pub struct PostRoomMessageArgs<'a> {
     pub reply_to_id: Option<String>,
     pub origin_telegram_chat: Option<String>,
     pub wake_targets: Option<Vec<String>>,
+    pub live_steering: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCrossTeamTaskWake {
+    task_id: String,
+    title: String,
+    description: String,
+    room_name: String,
 }
 
 pub struct TelegramTeamHub {
@@ -179,6 +189,10 @@ pub struct TelegramTeamHub {
     data_dir: PathBuf,
     active_runs: DashMap<String, ActiveTeamRunTracker>,
     orchestrator: std::sync::OnceLock<crate::bridge::context_compactor::TeamHubOrchestrator>,
+    http_client: reqwest::Client,
+    pending_task_wakes: Arc<DashMap<(String, String), PendingCrossTeamTaskWake>>,
+    delivered_handoff_banners: DashMap<(String, String), String>,
+    last_room_read_cursor: DashMap<(String, String), String>,
 }
 
 impl TelegramTeamHub {
@@ -195,6 +209,10 @@ impl TelegramTeamHub {
         encryption_key: [u8; 32],
         data_dir: PathBuf,
     ) -> Arc<Self> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(Self {
             bridge_repo,
             channel_repo,
@@ -208,6 +226,10 @@ impl TelegramTeamHub {
             data_dir,
             active_runs: DashMap::new(),
             orchestrator: std::sync::OnceLock::new(),
+            http_client,
+            pending_task_wakes: Arc::new(DashMap::new()),
+            delivered_handoff_banners: DashMap::new(),
+            last_room_read_cursor: DashMap::new(),
         })
     }
 
@@ -264,6 +286,9 @@ impl TelegramTeamHub {
                         if let Some(user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str)
                             && let Ok(payload) = serde_json::from_value::<TeamRunPayload>(event.data.clone())
                         {
+                            if let Some(orch) = hub_clone.team_hub_orchestrator() {
+                                orch.reset_team_run_turn_hops(&payload.team_id);
+                            }
                             let uid = user_id.to_owned();
                             hub_clone
                                 .active_runs
@@ -297,6 +322,9 @@ impl TelegramTeamHub {
                         if let Some(user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str)
                             && let Ok(payload) = serde_json::from_value::<TeamRunPayload>(event.data.clone())
                         {
+                            if let Some(orch) = hub_clone.team_hub_orchestrator() {
+                                orch.reset_team_run_turn_hops(&payload.team_id);
+                            }
                             let uid = user_id.to_owned();
                             tokio::spawn(async move {
                                 hub_clone.handle_team_run_failed(&uid, payload).await;
@@ -305,6 +333,9 @@ impl TelegramTeamHub {
                     }
                     TEAM_RUN_CANCELLED_EVENT => {
                         if let Ok(payload) = serde_json::from_value::<TeamRunPayload>(event.data.clone()) {
+                            if let Some(orch) = hub_clone.team_hub_orchestrator() {
+                                orch.reset_team_run_turn_hops(&payload.team_id);
+                            }
                             hub_clone.active_runs.remove(&payload.team_id);
                         }
                     }
@@ -312,6 +343,9 @@ impl TelegramTeamHub {
                         if let Some(user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str)
                             && let Some(team_id) = event.data.get("team_id").and_then(serde_json::Value::as_str)
                         {
+                            if let Some(orch) = hub_clone.team_hub_orchestrator() {
+                                orch.reset_team_run_turn_hops(team_id);
+                            }
                             let uid = user_id.to_owned();
                             let tid = team_id.to_owned();
                             tokio::spawn(async move {
@@ -323,6 +357,9 @@ impl TelegramTeamHub {
                         if let Some(user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str)
                             && let Ok(payload) = serde_json::from_value::<TeamRunPayload>(event.data.clone())
                         {
+                            if let Some(orch) = hub_clone.team_hub_orchestrator() {
+                                orch.reset_team_run_turn_hops(&payload.team_id);
+                            }
                             let uid = user_id.to_owned();
                             tokio::spawn(async move {
                                 hub_clone.handle_team_run_completed(&uid, payload).await;
@@ -748,6 +785,11 @@ impl TelegramTeamHub {
     }
 
     fn find_lead_info(team: &TeamResponse) -> (String, String) {
+        let (_, name, conv_id) = Self::find_lead_slot_info(team);
+        (name, conv_id)
+    }
+
+    fn find_lead_slot_info(team: &TeamResponse) -> (String, String, String) {
         let lead = team
             .assistants
             .iter()
@@ -758,8 +800,8 @@ impl TelegramTeamHub {
             })
             .or_else(|| team.assistants.first());
         match lead {
-            Some(a) => (a.name.clone(), a.conversation_id.clone()),
-            None => ("Leader".to_owned(), String::new()),
+            Some(a) => (a.slot_id.clone(), a.name.clone(), a.conversation_id.clone()),
+            None => ("lead".to_owned(), "Leader".to_owned(), String::new()),
         }
     }
 
@@ -838,56 +880,305 @@ impl TelegramTeamHub {
         let Ok(team) = self.team_service.get_team(owner_user_id, &payload.team_id).await else {
             return;
         };
-        let member_name = team
-            .assistants
-            .iter()
-            .find(|a| a.slot_id == payload.slot_id)
+        let member = team.assistants.iter().find(|a| a.slot_id == payload.slot_id);
+        let member_name = member
             .map(|a| a.name.clone())
             .unwrap_or_else(|| payload.slot_id.clone());
+        let is_worker_slot = member.is_some_and(|a| {
+            !a.role.eq_ignore_ascii_case("lead")
+                && !a.role.eq_ignore_ascii_case("leader")
+                && team.leader_assistant_id.as_deref() != Some(a.slot_id.as_str())
+        });
         let reason = payload
             .error
             .unwrap_or_else(|| "Runtime process exited or hit rate/quota limit".to_owned());
 
-        let Some(reply_chat) = self
-            .resolve_team_telegram_destination(owner_user_id, &payload.team_id)
-            .await
-        else {
-            return;
-        };
+        // 1. Always surface Desktop WebSocket alert + ActionInbox card even when Telegram is unbound
+        self.event_bus.broadcast(WebSocketMessage::new(
+            "team:slot_quota_alert",
+            serde_json::json!({
+                "user_id": owner_user_id,
+                "team_id": payload.team_id,
+                "team_name": team.name,
+                "slot_id": payload.slot_id,
+                "member_name": member_name,
+                "error": reason,
+            }),
+        ));
 
-        let mut buttons = Vec::new();
-        let locale = self.resolve_locale(owner_user_id).await;
-        if let Ok(tok) = self
+        let lower_reason = reason.to_lowercase();
+        let is_quota_or_rate_err = lower_reason.contains("quota")
+            || lower_reason.contains("rate")
+            || lower_reason.contains("429")
+            || lower_reason.contains("exhaust")
+            || lower_reason.contains("credit")
+            || lower_reason.contains("billing");
+
+        let (fb_backend, fb_model_id, fb_display) =
+            self.select_best_free_cli_fallback(owner_user_id).await;
+        let fallback_target_json = serde_json::json!({
+            "backend": fb_backend,
+            "provider_id": serde_json::Value::Null,
+            "model_id": fb_model_id,
+        });
+
+        let mut auto_fell_back = false;
+        if is_quota_or_rate_err
+            && is_worker_slot
+            && let Ok(pref) = self.bridge_repo.get_or_default_team_context_pref(&payload.team_id).await
+            && pref.is_auto_fallback_free_cli_enabled()
+        {
+            let _ = self
+                .execute_quota_fallback_resolution(
+                    owner_user_id,
+                    &payload.team_id,
+                    Some(&payload.slot_id),
+                    Some(&fallback_target_json),
+                )
+                .await;
+            auto_fell_back = true;
+        }
+
+        let failed_model = member
+            .map(|a| a.model.clone())
+            .unwrap_or_else(|| "API Model".to_owned());
+        let token_action_kind = if is_quota_or_rate_err {
+            "quota_fallback"
+        } else {
+            "retry_member"
+        };
+        let action_tok = self
             .bridge_repo
             .create_action_token(
                 owner_user_id,
                 CustomTargetType::Team,
                 &payload.team_id,
-                "retry_member",
-                &serde_json::json!({ "slot_id": payload.slot_id }),
+                token_action_kind,
+                &serde_json::json!({
+                    "slot_id": payload.slot_id,
+                    "fallback_target": fallback_target_json,
+                }),
                 None,
             )
             .await
+            .ok();
+
+        let mut tg_chat_saved: Option<String> = None;
+        let mut tg_msg_saved: Option<String> = None;
+        if let Some(reply_chat) = self
+            .resolve_team_telegram_destination(owner_user_id, &payload.team_id)
+            .await
         {
-            buttons.push(vec![ActionButton {
-                label: HubI18n::btn_retry_member(locale, &member_name),
-                action: format!("t:{tok}"),
-                params: None,
-            }]);
+            let mut buttons = Vec::new();
+            let locale = self.resolve_locale(owner_user_id).await;
+            if let Some(ref tok) = action_tok {
+                let btn_label = if is_quota_or_rate_err {
+                    match locale {
+                        HubLocale::ViVn => format!("Chuyển {} sang CLI $0 & Thử lại", member_name),
+                        HubLocale::EnUs => format!("Switch {} to $0 CLI & Retry", member_name),
+                    }
+                } else {
+                    HubI18n::btn_retry_member(locale, &member_name)
+                };
+                buttons.push(vec![ActionButton {
+                    label: btn_label,
+                    action: format!("t:{tok}"),
+                    params: None,
+                }]);
+            }
+
+            let alert_md = HubI18n::member_warning(locale, &team.name, &member_name, &reason);
+            if let Ok(sent_ids) = self
+                .send_formatted_telegram_message(
+                    owner_user_id,
+                    &reply_chat,
+                    &alert_md,
+                    (!buttons.is_empty()).then_some(buttons),
+                    None,
+                    CustomTargetType::Team,
+                    &payload.team_id,
+                )
+                .await
+                && let Some(last_mid) = sent_ids.last()
+            {
+                tg_chat_saved = Some(reply_chat);
+                tg_msg_saved = Some(last_mid.clone());
+            }
         }
 
-        let alert_md = HubI18n::member_warning(locale, &team.name, &member_name, &reason);
-        let _ = self
-            .send_formatted_telegram_message(
+        if let Ok(card) = self
+            .bridge_repo
+            .create_action_inbox_item(CreateActionInboxParams {
+                id: None,
+                owner_user_id: owner_user_id.to_owned(),
+                category: if is_quota_or_rate_err {
+                    "quota_fallback".to_owned()
+                } else {
+                    "quota_alert".to_owned()
+                },
+                title: format!("{} · {} runtime alert", team.name, member_name),
+                summary: if auto_fell_back {
+                    format!("{reason} (Auto-switched slot to $0 Free CLI)")
+                } else {
+                    reason.clone()
+                },
+                details_json: serde_json::json!({
+                    "team_id": payload.team_id,
+                    "team_name": team.name,
+                    "slot_id": payload.slot_id,
+                    "member_name": member_name,
+                    "failed_model": failed_model,
+                    "fallback_model": fb_display,
+                    "fallback_target": fallback_target_json,
+                    "error": reason,
+                    "auto_fallback_applied": auto_fell_back,
+                })
+                .to_string(),
+                target_type: Some("team".to_owned()),
+                target_id: payload.team_id.clone(),
+                action_token: action_tok,
+                telegram_chat_id: tg_chat_saved,
+                telegram_msg_id: tg_msg_saved,
+            })
+            .await
+        {
+            self.event_bus.broadcast(WebSocketMessage::new(
+                "inbox:item_added",
+                serde_json::json!({
+                    "user_id": owner_user_id,
+                    "item": ActionInboxCardDto::from_row(card),
+                }),
+            ));
+        }
+    }
+
+    async fn select_best_free_cli_fallback(&self, owner_user_id: &str) -> (String, String, String) {
+        if let Some(orch) = self.team_hub_orchestrator()
+            && let Ok(catalog) = orch.list_connected_models(owner_user_id).await
+        {
+            let preferred_order = ["claude", "codex", "gemini", "antigravity"];
+            for pref_backend in preferred_order {
+                if let Some(group) = catalog.cli_agents.iter().find(|g| {
+                    g.wallet_type == "cli_subscription"
+                        && g.backend.eq_ignore_ascii_case(pref_backend)
+                        && !g.models.is_empty()
+                }) {
+                    let first = &group.models[0];
+                    return (
+                        group.backend.clone(),
+                        first.id.clone(),
+                        format!("{} ($0 CLI)", first.label),
+                    );
+                }
+            }
+            if let Some(group) = catalog
+                .cli_agents
+                .iter()
+                .find(|g| g.wallet_type == "cli_subscription" && !g.models.is_empty())
+            {
+                let first = &group.models[0];
+                return (
+                    group.backend.clone(),
+                    first.id.clone(),
+                    format!("{} ($0 CLI)", first.label),
+                );
+            }
+        }
+        (
+            "claude".to_owned(),
+            "claude-sonnet-4-6".to_owned(),
+            "Claude Sonnet 4.6 ($0 CLI)".to_owned(),
+        )
+    }
+
+    /// Executes the `$0 CLI` model switch + runtime retry when a `quota_fallback` card is approved
+    /// from either Desktop Action Inbox (`POST /api/inbox/{id}/resolve`) or Telegram inline button.
+    pub async fn execute_quota_fallback_resolution(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        slot_id: Option<&str>,
+        explicit_target: Option<&serde_json::Value>,
+    ) -> Result<(), String> {
+        let orch = self
+            .team_hub_orchestrator()
+            .ok_or_else(|| "TeamHubOrchestrator not initialized".to_owned())?;
+
+        let target_obj = explicit_target.and_then(|v| {
+            if v.get("backend").is_some() {
+                Some(v)
+            } else {
+                v.get("fallback_target")
+            }
+        });
+        let (backend, provider_id, model_id) = if let Some(obj) = target_obj
+            && let Some(b) = obj.get("backend").and_then(serde_json::Value::as_str)
+            && !b.trim().is_empty()
+        {
+            let pid = obj
+                .get("provider_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned);
+            let mid = obj
+                .get("model_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| b.to_owned());
+            (b.to_owned(), pid, mid)
+        } else {
+            let (b, mid, _) = self.select_best_free_cli_fallback(owner_user_id).await;
+            (b, None, mid)
+        };
+
+        let trimmed_slot = slot_id.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(sid) = trimmed_slot {
+            orch.switch_team_models(
                 owner_user_id,
-                &reply_chat,
-                &alert_md,
-                (!buttons.is_empty()).then_some(buttons),
-                None,
-                CustomTargetType::Team,
-                &payload.team_id,
+                team_id,
+                crate::bridge::context_compactor::SwitchTeamModelsRequest {
+                    scope: Some("slots".to_owned()),
+                    preset: None,
+                    target: None,
+                    updates: vec![crate::bridge::context_compactor::PerSlotModelUpdate {
+                        slot_id: sid.to_owned(),
+                        backend,
+                        provider_id,
+                        model_id,
+                        target: None,
+                    }],
+                    force_interrupt: Some(true),
+                },
             )
-            .await;
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+            if self
+                .team_service
+                .restart_agent_runtime(owner_user_id, team_id, sid)
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .team_service
+                    .attach_agent_runtime(owner_user_id, team_id, sid)
+                    .await;
+            }
+        } else {
+            orch.apply_quota_preset(
+                owner_user_id,
+                team_id,
+                crate::bridge::context_compactor::ApplyQuotaPresetRequest {
+                    preset: Some("smart_split".to_owned()),
+                    force_interrupt: Some(true),
+                },
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        }
+
+        Ok(())
     }
 
     async fn handle_team_run_failed(&self, owner_user_id: &str, payload: TeamRunPayload) {
@@ -925,6 +1216,19 @@ impl TelegramTeamHub {
         }
     }
 
+    pub fn classify_slot_agent_wallet(agent: &aionui_api_types::TeamAgentResponse) -> WalletType {
+        classify_slot_wallet_facts(&SlotWalletFacts {
+            slot_backend: Some(&agent.backend),
+            assistant_backend: Some(&agent.assistant_backend),
+            extra_backend: None,
+            cli_path: None,
+            provider_id: None,
+            model_id: Some(&agent.model),
+            auth_methods_json: None,
+            has_custom_api_key: false,
+        })
+    }
+
     pub fn classify_team_lead_wallet(team: &TeamResponse) -> (String, WalletType) {
         let lead = team
             .assistants
@@ -940,43 +1244,13 @@ impl TelegramTeamHub {
             return ("lead".to_owned(), WalletType::CliSubscription);
         };
 
-        if agent.backend.trim().eq_ignore_ascii_case("aionrs") {
-            return (agent.slot_id.clone(), WalletType::ApiKey);
-        }
+        (agent.slot_id.clone(), Self::classify_slot_agent_wallet(agent))
+    }
 
-        let raw_backend = if !agent.backend.trim().is_empty()
-            && !agent.backend.eq_ignore_ascii_case("custom")
-            && !agent.backend.eq_ignore_ascii_case("acp")
-        {
-            agent.backend.trim()
-        } else if !agent.assistant_backend.trim().is_empty()
-            && !agent.assistant_backend.eq_ignore_ascii_case("custom")
-            && !agent.assistant_backend.eq_ignore_ascii_case("acp")
-        {
-            agent.assistant_backend.trim()
-        } else {
-            agent.model.trim()
-        };
-
-        let normalized = raw_backend.to_lowercase();
-        let backend_hint = if normalized == "aionrs" || normalized.contains('/') {
-            "aionrs"
-        } else if normalized.starts_with("claude") {
-            "claude"
-        } else if normalized.starts_with("codex") {
-            "codex"
-        } else if normalized.starts_with("gemini") {
-            "gemini"
-        } else if normalized.starts_with("antigravity") {
-            "antigravity"
-        } else {
-            normalized.as_str()
-        };
-
-        (
-            agent.slot_id.clone(),
-            classify_agent_wallet(Some(backend_hint), None, false),
-        )
+    pub fn has_any_api_key_slot(team: &TeamResponse) -> bool {
+        team.assistants
+            .iter()
+            .any(|a| Self::classify_slot_agent_wallet(a) == WalletType::ApiKey)
     }
 
     async fn is_team_api_key_hard_blocked(
@@ -984,8 +1258,8 @@ impl TelegramTeamHub {
         owner_user_id: &str,
         team: &TeamResponse,
     ) -> Option<(f64, f64)> {
-        let (_, wallet_type) = Self::classify_team_lead_wallet(team);
-        if wallet_type != WalletType::ApiKey {
+        let (_, lead_wallet) = Self::classify_team_lead_wallet(team);
+        if lead_wallet != WalletType::ApiKey && !Self::has_any_api_key_slot(team) {
             return None;
         }
         let Ok(wallet) = self.bridge_repo.get_or_create_cost_wallet(owner_user_id).await else {
@@ -1026,12 +1300,78 @@ impl TelegramTeamHub {
         run_id: &str,
         synthesis_chars: usize,
     ) {
-        let (agent_id, wallet_type) = Self::classify_team_lead_wallet(team);
-        let tokens_out = ((synthesis_chars as i64) / 4).max(64);
-        let tokens_in = 512_i64;
-        let cost_usd = match wallet_type {
+        let (lead_slot_id, lead_wallet) = Self::classify_team_lead_wallet(team);
+        let has_paid_slot = lead_wallet == WalletType::ApiKey || Self::has_any_api_key_slot(team);
+        let effective_wallet = if has_paid_slot {
+            WalletType::ApiKey
+        } else {
+            WalletType::CliSubscription
+        };
+
+        let slot_econs: HashMap<String, _> = self
+            .bridge_repo
+            .list_team_slot_economy(&team.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.slot_id.clone(), r))
+            .collect();
+
+        let mut measured_in_tokens = 0_i64;
+        let mut measured_out_tokens = 0_i64;
+        let mut measured_api_cost_usd = 0.0_f64;
+
+        for member in &team.assistants {
+            let slot_wallet = Self::classify_slot_agent_wallet(member);
+            let (_, total_bytes) = self
+                .bridge_repo
+                .estimate_conversation_tokens_fast(&member.conversation_id)
+                .await
+                .unwrap_or((0, 0));
+            let prev_bytes = slot_econs
+                .get(&member.slot_id)
+                .map(|e| e.last_seen_char_sum)
+                .unwrap_or(0);
+            let wake_chars = slot_econs
+                .get(&member.slot_id)
+                .map(|e| e.delivered_wake_chars)
+                .unwrap_or(0);
+            let delta_bytes = (total_bytes - prev_bytes).max(0);
+            let slot_in = ((delta_bytes / 8) + (wake_chars.max(0) / 4)).max(if delta_bytes > 0 { 16 } else { 0 });
+            let slot_out = (delta_bytes / 8).max(if delta_bytes > 0 { 16 } else { 0 });
+            measured_in_tokens += slot_in;
+            measured_out_tokens += slot_out;
+            if slot_wallet == WalletType::ApiKey {
+                measured_api_cost_usd += estimate_api_token_cost_usd(
+                    WalletType::ApiKey,
+                    &member.model,
+                    slot_in.max(64),
+                    slot_out.max(((synthesis_chars as i64) / 4).max(32)),
+                );
+            }
+        }
+
+        let synth_tokens_out = ((synthesis_chars as i64) / 4).max(32);
+        let final_tokens_in = measured_in_tokens.max(synth_tokens_out.max(64));
+        let final_tokens_out = measured_out_tokens.max(synth_tokens_out);
+        let cost_usd = match effective_wallet {
             WalletType::CliSubscription => 0.0,
-            WalletType::ApiKey => ((tokens_in as f64 * 0.000003) + (tokens_out as f64 * 0.000015)).max(0.01),
+            WalletType::ApiKey => {
+                if measured_api_cost_usd > 0.0 {
+                    measured_api_cost_usd.max(0.0001)
+                } else {
+                    estimate_api_token_cost_usd(
+                        WalletType::ApiKey,
+                        team.assistants
+                            .first()
+                            .map(|a| a.model.as_str())
+                            .unwrap_or("api"),
+                        final_tokens_in,
+                        final_tokens_out,
+                    )
+                    .max(0.0001)
+                }
+            }
         };
 
         if let Ok((wallet, newly_soft, newly_hard)) = self
@@ -1040,10 +1380,10 @@ impl TelegramTeamHub {
                 owner_user_id: owner_user_id.to_owned(),
                 run_id: run_id.to_owned(),
                 team_id: team.id.clone(),
-                agent_id,
-                wallet_type: wallet_type.as_str().to_owned(),
-                tokens_input: tokens_in,
-                tokens_output: tokens_out,
+                agent_id: lead_slot_id,
+                wallet_type: effective_wallet.as_str().to_owned(),
+                tokens_input: final_tokens_in,
+                tokens_output: final_tokens_out,
                 cost_usd,
             })
             .await
@@ -1172,6 +1512,7 @@ impl TelegramTeamHub {
                             reply_to_id: None,
                             origin_telegram_chat: None,
                             wake_targets: None,
+                            live_steering: false,
                         })
                         .await;
                 }
@@ -1440,6 +1781,7 @@ impl TelegramTeamHub {
                 reply_to_id: None,
                 origin_telegram_chat: Some(reply_chat.clone()),
                 wake_targets: None,
+                live_steering: false,
             })
             .await;
 
@@ -1623,9 +1965,31 @@ impl TelegramTeamHub {
             .list_shared_rooms(owner_user_id)
             .await
             .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let teams = self
+            .team_service
+            .list_teams(owner_user_id)
+            .await
+            .unwrap_or_default();
+        let team_map: HashMap<String, TeamResponse> = teams.into_iter().map(|t| (t.id.clone(), t)).collect();
+        let active_dm_room_ids: std::collections::HashSet<String> = self
+            .bridge_repo
+            .list_dm_targets_for_owner(owner_user_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.target_type == "room")
+            .map(|d| d.target_id)
+            .collect();
+
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            if let Ok(dto) = self.hydrate_shared_room_dto(owner_user_id, row).await {
+            if let Ok(dto) = self
+                .hydrate_shared_room_dto_with_maps(owner_user_id, row, &team_map, &active_dm_room_ids)
+                .await
+            {
                 out.push(dto);
             }
         }
@@ -1643,7 +2007,26 @@ impl TelegramTeamHub {
             .await
             .unwrap_or_default();
         let team_map: HashMap<String, TeamResponse> = teams.into_iter().map(|t| (t.id.clone(), t)).collect();
+        let active_dm_room_ids: std::collections::HashSet<String> = self
+            .bridge_repo
+            .list_dm_targets_for_owner(owner_user_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.target_type == "room")
+            .map(|d| d.target_id)
+            .collect();
+        self.hydrate_shared_room_dto_with_maps(owner_user_id, room, &team_map, &active_dm_room_ids)
+            .await
+    }
 
+    async fn hydrate_shared_room_dto_with_maps(
+        &self,
+        owner_user_id: &str,
+        room: CustomSharedRoomRow,
+        team_map: &HashMap<String, TeamResponse>,
+        active_dm_room_ids: &std::collections::HashSet<String>,
+    ) -> Result<SharedRoomDto, String> {
         let member_rows = self
             .bridge_repo
             .list_shared_room_members(&room.id)
@@ -1674,13 +2057,7 @@ impl TelegramTeamHub {
             .unwrap_or_default();
         let first_binding = bindings.first();
 
-        let is_active_dm_target = self
-            .bridge_repo
-            .list_dm_targets_for_owner(owner_user_id)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .any(|d| d.target_type == "room" && d.target_id == room.id);
+        let is_active_dm_target = active_dm_room_ids.contains(&room.id);
 
         Ok(SharedRoomDto {
             id: room.id,
@@ -1741,7 +2118,21 @@ impl TelegramTeamHub {
             .collect())
     }
 
-    fn map_room_task_dto(row: CustomSharedRoomTaskRow, name_map: &HashMap<String, String>) -> SharedRoomTaskDto {
+    pub async fn hydrate_room_task_dto(
+        &self,
+        owner_user_id: &str,
+        row: CustomSharedRoomTaskRow,
+    ) -> SharedRoomTaskDto {
+        let teams = self
+            .team_service
+            .list_teams(owner_user_id)
+            .await
+            .unwrap_or_default();
+        let name_map: HashMap<String, String> = teams.into_iter().map(|t| (t.id, t.name)).collect();
+        Self::map_room_task_dto(row, &name_map)
+    }
+
+    pub fn map_room_task_dto(row: CustomSharedRoomTaskRow, name_map: &HashMap<String, String>) -> SharedRoomTaskDto {
         let blocked_by: Vec<String> = serde_json::from_str(&row.blocked_by_json).unwrap_or_default();
         let artifacts: Vec<StagedRoomArtifact> = serde_json::from_str(&row.artifact_paths_json).unwrap_or_default();
         let from_team_name = row
@@ -1851,14 +2242,15 @@ impl TelegramTeamHub {
             .collect();
 
         let allow_user_local_files = args.sender_type == "user" && args.sender_team_id.is_none();
-        let artifact_batch = stage_room_artifacts_batch(
-            args.room_id,
-            &args.source_files,
-            source_ws,
-            &self.data_dir,
-            &recipient_workspaces,
+        let artifact_batch = stage_room_artifacts_batch_async(
+            args.room_id.to_owned(),
+            args.source_files.clone(),
+            source_ws.map(ToOwned::to_owned),
+            self.data_dir.clone(),
+            recipient_workspaces.clone(),
             allow_user_local_files,
-        )?;
+        )
+        .await?;
         let staged_artifacts = artifact_batch.artifacts;
         let recipient_inbox_paths = artifact_batch.recipient_inbox_paths;
 
@@ -1893,6 +2285,20 @@ impl TelegramTeamHub {
             })
             .collect();
 
+        let recent_msgs = if args.sender_type == "user" {
+            self.bridge_repo
+                .list_shared_room_messages(args.room_id, 6)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let latest_leader_pair: Option<(String, i64)> = recent_msgs
+            .iter()
+            .rev()
+            .find(|m| m.sender_type == "leader" && m.sender_team_id.is_some())
+            .and_then(|m| m.sender_team_id.as_ref().map(|tid| (tid.clone(), m.created_at)));
+
         let mut routed_targets = if args.sender_type == "system" {
             Vec::new()
         } else if let Some(ref allowlist) = args.wake_targets
@@ -1906,6 +2312,12 @@ impl TelegramTeamHub {
                 .list(args.owner_user_id)
                 .await
                 .unwrap_or_default();
+            let api_wallet_hard_blocked = self
+                .bridge_repo
+                .get_or_create_cost_wallet(args.owner_user_id)
+                .await
+                .map(|w| w.is_hard_blocked())
+                .unwrap_or(false);
             let routing_input = RoomRoutingInput {
                 sender_type: args.sender_type,
                 sender_team_id: args.sender_team_id,
@@ -1916,7 +2328,59 @@ impl TelegramTeamHub {
                 members: &participating,
                 room_tasks: &room_tasks,
             };
-            resolve_room_targets(&routing_input, &providers, &self.encryption_key).await
+            let heuristics = RoomRoutingHeuristics {
+                member_role_tags: &[],
+                last_leader_speaker: latest_leader_pair
+                    .as_ref()
+                    .map(|(tid, ts)| (tid.as_str(), *ts)),
+                now_ms: now_ms(),
+                api_wallet_hard_blocked,
+            };
+            let (targets, judge_usage) = resolve_room_targets_smart(
+                &routing_input,
+                &heuristics,
+                &providers,
+                &self.encryption_key,
+                &self.http_client,
+            )
+            .await;
+
+            if let Some(usage) = judge_usage {
+                let judge_cost = estimate_api_token_cost_usd(
+                    WalletType::ApiKey,
+                    &usage.model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                );
+                if let Ok((wallet, _, _)) = self
+                    .bridge_repo
+                    .record_cost_run(RecordCostRunParams {
+                        owner_user_id: args.owner_user_id.to_owned(),
+                        run_id: generate_prefixed_id("jrun"),
+                        team_id: args.room_id.to_owned(),
+                        agent_id: format!("room-judge:{}", usage.model),
+                        wallet_type: WalletType::ApiKey.as_str().to_owned(),
+                        tokens_input: usage.prompt_tokens,
+                        tokens_output: usage.completion_tokens,
+                        cost_usd: judge_cost,
+                    })
+                    .await
+                {
+                    self.event_bus.broadcast(WebSocketMessage::new(
+                        "wallet:spend_updated",
+                        serde_json::json!({
+                            "user_id": args.owner_user_id,
+                            "spent_usd": wallet.api_key_spent_usd,
+                            "budget_limit_usd": wallet.api_key_budget_limit_usd,
+                            "cli_subscription_runs": wallet.cli_subscription_runs_count,
+                            "api_key_runs": wallet.api_key_runs_count,
+                            "soft_warning": wallet.is_soft_warning(),
+                            "hard_blocked": wallet.is_hard_blocked(),
+                        }),
+                    ));
+                }
+            }
+            targets
         };
 
         // Apply Desktop wake-chip allowlist when user muted specific chips
@@ -1998,7 +2462,15 @@ impl TelegramTeamHub {
             .map_err(|e| e.to_string())?;
 
         let msg_dto = Self::map_room_message_dto(saved_row);
-        let updated_room_dto = self.build_shared_room_dto(args.owner_user_id, args.room_id).await?;
+        let mut updated_room_dto = room_dto.clone();
+        updated_room_dto.hop_count_since_human = current_hop;
+        updated_room_dto.updated_at = msg_dto.created_at;
+        if args.sender_type == "leader"
+            && let Some(stid) = args.sender_team_id
+            && let Some(member) = updated_room_dto.members.iter_mut().find(|m| m.team_id == stid)
+        {
+            member.pending_handoff_msg_id = None;
+        }
 
         self.event_bus.broadcast(WebSocketMessage::new(
             "sharedRoom.messageCreated",
@@ -2056,10 +2528,39 @@ impl TelegramTeamHub {
             return Ok((msg_dto, Vec::new()));
         }
 
+        // Offload oversized Shared Room message (> 2,400 chars) to `.shared-inbox/` once for all woken targets
+        let oversized_staged = if !effective_targets.is_empty() && args.content.chars().count() > 2_400 {
+            let saved_chars = args.content.chars().count().saturating_sub(1_200) as i64;
+            for t in &effective_targets {
+                let _ = self
+                    .bridge_repo
+                    .increment_team_economy_savings(&t.team_id, (saved_chars / 4).max(1), 0)
+                    .await;
+            }
+            stage_room_oversized_message_async(
+                args.room_id.to_owned(),
+                msg_id.clone(),
+                args.content.to_owned(),
+                self.data_dir.clone(),
+                recipient_workspaces.clone(),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+
+        let roster_summary: Vec<String> = room_dto
+            .members
+            .iter()
+            .map(|m| format!("@{} (team_id={})", m.team_name, m.team_id))
+            .collect();
+
         // Dispatch wakeups to each routed Team's Lead (enforcing 100% Smart Budget Fuse for metered API-key teams)
         for target in &effective_targets {
-            if let Ok(team_meta) = self.team_service.get_team(args.owner_user_id, &target.team_id).await
-                && let Some((spent, limit)) = self.is_team_api_key_hard_blocked(args.owner_user_id, &team_meta).await
+            let team_meta_opt = self.team_service.get_team(args.owner_user_id, &target.team_id).await.ok();
+            if let Some(ref team_meta) = team_meta_opt
+                && let Some((spent, limit)) = self.is_team_api_key_hard_blocked(args.owner_user_id, team_meta).await
             {
                 let fuse_notice = HubI18n::wallet_hard_blocked_notice(locale, &team_meta.name, spent, limit);
                 if let Ok(saved_fuse) = self
@@ -2095,6 +2596,9 @@ impl TelegramTeamHub {
                 .bridge_repo
                 .set_member_pending_handoff(args.room_id, &target.team_id, Some(&msg_id), current_hop)
                 .await;
+            // Suppress duplicate `[PENDING ROOM HANDOFF]` banner on Turn 1 (wake_prompt already carries room_id & instructions)
+            self.delivered_handoff_banners
+                .insert((args.room_id.to_owned(), target.team_id.clone()), msg_id.clone());
 
             self.active_runs.insert(
                 target.team_id.clone(),
@@ -2116,7 +2620,7 @@ impl TelegramTeamHub {
                 .map(|m| m.workspace.clone())
                 .unwrap_or_default();
 
-            let local_inbox_files: Vec<String> = if staged_artifacts.is_empty() {
+            let mut local_inbox_files: Vec<String> = if staged_artifacts.is_empty() {
                 Vec::new()
             } else {
                 recipient_inbox_paths
@@ -2125,42 +2629,88 @@ impl TelegramTeamHub {
                     .unwrap_or_else(|| staged_artifacts.iter().map(|a| a.staged_path.clone()).collect())
             };
 
+            let rendered_body = if let Some((ref fallback_path, ref per_ws)) = oversized_staged {
+                let delivered_md = per_ws
+                    .get(member_ws.trim())
+                    .cloned()
+                    .unwrap_or_else(|| fallback_path.clone());
+                if !local_inbox_files.contains(&delivered_md) {
+                    local_inbox_files.push(delivered_md.clone());
+                }
+                let excerpt: String = args.content.chars().take(1_200).collect();
+                format!(
+                    "{excerpt}…\n[Full message ({len} chars) staged at `{delivered_md}`]",
+                    len = args.content.chars().count()
+                )
+            } else {
+                args.content.to_owned()
+            };
+
+            let coalesced_task_note = if let Some((_, pending_task)) = self
+                .pending_task_wakes
+                .remove(&(args.room_id.to_owned(), target.team_id.clone()))
+            {
+                let _ = self
+                    .bridge_repo
+                    .increment_team_economy_savings(&target.team_id, 220, 1)
+                    .await;
+                let desc_line = if pending_task.description.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", pending_task.description.trim())
+                };
+                format!(
+                    "\n[Coalesced Cross-Team Task: task_id=\"{}\" title=\"{}\"{} -> call `team_room_task_update` with status=\"in_review\" when ready]\n",
+                    pending_task.task_id, pending_task.title, desc_line
+                )
+            } else {
+                String::new()
+            };
+
             let files_note = if local_inbox_files.is_empty() {
                 String::new()
             } else {
                 format!(
-                    "\nShared artifacts copied to your workspace inbox:\n- {}\n",
+                    "\nShared artifacts in workspace inbox:\n- {}\n",
                     local_inbox_files.join("\n- ")
                 )
             };
 
-            let roster_summary: Vec<String> = room_dto
-                .members
-                .iter()
-                .map(|m| format!("@{} (team_id={})", m.team_name, m.team_id))
-                .collect();
-
+            // Cache-friendly static room header FIRST; dynamic per-turn msg_id/sender/body LAST
             let wake_prompt = format!(
                 "[SHARED ROOM #{room_name} | room_id=\"{room_id}\"]\n\
-                 From: {sender_label}\n\
-                 Routing: tier {tier} ({reason})\n\
                  Room Participants: {roster}\n\
                  {rules_line}\
-                 \nMessage:\n{body}\n{files_note}\n\
+                 [Protocol]: Coordinate with your team if needed, then deliver back via `team_room_post` (room_id=\"{room_id}\"). For cross-team tasks, set status=\"in_review\" via `team_room_task_update` (Done is human-only).\n\
                  ---\n\
-                 [Action Required]: Coordinate with your team if needed, then post your response or deliverables back to Shared Room \"{room_name}\" using `team_room_post` (with `room_id`: \"{room_id}\"). To assign or update cross-team dependencies, use `team_room_task_create` / `team_room_task_update`.",
+                 msg_id: {msg_id} | From: {sender_label} | Routing: tier {tier} ({reason})\n\
+                 {coalesced_task_note}\
+                 Message:\n{rendered_body}\n{files_note}",
                 room_name = room_dto.name,
                 room_id = args.room_id,
-                tier = target.tier,
-                reason = target.reason,
                 roster = roster_summary.join(", "),
                 rules_line = if room_dto.rules.trim().is_empty() {
                     String::new()
                 } else {
                     format!("Room Rules: {}\n", room_dto.rules.trim())
                 },
-                body = args.content,
+                tier = target.tier,
+                reason = target.reason,
             );
+
+            if let Some(ref team_meta) = team_meta_opt {
+                let (lead_slot_id, _, _) = Self::find_lead_slot_info(team_meta);
+                let _ = self
+                    .bridge_repo
+                    .record_slot_wake_delivery(
+                        &target.team_id,
+                        &lead_slot_id,
+                        args.owner_user_id,
+                        "lead",
+                        wake_prompt.chars().count() as i64,
+                    )
+                    .await;
+            }
 
             let file_refs = if local_inbox_files.is_empty() {
                 None
@@ -2176,7 +2726,17 @@ impl TelegramTeamHub {
             let team_svc = Arc::clone(&self.team_service);
             let uid = args.owner_user_id.to_owned();
             let tid = target.team_id.clone();
+            let live_steering = args.live_steering && args.sender_type == "user";
+            let lead_slot_opt = team_meta_opt.as_ref().map(|tm| Self::find_lead_slot_info(tm).0);
             tokio::spawn(async move {
+                if live_steering
+                    && let Some(ref lead_slot) = lead_slot_opt
+                    && team_svc.is_slot_turn_running(&tid, lead_slot).await
+                {
+                    let _ = team_svc
+                        .interrupt_or_restart_slot_for_maintenance(&uid, &tid, lead_slot, true)
+                        .await;
+                }
                 if let Err(err) = team_svc.send_message(&uid, &tid, &wake_prompt, file_refs).await {
                     warn!(team_id = %tid, error = %err, "failed to wake target Team Lead from Shared Room");
                 }
@@ -2337,14 +2897,15 @@ impl TelegramTeamHub {
         validate_task_dependencies(&task_id, &blocked_by, &existing_tasks)?;
 
         let allow_user_local_files = from_team_id.is_none();
-        let staged = stage_room_artifacts_batch(
-            room_id,
-            &files,
-            source_ws,
-            &self.data_dir,
-            &recipient_ws,
+        let staged = stage_room_artifacts_batch_async(
+            room_id.to_owned(),
+            files,
+            source_ws.map(ToOwned::to_owned),
+            self.data_dir.clone(),
+            recipient_ws,
             allow_user_local_files,
-        )?
+        )
+        .await?
         .artifacts;
 
         let created = self
@@ -2378,30 +2939,79 @@ impl TelegramTeamHub {
             }),
         ));
 
-        // If this specific task is NOT gated by unfinished `blocked_by` tasks, wake the assignee Team's Lead immediately!
+        // If this specific task is NOT gated by unfinished `blocked_by` tasks, schedule a 650ms coalescable
+        // wake on the assignee Team's Lead (so `team_room_task_create` + `team_room_post` merge into 1 turn!)
         let all_tasks = self
             .bridge_repo
             .list_shared_room_tasks(room_id)
             .await
             .unwrap_or_default();
         if !is_task_blocked(&created, &all_tasks) {
-            let wake_msg = format!(
-                "[CROSS-TEAM TASK ASSIGNED in #{room_name} | room_id=\"{room_id}\" | task_id=\"{task_id}\"]\n\
-                 Title: {title}\n\
-                 Description: {description}\n\
-                 Please execute with your team and call `team_room_task_update` (task_id=\"{task_id}\", status=\"completed\") + `team_room_post` when finished.",
-                room_name = room_dto.name,
-            );
             let _ = self
                 .bridge_repo
                 .set_member_pending_handoff(room_id, &to_team_id, Some(&task_id), room_dto.hop_count_since_human)
                 .await;
-            let team_svc = Arc::clone(&self.team_service);
-            let uid = owner_user_id.to_owned();
-            let tid = to_team_id.clone();
-            tokio::spawn(async move {
-                let _ = team_svc.send_message(&uid, &tid, &wake_msg, None).await;
-            });
+
+            // Enforce max_hops for agent-originated task wakes
+            let hop_blocked = from_team_id.is_some() && room_dto.hop_count_since_human >= room_dto.max_hops;
+            let fuse_blocked = if let Ok(team_meta) = self.team_service.get_team(owner_user_id, &to_team_id).await {
+                self.is_team_api_key_hard_blocked(owner_user_id, &team_meta)
+                    .await
+                    .is_some()
+            } else {
+                false
+            };
+
+            if !hop_blocked && !fuse_blocked {
+                self.pending_task_wakes.insert(
+                    (room_id.to_owned(), to_team_id.clone()),
+                    PendingCrossTeamTaskWake {
+                        task_id: task_id.clone(),
+                        title: title.trim().to_owned(),
+                        description: description.to_owned(),
+                        room_name: room_dto.name.clone(),
+                    },
+                );
+
+                let pending_map = Arc::clone(&self.pending_task_wakes);
+                let team_svc = Arc::clone(&self.team_service);
+                let bridge_repo = Arc::clone(&self.bridge_repo);
+                let uid = owner_user_id.to_owned();
+                let rid = room_id.to_owned();
+                let tid = to_team_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                    let Some((_, pending)) = pending_map.remove(&(rid.clone(), tid.clone())) else {
+                        // Coalesced into a companion `team_room_post` wake!
+                        return;
+                    };
+                    let wake_msg = format!(
+                        "[CROSS-TEAM TASK ASSIGNED in #{room_name} | room_id=\"{rid}\"]\n\
+                         [Protocol]: Execute with your team, then call `team_room_task_update` (task_id=\"{task_id}\", status=\"in_review\") + `team_room_post` (Done is human-only).\n\
+                         ---\n\
+                         task_id: {task_id}\n\
+                         Title: {title}\n\
+                         Description: {desc}",
+                        room_name = pending.room_name,
+                        task_id = pending.task_id,
+                        title = pending.title,
+                        desc = pending.description,
+                    );
+                    if let Ok(team_meta) = team_svc.get_team(&uid, &tid).await {
+                        let (lead_slot_id, _, _) = Self::find_lead_slot_info(&team_meta);
+                        let _ = bridge_repo
+                            .record_slot_wake_delivery(
+                                &tid,
+                                &lead_slot_id,
+                                &uid,
+                                "lead",
+                                wake_msg.chars().count() as i64,
+                            )
+                            .await;
+                    }
+                    let _ = team_svc.send_message(&uid, &tid, &wake_msg, None).await;
+                });
+            }
         }
 
         Ok(dto)
@@ -2464,14 +3074,15 @@ impl TelegramTeamHub {
                 .map(|m| m.workspace.clone())
                 .collect();
             let allow_user_local_files = actor_team_id.is_none();
-            let newly_staged = stage_room_artifacts_batch(
-                &existing.room_id,
-                &files,
-                source_ws,
-                &self.data_dir,
-                &recipient_ws,
+            let newly_staged = stage_room_artifacts_batch_async(
+                existing.room_id.clone(),
+                files,
+                source_ws.map(ToOwned::to_owned),
+                self.data_dir.clone(),
+                recipient_ws,
                 allow_user_local_files,
-            )?
+            )
+            .await?
             .artifacts;
             merged_artifacts.extend(newly_staged);
         }
@@ -2509,9 +3120,109 @@ impl TelegramTeamHub {
             }),
         ));
 
-        // Closed-Loop Layer 3: If this task newly transitioned to `completed`, wake any downstream Team
-        // whose `blocked_by` task just became unblocked!
-        if existing.status != "completed" && updated.status == "completed" {
+        // Feature F19: When an agent submits `status == "in_review"`, emit a human-only `approve_done`
+        // ActionInbox card (synced with optional Telegram inline Approve button) so a human can finalize `completed`.
+        if existing.status != "in_review" && updated.status == "in_review" {
+            let approve_token = self
+                .bridge_repo
+                .create_action_token(
+                    owner_user_id,
+                    CustomTargetType::Room,
+                    &existing.room_id,
+                    "approve_done",
+                    &serde_json::json!({
+                        "task_id": updated.id,
+                        "room_id": existing.room_id,
+                    }),
+                    None,
+                )
+                .await
+                .ok();
+
+            let mut tg_chat_saved: Option<String> = None;
+            let mut tg_msg_saved: Option<String> = None;
+            if let (Some(tok), Some(tg_dest)) = (
+                approve_token.as_deref(),
+                self.resolve_room_telegram_destination(owner_user_id, &existing.room_id)
+                    .await,
+            ) {
+                let summary_snip = updated
+                    .result_summary
+                    .as_deref()
+                    .unwrap_or("Ready for human review");
+                let review_md = format!(
+                    "📋 **[#{} · Task Ready for Review]**\n**{}**\n\n{}",
+                    room_dto.name, updated.title, summary_snip
+                );
+                let btns = vec![vec![ActionButton {
+                    label: "Approve Done".to_owned(),
+                    action: format!("t:{tok}"),
+                    params: None,
+                }]];
+                if let Ok(sent_ids) = self
+                    .send_formatted_telegram_message(
+                        owner_user_id,
+                        &tg_dest,
+                        &review_md,
+                        Some(btns),
+                        None,
+                        CustomTargetType::Room,
+                        &existing.room_id,
+                    )
+                    .await
+                    && let Some(last_mid) = sent_ids.last()
+                {
+                    tg_chat_saved = Some(tg_dest);
+                    tg_msg_saved = Some(last_mid.clone());
+                }
+            }
+
+            if let Ok(card) = self
+                .bridge_repo
+                .create_action_inbox_item(CreateActionInboxParams {
+                    id: None,
+                    owner_user_id: owner_user_id.to_owned(),
+                    category: "approve_done".to_owned(),
+                    title: format!("Review Done: {}", updated.title),
+                    summary: updated
+                        .result_summary
+                        .clone()
+                        .unwrap_or_else(|| format!("Task '{}' in #{} is ready for human Done approval.", updated.title, room_dto.name)),
+                    details_json: serde_json::json!({
+                        "task_id": updated.id,
+                        "task_title": updated.title,
+                        "title": updated.title,
+                        "room_id": existing.room_id,
+                        "room_name": room_dto.name,
+                        "to_team_id": updated.to_team_id,
+                        "to_team_name": dto.to_team_name,
+                        "team_name": dto.to_team_name,
+                        "result_summary": updated.result_summary,
+                    })
+                    .to_string(),
+                    target_type: Some("room".to_owned()),
+                    target_id: existing.room_id.clone(),
+                    action_token: approve_token,
+                    telegram_chat_id: tg_chat_saved,
+                    telegram_msg_id: tg_msg_saved,
+                })
+                .await
+            {
+                self.event_bus.broadcast(WebSocketMessage::new(
+                    "inbox:item_added",
+                    serde_json::json!({
+                        "user_id": owner_user_id,
+                        "item": ActionInboxCardDto::from_row(card),
+                    }),
+                ));
+            }
+        }
+
+        // Closed-Loop Layer 3: If this task newly transitioned into a dependency-satisfying state
+        // (`in_review`, `completed`, or `done`), wake any downstream Team whose `blocked_by` task just unblocked!
+        let was_satisfying = matches!(existing.status.as_str(), "in_review" | "completed" | "done");
+        let now_satisfying = matches!(updated.status.as_str(), "in_review" | "completed" | "done");
+        if !was_satisfying && now_satisfying {
             let after_tasks = self
                 .bridge_repo
                 .list_shared_room_tasks(&existing.room_id)
@@ -2519,7 +3230,7 @@ impl TelegramTeamHub {
                 .unwrap_or_default();
 
             for candidate in &after_tasks {
-                if matches!(candidate.status.as_str(), "completed" | "cancelled") {
+                if matches!(candidate.status.as_str(), "in_review" | "completed" | "done" | "cancelled") {
                     continue;
                 }
                 let deps: Vec<String> = serde_json::from_str(&candidate.blocked_by_json).unwrap_or_default();
@@ -2542,6 +3253,21 @@ impl TelegramTeamHub {
                         )
                         .await;
 
+                    // Respect room max_hops and Paid API 100% Safety Fuse before waking downstream team
+                    if actor_team_id.is_some() && room_dto.hop_count_since_human >= room_dto.max_hops {
+                        continue;
+                    }
+                    let downstream_team = self
+                        .team_service
+                        .get_team(owner_user_id, &candidate.to_team_id)
+                        .await
+                        .ok();
+                    if let Some(ref tm) = downstream_team
+                        && self.is_team_api_key_hard_blocked(owner_user_id, tm).await.is_some()
+                    {
+                        continue;
+                    }
+
                     let summary_line = updated
                         .result_summary
                         .as_deref()
@@ -2549,18 +3275,33 @@ impl TelegramTeamHub {
                         .unwrap_or_default();
                     let wake_prompt = format!(
                         "[CROSS-TEAM TASK UNBLOCKED in #{room_name} | room_id=\"{room_id}\"]\n\
-                         Upstream dependency `{upstream_id}` (\"{upstream_title}\") is now COMPLETED!\n\
+                         [Protocol]: Check `.shared-inbox/{safe_room}/` for upstream artifacts, execute with your team, and call `team_room_task_update` (status=\"in_review\") + `team_room_post` when ready.\n\
+                         ---\n\
+                         Upstream `{upstream_id}` (\"{upstream_title}\") status: {upstream_status}\n\
                          {summary_line}\
-                         Your Cross-Team Task `{task_id}` (\"{task_title}\") is now UNBLOCKED and ready to start.\n\
-                         Check `.shared-inbox/{safe_room}/` for any upstream artifacts, execute with your team, and call `team_room_task_update` + `team_room_post` when done.",
+                         Unblocked Task `{task_id}` (\"{task_title}\")",
                         room_name = room_dto.name,
                         room_id = existing.room_id,
                         upstream_id = updated.id,
                         upstream_title = updated.title,
+                        upstream_status = updated.status,
                         task_id = candidate.id,
                         task_title = candidate.title,
                         safe_room = sanitize_file_name(&existing.room_id),
                     );
+                    if let Some(ref tm) = downstream_team {
+                        let (lead_slot_id, _, _) = Self::find_lead_slot_info(tm);
+                        let _ = self
+                            .bridge_repo
+                            .record_slot_wake_delivery(
+                                &candidate.to_team_id,
+                                &lead_slot_id,
+                                owner_user_id,
+                                "lead",
+                                wake_prompt.chars().count() as i64,
+                            )
+                            .await;
+                    }
                     let team_svc = Arc::clone(&self.team_service);
                     let uid = owner_user_id.to_owned();
                     let tid = candidate.to_team_id.clone();
@@ -3440,8 +4181,8 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
             }
 
             // Mutating one-shot actions guarded by `consume_action_token_once`
-            "approve_continue" | "stop_run" | "retry_member" | "allow_more_hops"
-            | "worktree_merge" | "inbox_resolve" | "inbox_choice" | "budget_ack"
+            "approve_continue" | "stop_run" | "retry_member" | "quota_fallback" | "allow_more_hops"
+            | "worktree_merge" | "approve_done" | "inbox_resolve" | "inbox_choice" | "budget_ack"
             | "switch_team_model" | "compact_team_now" => {
                 let consumed = self.bridge_repo.consume_action_token_once(token).await?;
                 if !consumed {
@@ -3570,6 +4311,73 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         })
                     }
 
+                    "quota_fallback" => {
+                        let inbox_details: serde_json::Value = resolved_inbox_item
+                            .as_ref()
+                            .and_then(|item| serde_json::from_str(&item.details_json).ok())
+                            .unwrap_or_default();
+                        let slot_id_opt = payload
+                            .get("slot_id")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| inbox_details.get("slot_id").and_then(serde_json::Value::as_str));
+                        let fb_target_opt = payload
+                            .get("fallback_target")
+                            .or_else(|| inbox_details.get("fallback_target"));
+
+                        let _ = self
+                            .execute_quota_fallback_resolution(
+                                owner_user_id,
+                                &row.target_id,
+                                slot_id_opt,
+                                fb_target_opt,
+                            )
+                            .await;
+
+                        let done_md = match locale {
+                            HubLocale::ViVn => "✅ **Đã chuyển sang CLI $0 và khởi động lại phiên chạy qua Telegram!**",
+                            HubLocale::EnUs => "✅ **Switched slot to $0 CLI and restarted runtime via Telegram!**",
+                        };
+                        let html = markdown_to_telegram_html(done_md);
+                        if let Some(ref mid) = context.message_id {
+                            let base_chat = split_chat_and_thread(&context.chat_id).0;
+                            let _ = self
+                                .channel_manager
+                                .edit_message(
+                                    owner_user_id,
+                                    "telegram",
+                                    base_chat,
+                                    mid,
+                                    UnifiedOutgoingMessage {
+                                        message_type: OutgoingMessageType::Text,
+                                        text: Some(html.clone()),
+                                        parse_mode: Some(ParseMode::HTML),
+                                        buttons: None,
+                                        keyboard: None,
+                                        image_url: None,
+                                        file_url: None,
+                                        file_name: None,
+                                        media_actions: None,
+                                        reply_to_message_id: None,
+                                        silent: None,
+                                    },
+                                )
+                                .await;
+                        }
+                        Ok(ActionResponse {
+                            text: Some(html),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: if context.message_id.is_some() {
+                                ActionBehavior::Edit
+                            } else {
+                                ActionBehavior::Send
+                            },
+                            toast: None,
+                            edit_message_id: context.message_id.clone(),
+                        })
+                    }
+
                     "allow_more_hops" => {
                         let _ = self
                             .bridge_repo
@@ -3644,6 +4452,43 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                         let text = match locale {
                             HubLocale::ViVn => "✅ **Đã duyệt gộp nhánh Git Worktree qua Telegram!**",
                             HubLocale::EnUs => "✅ **Approved Git Worktree squash merge via Telegram!**",
+                        };
+                        Ok(ActionResponse {
+                            text: Some(markdown_to_telegram_html(text)),
+                            parse_mode: Some(ParseMode::HTML),
+                            buttons: None,
+                            keyboard: None,
+                            behavior: ActionBehavior::Send,
+                            toast: None,
+                            edit_message_id: None,
+                        })
+                    }
+
+                    "approve_done" => {
+                        let inbox_details: serde_json::Value = resolved_inbox_item
+                            .as_ref()
+                            .and_then(|item| serde_json::from_str(&item.details_json).ok())
+                            .unwrap_or_default();
+                        let task_id_opt = payload
+                            .get("task_id")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| inbox_details.get("task_id").and_then(serde_json::Value::as_str));
+                        if let Some(tid) = task_id_opt {
+                            let _ = self
+                                .update_cross_team_task(
+                                    owner_user_id,
+                                    tid,
+                                    None,
+                                    Some("completed".to_owned()),
+                                    None,
+                                    None,
+                                    Vec::new(),
+                                )
+                                .await;
+                        }
+                        let text = match locale {
+                            HubLocale::ViVn => "✅ **Đã duyệt hoàn tất (Done) tác vụ liên team qua Telegram!**",
+                            HubLocale::EnUs => "✅ **Approved cross-team task as Done via Telegram!**",
                         };
                         Ok(ActionResponse {
                             text: Some(markdown_to_telegram_html(text)),
@@ -3779,6 +4624,7 @@ impl ChannelTeamBridgePort for TelegramTeamHub {
                                 &row.target_id,
                                 crate::bridge::context_compactor::SwitchTeamModelsRequest {
                                     scope: Some(scope.clone()),
+                                    preset: None,
                                     target: Some(crate::bridge::context_compactor::ModelTargetSpec {
                                         backend,
                                         provider_id,
@@ -4324,28 +5170,113 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         room_id: Option<&str>,
         limit: usize,
     ) -> Result<serde_json::Value, String> {
+        self.room_read_delta(user_id, team_id, room_id, limit, None, false)
+            .await
+    }
+
+    async fn room_read_delta(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        room_id: Option<&str>,
+        limit: usize,
+        since_msg_id: Option<&str>,
+        include_completed_tasks: bool,
+    ) -> Result<serde_json::Value, String> {
         let resolved_room_id = match room_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => id.to_owned(),
             None => self.resolve_default_room_for_team(user_id, team_id).await?,
         };
 
         let room_dto = self.build_shared_room_dto(user_id, &resolved_room_id).await?;
-        let messages: Vec<SharedRoomMessageDto> = self
+        let capped_limit = limit.clamp(1, 50) as i64;
+        let fetched_messages: Vec<SharedRoomMessageDto> = self
             .bridge_repo
-            .list_shared_room_messages(&resolved_room_id, limit.clamp(1, 200) as i64)
+            .list_shared_room_messages(&resolved_room_id, capped_limit)
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(Self::map_room_message_dto)
             .collect();
-        let tasks = self
+
+        let explicit_cursor = since_msg_id.map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
+        let cursor_key = (resolved_room_id.clone(), team_id.to_owned());
+        let prev_cursor = self.last_room_read_cursor.get(&cursor_key).map(|v| v.clone());
+        if let Some(last_msg) = fetched_messages.last() {
+            self.last_room_read_cursor
+                .insert(cursor_key, last_msg.id.clone());
+        }
+
+        // Honor explicit `since_msg_id` directly (even if caught up -> empty delta),
+        // otherwise fall back to per-team `prev_cursor` when newer messages exist.
+        let mut delta_applied = false;
+        let effective_cursor: Option<String>;
+        let selected_messages: Vec<SharedRoomMessageDto> = if let Some(cur_id) = explicit_cursor {
+            effective_cursor = Some(cur_id.clone());
+            if let Some(pos) = fetched_messages.iter().position(|m| m.id == cur_id) {
+                delta_applied = true;
+                fetched_messages[(pos + 1)..].to_vec()
+            } else {
+                fetched_messages
+            }
+        } else if let Some(ref cur_id) = prev_cursor
+            && let Some(pos) = fetched_messages.iter().position(|m| m.id == *cur_id)
+            && pos + 1 < fetched_messages.len()
+        {
+            effective_cursor = Some(cur_id.clone());
+            delta_applied = true;
+            fetched_messages[(pos + 1)..].to_vec()
+        } else {
+            effective_cursor = prev_cursor;
+            fetched_messages
+        };
+
+        // Digest cap: truncate individual message bodies to <= 800 chars in MCP room_read to prevent context bloat
+        let mut chars_saved = 0_i64;
+        let messages: Vec<SharedRoomMessageDto> = selected_messages
+            .into_iter()
+            .map(|mut m| {
+                let char_len = m.content.chars().count();
+                if char_len > 800 {
+                    chars_saved += (char_len - 800) as i64;
+                    let snippet: String = m.content.chars().take(800).collect();
+                    m.content = format!("{snippet}… [truncated {} chars]", char_len - 800);
+                }
+                m
+            })
+            .collect();
+
+        if chars_saved > 0 || delta_applied {
+            let bonus_saved = (chars_saved / 4) + if delta_applied { 120 } else { 0 };
+            let _ = self
+                .bridge_repo
+                .increment_team_economy_savings(team_id, bonus_saved.max(1), 0)
+                .await;
+        }
+
+        let all_tasks = self
             .list_shared_room_task_dtos(user_id, &resolved_room_id)
             .await?;
+        let total_tasks = all_tasks.len();
+        let (returned_tasks, completed_tasks_omitted) = if include_completed_tasks {
+            (all_tasks, 0)
+        } else {
+            let active_tasks: Vec<SharedRoomTaskDto> = all_tasks
+                .into_iter()
+                .filter(|t| !matches!(t.status.as_str(), "completed" | "done" | "cancelled"))
+                .collect();
+            let omitted = total_tasks.saturating_sub(active_tasks.len());
+            (active_tasks, omitted)
+        };
 
         Ok(serde_json::json!({
             "room": room_dto,
             "messages": messages,
-            "tasks": tasks,
+            "tasks": returned_tasks,
+            "delta_from_cursor": effective_cursor,
+            "delta_applied": delta_applied,
+            "completed_tasks_omitted": completed_tasks_omitted,
+            "include_completed_tasks": include_completed_tasks,
         }))
     }
 
@@ -4375,6 +5306,7 @@ impl TeamExternalBridgePort for TelegramTeamHub {
                 reply_to_id: None,
                 origin_telegram_chat: None,
                 wake_targets: None,
+                live_steering: false,
             })
             .await?;
 
@@ -4470,20 +5402,87 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         }
         let mut lines = Vec::new();
         for (room, member) in pending {
+            let msg_id = member.pending_handoff_msg_id.unwrap_or_default();
+            // Turn-1 deduplication: skip repeating the handoff banner on the very wake turn where `wake_prompt`
+            // already delivered the room context and `team_room_post` instructions!
+            if let Some((_, delivered_msg_id)) = self
+                .delivered_handoff_banners
+                .remove(&(room.id.clone(), team_id.to_owned()))
+                && (delivered_msg_id == msg_id || delivered_msg_id.is_empty())
+            {
+                let _ = self
+                    .bridge_repo
+                    .increment_team_economy_savings(team_id, 45, 0)
+                    .await;
+                continue;
+            }
+            // Cache-friendly static instruction prefix first; dynamic IDs at the tail
             lines.push(format!(
-                "[PENDING ROOM HANDOFF -> #{name} (room_id=\"{id}\", msg_id=\"{msg_id}\")]: When your team finishes this work or reaches a decision, call `team_room_post` (room_id=\"{id}\") to deliver your response/files back to the Shared Room.",
+                "[PENDING ROOM HANDOFF]: When your team finishes this work or reaches a decision, call `team_room_post` to deliver your response/files back to the Shared Room | room=\"#{name}\" room_id=\"{id}\" msg_id=\"{msg_id}\"",
                 name = room.name,
                 id = room.id,
-                msg_id = member.pending_handoff_msg_id.unwrap_or_default(),
             ));
         }
-        Some(lines.join("\n"))
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
     }
 
     fn on_team_delegation(&self, team_id: &str) {
         if let Some(mut entry) = self.active_runs.get_mut(team_id) {
             entry.delegated = true;
         }
+    }
+
+    async fn has_pending_slot_handover(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        _conversation_id: &str,
+    ) -> bool {
+        self.bridge_repo
+            .get_team_context_anchor(team_id, slot_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|anchor| anchor.pending_handover != 0)
+    }
+
+    async fn slot_requires_fresh_role_prompt(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        conversation_id: &str,
+    ) -> bool {
+        if self
+            .has_pending_slot_handover(user_id, team_id, slot_id, conversation_id)
+            .await
+        {
+            return true;
+        }
+        self.bridge_repo
+            .slot_has_empty_acp_session(user_id, conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
+    async fn rearm_slot_handover(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        _conversation_id: &str,
+    ) {
+        let _ = self
+            .bridge_repo
+            .rearm_pending_slot_handover(team_id, slot_id)
+            .await;
     }
 
     async fn pending_slot_handover_banner(
@@ -4502,7 +5501,12 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         if trimmed.is_empty() {
             return None;
         }
-        Some(format!("## Anchored Session Handover\n\n{trimmed}"))
+        Some(format!(
+            "## Anchored Session Handover\n\n{trimmed}\n\n\
+             > **Compaction Continuity Note**: Your prior CLI session was rolled over into this fresh context window. \
+             Follow your `<team_Prompt>` role & tool rules above (when using Team CLI transport, pipe JSON via stdin to \
+             `$env:AIONUI_HELPER_BIN` on Windows PowerShell or `\"$AIONUI_HELPER_BIN\"` on POSIX sh)."
+        ))
     }
 
     fn on_slot_turn_settled(
@@ -4521,6 +5525,35 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         let cid = conversation_id.to_owned();
         tokio::spawn(async move {
             orch.handle_slot_turn_settled(&uid, &tid, &sid, &cid).await;
+        });
+    }
+
+    fn on_slot_wake_delivered(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        _conversation_id: &str,
+        delivered_chars: usize,
+        coalesced_wakes_saved: u64,
+    ) {
+        let bridge_repo = Arc::clone(&self.bridge_repo);
+        let uid = user_id.to_owned();
+        let tid = team_id.to_owned();
+        let sid = slot_id.to_owned();
+        let chars = delivered_chars as i64;
+        let saved_wakes = coalesced_wakes_saved as i64;
+        tokio::spawn(async move {
+            if chars > 0 {
+                let _ = bridge_repo
+                    .record_slot_wake_delivery(&tid, &sid, &uid, "member", chars)
+                    .await;
+            }
+            if saved_wakes > 0 {
+                let _ = bridge_repo
+                    .increment_team_economy_savings(&tid, saved_wakes * 350, saved_wakes)
+                    .await;
+            }
         });
     }
 }

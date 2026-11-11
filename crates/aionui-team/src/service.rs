@@ -528,6 +528,24 @@ impl TeamSessionService {
         self.external_bridge.get()
     }
 
+    pub(crate) fn include_shared_room_tools(&self, team_id: &str) -> bool {
+        let Some(ext) = self.external_bridge() else {
+            return false;
+        };
+        let user_id = self
+            .sessions
+            .get(team_id)
+            .map(|entry| entry.session.user_id().to_owned())
+            .unwrap_or_default();
+        ext.has_shared_room_binding(&user_id, team_id)
+    }
+
+    pub(crate) fn team_workspace_for_session(&self, team_id: &str) -> Option<String> {
+        self.sessions
+            .get(team_id)
+            .and_then(|entry| entry.session.team_workspace().map(str::to_owned))
+    }
+
     pub async fn resolve_team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
         self.team_owner_user_id(team_id).await
     }
@@ -807,13 +825,14 @@ impl TeamSessionService {
 
         // Project-bind side branch (best-effort; never affects team creation).
         let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &team_workspace).await;
+        let workspace_mode = crate::types::normalize_workspace_mode(req.workspace_mode.as_deref());
 
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.clone(),
             workspace: team_workspace.clone(),
-            workspace_mode: "shared".into(),
+            workspace_mode: workspace_mode.clone(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
@@ -829,6 +848,7 @@ impl TeamSessionService {
             id: team_id,
             name: req.name,
             workspace: team_workspace,
+            workspace_mode,
             agents,
             lead_agent_id,
             created_at: now,
@@ -2394,6 +2414,7 @@ impl TeamSessionService {
     /// wake injects the full Team Governance & Role prompt alongside any handover.
     pub async fn mark_slot_needs_role_prompt(&self, team_id: &str, slot_id: &str) {
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            session.reset_slot_prompt_state(slot_id);
             let _ = session.scheduler().require_role_prompt(slot_id).await;
         }
     }
@@ -3133,6 +3154,7 @@ impl TeamSessionService {
             preserved_unread_count,
             "team member context reset anchor cleared"
         );
+        session.reset_slot_prompt_state(slot_id);
         let role_prompt_error = session.scheduler().require_role_prompt(slot_id).await.err();
         if let Some(error) = &role_prompt_error {
             warn!(
@@ -3655,6 +3677,7 @@ mod tests {
                 },
             ],
             workspace: None,
+            workspace_mode: None,
         }
     }
 
@@ -5200,5 +5223,34 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn create_team_persists_isolated_workspace_mode_and_defaults_to_shared() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+
+        let mut isolated_req = single_agent_team_request("Isolated Team");
+        isolated_req.workspace_mode = Some("isolated".into());
+        let isolated = svc.create_team("user-test", isolated_req).await.unwrap();
+        assert_eq!(isolated.workspace_mode, "isolated");
+
+        let stored = repo
+            .get_team("user-test", &isolated.id)
+            .await
+            .unwrap()
+            .expect("team row");
+        assert_eq!(stored.workspace_mode, "isolated");
+
+        let fetched = svc.get_team("user-test", &isolated.id).await.unwrap();
+        assert_eq!(fetched.workspace_mode, "isolated");
+
+        let mut empty_req = single_agent_team_request("Default Shared Team");
+        empty_req.workspace_mode = Some("   ".into());
+        let shared = svc.create_team("user-test", empty_req).await.unwrap();
+        assert_eq!(shared.workspace_mode, "shared");
+
+        let listed = svc.list_teams("user-test").await.unwrap();
+        assert!(listed.iter().any(|t| t.id == isolated.id && t.workspace_mode == "isolated"));
+        assert!(listed.iter().any(|t| t.id == shared.id && t.workspace_mode == "shared"));
     }
 }

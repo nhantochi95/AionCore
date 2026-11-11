@@ -153,11 +153,24 @@ impl TeamAgent {
 // Team
 // ---------------------------------------------------------------------------
 
+fn default_workspace_mode() -> String {
+    "shared".to_owned()
+}
+
+pub fn normalize_workspace_mode(mode: Option<&str>) -> String {
+    match mode.map(str::trim) {
+        Some(m) if m.eq_ignore_ascii_case("isolated") => "isolated".to_owned(),
+        _ => "shared".to_owned(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Team {
     pub id: String,
     pub name: String,
     pub workspace: String,
+    #[serde(default = "default_workspace_mode")]
+    pub workspace_mode: String,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -290,6 +303,7 @@ impl Team {
             id: row.id.clone(),
             name: row.name.clone(),
             workspace: row.workspace.clone(),
+            workspace_mode: normalize_workspace_mode(Some(&row.workspace_mode)),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
@@ -302,6 +316,7 @@ impl Team {
             id: self.id.clone(),
             name: self.name.clone(),
             workspace: self.workspace.clone(),
+            workspace_mode: self.workspace_mode.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
@@ -670,6 +685,7 @@ mod tests {
             id: "t1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team".into(),
+            workspace_mode: "isolated".into(),
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),
@@ -689,6 +705,7 @@ mod tests {
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
         assert_eq!(resp.name, "Alpha");
+        assert_eq!(resp.workspace_mode, "isolated");
         assert_eq!(resp.assistants.len(), 1);
         assert_eq!(resp.assistants[0].slot_id, "s1");
         assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));

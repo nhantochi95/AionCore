@@ -12,9 +12,10 @@ use std::sync::Arc;
 use aionui_api_types::{ApiResponse, WebSocketMessage};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::custom_bridge_schema::CustomCostLedgerRow;
 use aionui_db::{DbError, SqliteCustomBridgeRepository};
 use aionui_realtime::{BroadcastEventBus, EventBroadcaster};
-use axum::extract::{Extension, Json, State};
+use axum::extract::{Extension, Json, Query, State};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
@@ -50,12 +51,40 @@ pub struct UpdateBudgetLimitRequest {
     pub budget_limit_usd: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WalletLedgerQuery {
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 pub fn wallets_routes(state: WalletsRouterState) -> Router {
     Router::new()
         .route("/api/wallets/summary", get(get_wallet_summary))
+        .route("/api/wallets/ledger", get(get_wallet_ledger))
         .route("/api/wallets/budget-limit", post(update_budget_limit))
         .route("/api/wallets/reset", post(reset_wallet))
         .with_state(state)
+}
+
+/// GET /api/wallets/ledger
+async fn get_wallet_ledger(
+    State(state): State<WalletsRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<WalletLedgerQuery>,
+) -> Result<Json<ApiResponse<Vec<CustomCostLedgerRow>>>, ApiError> {
+    let entries = state
+        .bridge_repo
+        .list_cost_ledger_entries(
+            &user.id,
+            query.team_id.as_deref(),
+            query.limit.unwrap_or(50) as i64,
+        )
+        .await
+        .map_err(db_err_to_api)?;
+
+    Ok(Json(ApiResponse::ok(entries)))
 }
 
 /// GET /api/wallets/summary

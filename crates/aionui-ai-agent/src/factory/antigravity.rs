@@ -64,7 +64,29 @@ pub(super) async fn build(
     let resolved_mode =
         crate::session_agent::resolved_session_mode(&config, build_context.session_snapshot.as_ref(), &meta);
     let full_auto = is_full_auto(resolved_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
+    let warm_acp = std::env::var("AIONUI_AGY_WARM_ACP")
+        .or_else(|_| std::env::var("AIONUI_ANTIGRAVITY_WARM_ACP"))
+        .ok()
+        .as_deref()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let isolate_default_customizations = std::env::var("AIONUI_AGY_ISOLATE_CUSTOMIZATIONS")
+        .or_else(|_| std::env::var("AIONUI_ANTIGRAVITY_ISOLATE_CUSTOMIZATIONS"))
+        .ok()
+        .as_deref()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(build_context.belongs_to_team || build_context.team.is_some());
     let hook_env = match deps.antigravity_hook_base_url.as_deref() {
+        _ if warm_acp => {
+            tracing::info!(
+                conversation_id = %ctx.conversation_id,
+                isolate_default_customizations,
+                "antigravity: warm `agy acp` mode — permissions gated natively over JSON-RPC"
+            );
+            crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
+            deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
+            Vec::new()
+        }
         _ if full_auto => {
             tracing::info!(
                 conversation_id = %ctx.conversation_id,
@@ -164,6 +186,10 @@ pub(super) async fn build(
             permission_hook_body,
         },
         deps.session_spawner.clone(),
+        crate::session_agent::AntigravityRuntimeOptions {
+            warm_acp,
+            isolate_default_customizations,
+        },
     )
     .await?;
 

@@ -96,6 +96,10 @@ pub struct TaskUpdateInput {
     pub description: Option<String>,
     pub owner: Option<String>,
     pub blocked_by: Option<Vec<String>>,
+    #[serde(default)]
+    pub reply_message: Option<String>,
+    #[serde(default)]
+    pub reply_files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +154,11 @@ pub struct RoomReadInput {
     #[serde(default)]
     pub room_id: Option<String>,
     #[serde(default)]
+    pub since_msg_id: Option<String>,
+    #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_completed_tasks: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +230,24 @@ mod tests {
         assert!(authorize_tool(TeammateRole::Teammate, "team_notify_user").is_err());
         assert!(authorize_tool(TeammateRole::Lead, "team_room_post").is_ok());
         assert!(authorize_tool(TeammateRole::Teammate, "team_room_post").is_err());
+        assert!(authorize_tool(TeammateRole::Lead, "team_list_assistants").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_list_assistants").is_err());
+        assert!(authorize_tool(TeammateRole::Lead, "team_describe_assistant").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_describe_assistant").is_err());
+    }
+
+    #[test]
+    fn room_read_input_accepts_delta_and_completed_filter_fields() {
+        let parsed: RoomReadInput = serde_json::from_value(json!({
+            "room_id": "room-1",
+            "since_msg_id": "msg-42",
+            "limit": 12,
+            "include_completed_tasks": false
+        }))
+        .expect("RoomReadInput must accept delta fields");
+        assert_eq!(parsed.since_msg_id.as_deref(), Some("msg-42"));
+        assert_eq!(parsed.limit, Some(12));
+        assert_eq!(parsed.include_completed_tasks, Some(false));
     }
 
     #[test]

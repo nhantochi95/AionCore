@@ -201,6 +201,14 @@ impl Mailbox {
         Ok(rows.iter().any(|r| !r.read))
     }
 
+    /// Returns `true` when this agent slot has already consumed at least one
+    /// non-idle mailbox message in a prior turn (used on session restore to avoid
+    /// re-injecting the static role prompt into resumed conversations).
+    pub async fn has_consumed_substantive_turn(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, Some(25)).await?;
+        Ok(rows.iter().any(|r| r.read && r.msg_type != "idle_notification"))
+    }
+
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
         let row = self
             .repo

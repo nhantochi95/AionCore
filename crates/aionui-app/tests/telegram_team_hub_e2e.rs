@@ -863,3 +863,277 @@ async fn torture_concurrent_action_token_replay_and_unpaired_group_silent_guard(
     assert_eq!(executed_count, 1, "one-shot token must execute at most once");
     assert_eq!(deduped_count, 11, "all 11 concurrent replays must receive idempotent toast");
 }
+
+#[tokio::test]
+async fn e2e_f19_in_review_unblocks_downstream_emits_approve_done_and_coalesces_wakes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services, _states) = build_temp_app(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let ws_be = tmp.path().join("ws_be_f19");
+    let ws_fe = tmp.path().join("ws_fe_f19");
+    let be = create_team_with_workspace(&mut app, &services, &token, &csrf, "BackendTeam", &ws_be).await;
+    let fe = create_team_with_workspace(&mut app, &services, &token, &csrf, "FrontendTeam", &ws_fe).await;
+
+    let be_id = be["id"].as_str().unwrap().to_owned();
+    let fe_id = fe["id"].as_str().unwrap().to_owned();
+    let be_lead_conv = be["assistants"][0]["conversation_id"].as_str().unwrap().to_owned();
+
+    let create_room = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/shared-rooms",
+            json!({
+                "name": "F19Room",
+                "team_ids": [&be_id, &fe_id],
+                "host_team_id": &be_id
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let room_id = body_json(create_room).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // 1. Coalescing: `team_room_task_create` immediately followed by `team_room_post` targeting FrontendTeam
+    let (tc_status, tc_res) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_task_create",
+        json!({
+            "room_id": &room_id,
+            "to_team": "FrontendTeam",
+            "title": "Build Login Form",
+            "description": "Implement OAuth button"
+        }),
+    )
+    .await;
+    assert_eq!(tc_status, StatusCode::OK, "task_create failed: {tc_res}");
+    let coalesced_task_id = tc_res["data"]["task"]["id"].as_str().unwrap().to_owned();
+
+    let (post_status, _) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_post",
+        json!({
+            "room_id": &room_id,
+            "message": "@FrontendTeam please start Login Form right away!"
+        }),
+    )
+    .await;
+    assert_eq!(post_status, StatusCode::OK);
+
+    // Check FrontendTeam economy metrics: coalesced_wakes_saved >= 1!
+    let ctx_resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/team-hub/teams/{fe_id}/context-status"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ctx_resp.status(), StatusCode::OK);
+    let ctx_json = body_json(ctx_resp).await["data"].clone();
+    assert!(
+        ctx_json["coalesced_wakes_saved"].as_i64().unwrap_or(0) >= 1,
+        "coalesced_wakes_saved must increment when task_create + post coalesce: {ctx_json}"
+    );
+    assert!(ctx_json["tokens_saved_estimate"].as_i64().unwrap_or(0) >= 220);
+
+    // 2. Create upstream task U1 (BackendTeam) and downstream task D1 (FrontendTeam blocked_by U1)
+    let (_, u1_res) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_task_create",
+        json!({ "room_id": &room_id, "to_team": "BackendTeam", "title": "Ship Auth Schema" }),
+    )
+    .await;
+    let task_u1_id = u1_res["data"]["task"]["id"].as_str().unwrap().to_owned();
+
+    let (_, d1_res) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_task_create",
+        json!({
+            "room_id": &room_id,
+            "to_team": "FrontendTeam",
+            "title": "Bind Auth Schema",
+            "blocked_by": [&task_u1_id]
+        }),
+    )
+    .await;
+    let task_d1_id = d1_res["data"]["task"]["id"].as_str().unwrap().to_owned();
+
+    let bridge_repo = SqliteCustomBridgeRepository::new(services.database.pool().clone());
+    bridge_repo
+        .set_member_pending_handoff(&room_id, &fe_id, None, 0)
+        .await
+        .unwrap();
+
+    // Agent transitions U1 -> "in_review": MUST unblock D1 immediately AND create an `approve_done` ActionInbox card!
+    let (rev_status, rev_json) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_task_update",
+        json!({
+            "task_id": &task_u1_id,
+            "status": "in_review",
+            "result_summary": "Auth schema migrated and verified"
+        }),
+    )
+    .await;
+    assert_eq!(rev_status, StatusCode::OK, "agent in_review must succeed: {rev_json}");
+    assert_eq!(rev_json["data"]["task"]["status"], "in_review");
+
+    let pending_fe = bridge_repo.list_pending_handoffs_for_team(&fe_id).await.unwrap();
+    assert_eq!(pending_fe.len(), 1);
+    assert_eq!(
+        pending_fe[0].1.pending_handoff_msg_id.as_deref(),
+        Some(task_d1_id.as_str()),
+        "in_review must satisfy blocked_by and unblock downstream task D1"
+    );
+
+    // Verify `approve_done` card exists in `/api/inbox` and resolving with `approve` transitions U1 -> `completed`
+    let inbox_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/inbox?status=pending", &token))
+        .await
+        .unwrap();
+    assert_eq!(inbox_resp.status(), StatusCode::OK);
+    let inbox_items = body_json(inbox_resp).await["data"]["items"].as_array().unwrap().clone();
+    let approve_card = inbox_items
+        .iter()
+        .find(|c| c["category"] == "approve_done" && c["details"]["task_id"] == task_u1_id)
+        .expect("approve_done card must be emitted for in_review task");
+    let card_id = approve_card["id"].as_str().unwrap();
+
+    let mut ws_rx = services.event_bus.subscribe();
+    let resolve_resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/inbox/{card_id}/resolve"),
+            json!({ "action": "approve" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resolve_resp.status(), StatusCode::OK);
+
+    // Regression (`#21` §3.3): `sharedRoom.taskChanged` emitted from `/api/inbox/{id}/resolve` MUST be a hydrated `SharedRoomTaskDto`
+    let mut saw_hydrated_task_changed = false;
+    while let Ok(ev) = ws_rx.try_recv() {
+        if ev.name == "sharedRoom.taskChanged" && ev.data["task"]["id"] == task_u1_id {
+            assert_eq!(ev.data["user_id"], OWNER_ID);
+            assert_eq!(ev.data["task"]["to_team_name"], "BackendTeam");
+            assert!(
+                ev.data["task"]["artifacts"].is_array(),
+                "taskChanged must serialize hydrated `artifacts` array, not raw row: {}",
+                ev.data
+            );
+            assert!(
+                ev.data["task"]["blocked_by"].is_array(),
+                "taskChanged must serialize hydrated `blocked_by` array, not raw row: {}",
+                ev.data
+            );
+            assert!(ev.data["task"].get("artifact_paths_json").is_none());
+            saw_hydrated_task_changed = true;
+        }
+    }
+    assert!(saw_hydrated_task_changed, "must emit hydrated sharedRoom.taskChanged on approve_done");
+
+    let updated_u1 = bridge_repo.get_shared_room_task(&task_u1_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated_u1.status, "completed",
+        "human resolving approve_done card must finalize task as completed"
+    );
+
+    // 3. Empty-body `{}` PATCH on `/api/shared-rooms/{room_id}/tasks/{task_id}` must succeed cleanly
+    let empty_patch = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/shared-rooms/{room_id}/tasks/{coalesced_task_id}"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty_patch.status(), StatusCode::OK);
+
+    // 4. Delta `team_room_read` omits completed tasks & returns only newly posted messages on second call
+    let (r1_status, r1_json) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_read",
+        json!({ "room_id": &room_id, "limit": 12 }),
+    )
+    .await;
+    assert_eq!(r1_status, StatusCode::OK);
+    assert!(
+        r1_json["data"]["completed_tasks_omitted"].as_u64().unwrap_or(0) >= 1,
+        "completed U1 task must be omitted from active task digest: {r1_json}"
+    );
+    let first_msg_id = r1_json["data"]["messages"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let _ = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_post",
+        json!({ "room_id": &room_id, "message": "Delta follow-up checkpoint." }),
+    )
+    .await;
+
+    let (r2_status, r2_json) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_read",
+        json!({ "room_id": &room_id, "limit": 12 }),
+    )
+    .await;
+    assert_eq!(r2_status, StatusCode::OK);
+    assert_eq!(r2_json["data"]["delta_applied"], true);
+    assert_eq!(r2_json["data"]["messages"].as_array().unwrap().len(), 1);
+
+    // 5. Regression (`#21` §3.4): Explicit `include_completed_tasks: true` and explicit `since_msg_id`
+    //    must NOT be shadowed by `last_room_read_cursor` or active-task stripping!
+    let (r3_status, r3_json) = call_runtime_team_tool(
+        &app,
+        &services,
+        &be_lead_conv,
+        "team_room_read",
+        json!({
+            "room_id": &room_id,
+            "limit": 12,
+            "since_msg_id": &first_msg_id,
+            "include_completed_tasks": true
+        }),
+    )
+    .await;
+    assert_eq!(r3_status, StatusCode::OK, "explicit room_read_delta failed: {r3_json}");
+    assert_eq!(r3_json["data"]["completed_tasks_omitted"], 0);
+    let r3_tasks = r3_json["data"]["tasks"].as_array().unwrap();
+    assert!(
+        r3_tasks.iter().any(|t| t["id"] == task_u1_id && t["status"] == "completed"),
+        "include_completed_tasks=true must return completed U1 task: {r3_json}"
+    );
+    assert_eq!(r3_json["data"]["delta_from_cursor"], first_msg_id);
+    assert!(
+        !r3_json["data"]["messages"].as_array().unwrap().is_empty(),
+        "explicit since_msg_id=first_msg_id must return messages after first_msg_id even after r2 advanced cursor: {r3_json}"
+    );
+}

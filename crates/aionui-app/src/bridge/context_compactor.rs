@@ -13,7 +13,10 @@ use aionui_api_types::{
 use aionui_assistant::AssistantService;
 use aionui_common::{AgentType, ApiError, ProviderWithModel};
 use aionui_conversation::ConversationService;
-use aionui_db::custom_bridge_schema::{WalletType, classify_agent_wallet};
+use aionui_db::custom_bridge_schema::{
+    CreateActionInboxParams, SettleSlotEconomyParams, SlotWalletFacts, UpsertTeamContextPrefParams, WalletType,
+    classify_slot_wallet_facts,
+};
 use aionui_db::{
     IAgentMetadataRepository, IConversationRepository, IProviderRepository, ITeamRepository,
     SqliteCustomBridgeRepository, UpdateTeamParams, UpsertTeamContextAnchorParams,
@@ -62,9 +65,22 @@ pub struct ConnectedEngineCatalogItemDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct QuotaRoutingPresetDto {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    #[serde(default)]
+    pub lead_target: Option<ModelTargetSpec>,
+    #[serde(default)]
+    pub worker_target: Option<ModelTargetSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ConnectedModelsCatalogDto {
     pub cli_agents: Vec<ConnectedEngineCatalogItemDto>,
     pub api_providers: Vec<ConnectedEngineCatalogItemDto>,
+    #[serde(default)]
+    pub recommended_presets: Vec<QuotaRoutingPresetDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -109,7 +125,7 @@ pub struct ModelTargetSpec {
     pub model_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SlotContextStatusDto {
     pub slot_id: String,
     pub name: String,
@@ -127,14 +143,62 @@ pub struct SlotContextStatusDto {
     pub auto_compact_enabled: bool,
     pub has_anchored_summary: bool,
     pub pending_model_swap: Option<ModelTargetSpec>,
+    #[serde(default)]
+    pub effective_compact_limit_tokens: i64,
+    #[serde(default)]
+    pub wakeup_turns: i64,
+    #[serde(default)]
+    pub input_tokens_total: i64,
+    #[serde(default)]
+    pub output_tokens_total: i64,
+    #[serde(default)]
+    pub cached_read_tokens_total: i64,
+    #[serde(default)]
+    pub estimated_cost_usd: f64,
+    #[serde(default)]
+    pub compaction_saved_tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamContextStatusResponse {
     pub team_id: String,
     pub auto_compact_enabled: bool,
     pub auto_compact_threshold_pct: i64,
+    #[serde(default = "default_economy_mode")]
+    pub economy_mode: String,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: i64,
+    #[serde(default)]
+    pub tokens_saved_estimate: i64,
+    #[serde(default)]
+    pub coalesced_wakes_saved: i64,
+    #[serde(default = "default_max_turn_hops")]
+    pub max_turn_hops_per_run: i64,
+    #[serde(default)]
+    pub auto_fallback_free_cli: bool,
+    #[serde(default)]
+    pub total_wakeup_turns: i64,
+    #[serde(default)]
+    pub total_input_tokens: i64,
+    #[serde(default)]
+    pub total_output_tokens: i64,
+    #[serde(default)]
+    pub total_cached_read_tokens: i64,
+    #[serde(default)]
+    pub total_estimated_cost_usd: f64,
     pub slots: Vec<SlotContextStatusDto>,
+}
+
+fn default_economy_mode() -> String {
+    "lean".to_owned()
+}
+
+fn default_max_context_tokens() -> i64 {
+    160_000
+}
+
+fn default_max_turn_hops() -> i64 {
+    24
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,6 +211,14 @@ pub struct CompactTeamContextRequest {
     pub auto_compact_enabled: Option<bool>,
     #[serde(default)]
     pub threshold_pct: Option<i64>,
+    #[serde(default)]
+    pub economy_mode: Option<String>,
+    #[serde(default)]
+    pub max_context_tokens: Option<i64>,
+    #[serde(default)]
+    pub max_turn_hops_per_run: Option<i64>,
+    #[serde(default)]
+    pub auto_fallback_free_cli: Option<bool>,
     #[serde(default)]
     pub force_interrupt: Option<bool>,
 }
@@ -174,6 +246,10 @@ pub struct CompactTeamContextResponse {
     pub team_id: String,
     pub auto_compact_enabled: bool,
     pub auto_compact_threshold_pct: i64,
+    pub economy_mode: String,
+    pub max_context_tokens: i64,
+    pub tokens_saved_estimate: i64,
+    pub coalesced_wakes_saved: i64,
     pub outcomes: Vec<SlotCompactionOutcomeDto>,
     pub context_status: TeamContextStatusResponse,
 }
@@ -211,9 +287,19 @@ pub struct SwitchTeamModelsRequest {
     #[serde(default)]
     pub scope: Option<String>, // "all" | "teammates_only" | "slots"
     #[serde(default)]
+    pub preset: Option<String>, // "smart_split" | "quota_saver" | "all_free_cli"
+    #[serde(default)]
     pub target: Option<ModelTargetSpec>,
     #[serde(default)]
     pub updates: Vec<PerSlotModelUpdate>,
+    #[serde(default)]
+    pub force_interrupt: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApplyQuotaPresetRequest {
+    #[serde(default)]
+    pub preset: Option<String>, // Defaults to "smart_split" on `{}` empty body
     #[serde(default)]
     pub force_interrupt: Option<bool>,
 }
@@ -738,32 +824,153 @@ pub struct TeamHubOrchestrator {
     pub event_bus: Arc<BroadcastEventBus>,
     pub data_dir: PathBuf,
     pub slot_locks: Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    pub active_run_turn_hops: Arc<dashmap::DashMap<String, i64>>,
 }
 
 impl TeamHubOrchestrator {
+    pub fn reset_team_run_turn_hops(&self, team_id: &str) {
+        self.active_run_turn_hops.remove(team_id);
+    }
+
     pub fn classify_slot_wallet(backend: &str, model_id: &str) -> WalletType {
-        let b = backend.trim().to_lowercase();
-        if b == "aionrs" {
-            return WalletType::ApiKey;
-        }
-        let hint = if b == "acp" || b.is_empty() || b == "custom" {
-            let m = model_id.trim().to_lowercase();
-            if m.starts_with("claude") && !m.contains('/') {
-                "claude"
-            } else if m.starts_with("codex") && !m.contains('/') {
-                "codex"
-            } else if m.starts_with("gemini") && !m.contains('/') {
-                "gemini"
-            } else if m.starts_with("antigravity") {
-                "antigravity"
-            } else {
-                m.as_str()
+        Self::classify_slot_wallet_ext(backend, "", None, model_id, None, false)
+    }
+
+    pub fn classify_slot_wallet_ext(
+        backend: &str,
+        assistant_backend: &str,
+        provider_id: Option<&str>,
+        model_id: &str,
+        auth_methods_json: Option<&str>,
+        has_custom_api_key: bool,
+    ) -> WalletType {
+        classify_slot_wallet_facts(&SlotWalletFacts {
+            slot_backend: Some(backend),
+            assistant_backend: Some(assistant_backend),
+            extra_backend: None,
+            cli_path: None,
+            provider_id,
+            model_id: Some(model_id),
+            auth_methods_json,
+            has_custom_api_key,
+        })
+    }
+
+    fn build_recommended_presets(
+        cli_agents: &[ConnectedEngineCatalogItemDto],
+        api_providers: &[ConnectedEngineCatalogItemDto],
+    ) -> Vec<QuotaRoutingPresetDto> {
+        let pick_free_worker = || -> Option<ModelTargetSpec> {
+            // Prefer lightweight/fast $0 CLI models for worker slots
+            const WORKER_MODEL_HINTS: &[&str] = &[
+                "haiku",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gemini-2.5-flash",
+                "sonnet",
+                "default",
+            ];
+            let free_clis: Vec<&ConnectedEngineCatalogItemDto> = cli_agents
+                .iter()
+                .filter(|c| c.wallet_type == "cli_subscription")
+                .collect();
+            for hint in WORKER_MODEL_HINTS {
+                for engine in &free_clis {
+                    if let Some(m) = engine
+                        .models
+                        .iter()
+                        .find(|m| m.id.to_ascii_lowercase().contains(hint))
+                    {
+                        return Some(ModelTargetSpec {
+                            backend: engine.backend.clone(),
+                            provider_id: None,
+                            model_id: m.id.clone(),
+                        });
+                    }
+                }
             }
-            .to_owned()
-        } else {
-            b
+            free_clis.first().map(|engine| ModelTargetSpec {
+                backend: engine.backend.clone(),
+                provider_id: None,
+                model_id: engine
+                    .models
+                    .first()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| engine.backend.clone()),
+            })
         };
-        classify_agent_wallet(Some(&hint), None, false)
+
+        let pick_free_lead = || -> Option<ModelTargetSpec> {
+            const LEAD_MODEL_HINTS: &[&str] = &[
+                "opus",
+                "fable",
+                "gpt-6.1-sol",
+                "gpt-5.4",
+                "gemini-2.5-pro",
+                "sonnet",
+            ];
+            let free_clis: Vec<&ConnectedEngineCatalogItemDto> = cli_agents
+                .iter()
+                .filter(|c| c.wallet_type == "cli_subscription")
+                .collect();
+            for hint in LEAD_MODEL_HINTS {
+                for engine in &free_clis {
+                    if let Some(m) = engine
+                        .models
+                        .iter()
+                        .find(|m| m.id.to_ascii_lowercase() == *hint || m.id.to_ascii_lowercase().contains(hint))
+                    {
+                        return Some(ModelTargetSpec {
+                            backend: engine.backend.clone(),
+                            provider_id: None,
+                            model_id: m.id.clone(),
+                        });
+                    }
+                }
+            }
+            free_clis.first().map(|engine| ModelTargetSpec {
+                backend: engine.backend.clone(),
+                provider_id: None,
+                model_id: engine
+                    .models
+                    .first()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| engine.backend.clone()),
+            })
+        };
+
+        let worker_free = pick_free_worker();
+        let lead_free = pick_free_lead();
+        let lead_smart = lead_free.clone().or_else(|| {
+            api_providers.first().and_then(|p| {
+                p.models.first().map(|m| ModelTargetSpec {
+                    backend: "aionrs".to_owned(),
+                    provider_id: p.provider_id.clone(),
+                    model_id: m.id.clone(),
+                })
+            })
+        });
+
+        let mut presets = Vec::new();
+        if worker_free.is_some() || lead_smart.is_some() {
+            presets.push(QuotaRoutingPresetDto {
+                id: "smart_split".to_owned(),
+                label: "Smart Split (Reasoning Lead + $0 CLI Workers)".to_owned(),
+                description: "Keep Team Lead on a high-reasoning model while routing worker slots to fast $0 CLI OAuth models.".to_owned(),
+                lead_target: lead_smart,
+                worker_target: worker_free.clone(),
+            });
+        }
+        if lead_free.is_some() || worker_free.is_some() {
+            presets.push(QuotaRoutingPresetDto {
+                id: "all_free_cli".to_owned(),
+                label: "All $0 CLI Subscription".to_owned(),
+                description: "Switch Lead and all teammates to $0 OAuth CLI engines immune to Paid API budget limits.".to_owned(),
+                lead_target: lead_free,
+                worker_target: worker_free,
+            });
+        }
+        presets
     }
 
     pub fn infer_max_context_tokens(model_id: &str, provider_limit: Option<i64>) -> i64 {
@@ -937,8 +1144,11 @@ impl TeamHubOrchestrator {
                 .unwrap_or(bare_id);
 
             let meta_row = self.agent_metadata_repo.get_for_user(user_id, &row.id).await.ok().flatten();
-            let wallet_type = classify_agent_wallet(
-                Some(backend),
+            let wallet_type = Self::classify_slot_wallet_ext(
+                backend,
+                "",
+                None,
+                backend,
                 meta_row.as_ref().and_then(|m| m.auth_methods.as_deref()),
                 false,
             )
@@ -1026,9 +1236,12 @@ impl TeamHubOrchestrator {
             });
         }
 
+        let recommended_presets = Self::build_recommended_presets(&cli_agents, &api_providers);
+
         Ok(ConnectedModelsCatalogDto {
             cli_agents,
             api_providers,
+            recommended_presets,
         })
     }
 
@@ -1249,25 +1462,35 @@ impl TeamHubOrchestrator {
         conversation_id: &str,
         last_compacted_msg_id: Option<&str>,
         anchored_summary_md: Option<&str>,
+        unsettled_wake_chars: i64,
     ) -> i64 {
-        let rows = self
-            .bridge_repo
-            .list_conversation_messages_for_anchor(conversation_id)
-            .await
-            .unwrap_or_default();
+        let anchor_chars = anchored_summary_md.map(|s| s.chars().count() as i64).unwrap_or(0);
+        let wake_chars = unsettled_wake_chars.max(0);
 
-        let start_idx = if let Some(last_id) = last_compacted_msg_id {
-            rows.iter()
+        if let Some(last_id) = last_compacted_msg_id {
+            let rows = self
+                .bridge_repo
+                .list_conversation_messages_for_anchor(conversation_id)
+                .await
+                .unwrap_or_default();
+
+            let start_idx = rows
+                .iter()
                 .position(|r| r.id == last_id || r.msg_id.as_deref() == Some(last_id))
                 .map(|i| i + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+                .unwrap_or(0);
 
-        let delta_chars: usize = rows[start_idx..].iter().map(|r| r.content.chars().count()).sum();
-        let anchor_chars: usize = anchored_summary_md.map(|s| s.chars().count()).unwrap_or(0);
-        ((delta_chars + anchor_chars) / 4) as i64
+            let delta_chars: i64 = rows[start_idx..].iter().map(|r| r.content.chars().count() as i64).sum();
+            ((delta_chars + anchor_chars + wake_chars) / 4).max(0)
+        } else {
+            // Fast O(1)-memory SQLite SUM(LENGTH(content)) without allocating MessageRow strings
+            let (_, total_bytes) = self
+                .bridge_repo
+                .estimate_conversation_tokens_fast(conversation_id)
+                .await
+                .unwrap_or((0, 0));
+            ((total_bytes + anchor_chars + wake_chars) / 4).max(0)
+        }
     }
 
     /// `GET /api/team-hub/teams/{id}/context-status`
@@ -1306,6 +1529,15 @@ impl TeamHubOrchestrator {
             .map(|s| (s.slot_id.clone(), s))
             .collect();
 
+        let slot_economies: HashMap<String, _> = self
+            .bridge_repo
+            .list_team_slot_economy(team_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.slot_id.clone(), e))
+            .collect();
+
         let providers: HashMap<String, _> = self
             .provider_repo
             .list(user_id)
@@ -1316,6 +1548,12 @@ impl TeamHubOrchestrator {
             .collect();
 
         let auto_enabled = pref.is_auto_compact_enabled();
+        let economy_cap_tokens = pref.effective_max_context_tokens();
+        let mut total_wakeup_turns = 0_i64;
+        let mut total_input_tokens = 0_i64;
+        let mut total_output_tokens = 0_i64;
+        let mut total_cached_read_tokens = 0_i64;
+        let mut total_estimated_cost_usd = 0.0_f64;
         let mut slots = Vec::with_capacity(team.assistants.len());
 
         for member in &team.assistants {
@@ -1389,14 +1627,19 @@ impl TeamHubOrchestrator {
                 .filter(|&m| m > 0)
                 .unwrap_or_else(|| Self::infer_max_context_tokens(&model_id, provider_limit));
 
+            let pct_limit = ((max_tokens * pref.threshold_pct) / 100).max(1);
+            let effective_compact_limit_tokens = pct_limit.min(economy_cap_tokens);
+
             let anchor = anchors.get(&member.slot_id);
+            let slot_econ = slot_economies.get(&member.slot_id);
+            let unsettled_wake_chars = slot_econ.map(|e| e.delivered_wake_chars).unwrap_or(0);
             let has_anchored_summary = anchor
                 .map(|a| !a.anchored_summary_md.trim().is_empty())
                 .unwrap_or(false);
             let compaction_count = anchor.map(|a| a.compaction_count).unwrap_or(0);
 
             let used_tokens = match reported_used {
-                Some(u) if u > 0 => u,
+                Some(u) if u > 0 => u + (unsettled_wake_chars.max(0) / 4),
                 _ => {
                     self.estimate_tokens_from_messages(
                         &member.conversation_id,
@@ -1404,6 +1647,7 @@ impl TeamHubOrchestrator {
                         anchor
                             .map(|a| a.anchored_summary_md.as_str())
                             .filter(|s| !s.trim().is_empty()),
+                        unsettled_wake_chars,
                     )
                     .await
                 }
@@ -1412,24 +1656,44 @@ impl TeamHubOrchestrator {
             let usage_percent = ((used_tokens.max(0) as f64 / max_tokens.max(1) as f64) * 100.0)
                 .round()
                 .clamp(0.0, 100.0) as i64;
-            let level = if usage_percent >= 85 {
+            let level = if usage_percent >= 85 || used_tokens >= effective_compact_limit_tokens {
                 "critical"
-            } else if usage_percent >= 70 {
+            } else if usage_percent >= 70 || used_tokens >= ((effective_compact_limit_tokens * 85) / 100).max(1) {
                 "warning"
             } else {
                 "normal"
             }
             .to_owned();
 
-            let wallet_type = Self::classify_slot_wallet(&backend, &model_id)
-                .as_str()
-                .to_owned();
+            let wallet_type = Self::classify_slot_wallet_ext(
+                &backend,
+                &member.assistant_backend,
+                provider_id.as_deref(),
+                &model_id,
+                None,
+                false,
+            )
+            .as_str()
+            .to_owned();
 
             let pending_model_swap = swaps.get(&member.slot_id).map(|s| ModelTargetSpec {
                 backend: s.target_backend.clone(),
                 provider_id: s.target_provider_id.clone(),
                 model_id: s.target_model_id.clone(),
             });
+
+            let wakeup_turns = slot_econ.map(|e| e.wakeup_turns).unwrap_or(0);
+            let input_tokens_total = slot_econ.map(|e| e.input_tokens_total).unwrap_or(0);
+            let output_tokens_total = slot_econ.map(|e| e.output_tokens_total).unwrap_or(0);
+            let cached_read_tokens_total = slot_econ.map(|e| e.cached_read_tokens_total).unwrap_or(0);
+            let estimated_cost_usd = slot_econ.map(|e| e.estimated_cost_usd).unwrap_or(0.0);
+            let compaction_saved_tokens = slot_econ.map(|e| e.compaction_saved_tokens).unwrap_or(0);
+
+            total_wakeup_turns += wakeup_turns;
+            total_input_tokens += input_tokens_total;
+            total_output_tokens += output_tokens_total;
+            total_cached_read_tokens += cached_read_tokens_total;
+            total_estimated_cost_usd += estimated_cost_usd;
 
             slots.push(SlotContextStatusDto {
                 slot_id: member.slot_id.clone(),
@@ -1448,6 +1712,13 @@ impl TeamHubOrchestrator {
                 auto_compact_enabled: auto_enabled,
                 has_anchored_summary,
                 pending_model_swap,
+                effective_compact_limit_tokens,
+                wakeup_turns,
+                input_tokens_total,
+                output_tokens_total,
+                cached_read_tokens_total,
+                estimated_cost_usd,
+                compaction_saved_tokens,
             });
         }
 
@@ -1455,6 +1726,21 @@ impl TeamHubOrchestrator {
             team_id: team_id.to_owned(),
             auto_compact_enabled: auto_enabled,
             auto_compact_threshold_pct: pref.threshold_pct,
+            economy_mode: pref.effective_economy_mode().to_owned(),
+            max_context_tokens: economy_cap_tokens,
+            tokens_saved_estimate: pref.tokens_saved_estimate,
+            coalesced_wakes_saved: pref.coalesced_wakes_saved,
+            max_turn_hops_per_run: if pref.max_turn_hops_per_run > 0 {
+                pref.max_turn_hops_per_run
+            } else {
+                24
+            },
+            auto_fallback_free_cli: pref.is_auto_fallback_free_cli_enabled(),
+            total_wakeup_turns,
+            total_input_tokens,
+            total_output_tokens,
+            total_cached_read_tokens,
+            total_estimated_cost_usd,
             slots,
         })
     }
@@ -1467,6 +1753,17 @@ impl TeamHubOrchestrator {
                 "team_id": status.team_id,
                 "auto_compact_enabled": status.auto_compact_enabled,
                 "auto_compact_threshold_pct": status.auto_compact_threshold_pct,
+                "economy_mode": status.economy_mode,
+                "max_context_tokens": status.max_context_tokens,
+                "tokens_saved_estimate": status.tokens_saved_estimate,
+                "coalesced_wakes_saved": status.coalesced_wakes_saved,
+                "max_turn_hops_per_run": status.max_turn_hops_per_run,
+                "auto_fallback_free_cli": status.auto_fallback_free_cli,
+                "total_wakeup_turns": status.total_wakeup_turns,
+                "total_input_tokens": status.total_input_tokens,
+                "total_output_tokens": status.total_output_tokens,
+                "total_cached_read_tokens": status.total_cached_read_tokens,
+                "total_estimated_cost_usd": status.total_estimated_cost_usd,
                 "slots": status.slots,
             }),
         ));
@@ -1491,20 +1788,31 @@ impl TeamHubOrchestrator {
             .await
             .map_err(|e| ApiError::Internal(format!("Context pref error: {e}")))?;
 
-        if req.auto_compact_enabled.is_some() || req.threshold_pct.is_some() {
-            let next_enabled = req.auto_compact_enabled.unwrap_or_else(|| pref.is_auto_compact_enabled());
-            let next_threshold = req.threshold_pct.unwrap_or(pref.threshold_pct);
+        let has_pref_patch = req.auto_compact_enabled.is_some()
+            || req.threshold_pct.is_some()
+            || req.economy_mode.is_some()
+            || req.max_context_tokens.is_some()
+            || req.max_turn_hops_per_run.is_some()
+            || req.auto_fallback_free_cli.is_some();
+
+        if has_pref_patch {
             pref = self
                 .bridge_repo
-                .upsert_team_context_pref(team_id, next_enabled, next_threshold)
+                .upsert_team_context_pref_ext(UpsertTeamContextPrefParams {
+                    team_id: team_id.to_owned(),
+                    auto_compact_enabled: req.auto_compact_enabled,
+                    threshold_pct: req.threshold_pct,
+                    economy_mode: req.economy_mode.clone(),
+                    max_context_tokens: req.max_context_tokens,
+                    max_turn_hops_per_run: req.max_turn_hops_per_run,
+                    auto_fallback_free_cli: req.auto_fallback_free_cli,
+                })
                 .await
                 .map_err(|e| ApiError::Internal(format!("Failed to update context prefs: {e}")))?;
         }
 
         let is_prefs_only = req.mode.as_deref() == Some("prefs_only")
-            || ((req.auto_compact_enabled.is_some() || req.threshold_pct.is_some())
-                && req.mode.is_none()
-                && req.slot_id.is_none());
+            || (has_pref_patch && req.mode.is_none() && req.slot_id.is_none());
 
         if is_prefs_only {
             let status = self.get_team_context_status(user_id, team_id).await?;
@@ -1513,6 +1821,10 @@ impl TeamHubOrchestrator {
                 team_id: team_id.to_owned(),
                 auto_compact_enabled: pref.is_auto_compact_enabled(),
                 auto_compact_threshold_pct: pref.threshold_pct,
+                economy_mode: status.economy_mode.clone(),
+                max_context_tokens: status.max_context_tokens,
+                tokens_saved_estimate: status.tokens_saved_estimate,
+                coalesced_wakes_saved: status.coalesced_wakes_saved,
                 outcomes: Vec::new(),
                 context_status: status,
             });
@@ -1640,6 +1952,18 @@ impl TeamHubOrchestrator {
             };
 
             let after_tokens = (summary_chars / 4) as i64;
+            let saved_tokens = (before_tokens - after_tokens).max(0);
+            if saved_tokens > 0 {
+                let _ = self
+                    .bridge_repo
+                    .record_slot_compaction_savings(
+                        team_id,
+                        &member.slot_id,
+                        user_id,
+                        saved_tokens,
+                    )
+                    .await;
+            }
             let after_percent = ((after_tokens as f64 / max_tokens.max(1) as f64) * 100.0)
                 .round()
                 .clamp(0.0, 100.0) as i64;
@@ -1680,6 +2004,10 @@ impl TeamHubOrchestrator {
             team_id: team_id.to_owned(),
             auto_compact_enabled: updated_status.auto_compact_enabled,
             auto_compact_threshold_pct: updated_status.auto_compact_threshold_pct,
+            economy_mode: updated_status.economy_mode.clone(),
+            max_context_tokens: updated_status.max_context_tokens,
+            tokens_saved_estimate: updated_status.tokens_saved_estimate,
+            coalesced_wakes_saved: updated_status.coalesced_wakes_saved,
             outcomes,
             context_status: updated_status,
         })
@@ -1732,6 +2060,34 @@ impl TeamHubOrchestrator {
         ))
     }
 
+    /// `POST /api/team-hub/teams/{id}/apply-quota-preset`
+    pub async fn apply_quota_preset(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        req: ApplyQuotaPresetRequest,
+    ) -> Result<SwitchTeamModelsResponse, ApiError> {
+        let preset = req
+            .preset
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("smart_split")
+            .to_owned();
+        self.switch_team_models(
+            user_id,
+            team_id,
+            SwitchTeamModelsRequest {
+                scope: Some("slots".to_owned()),
+                preset: Some(preset),
+                target: None,
+                updates: Vec::new(),
+                force_interrupt: req.force_interrupt,
+            },
+        )
+        .await
+    }
+
     /// `POST /api/team-hub/teams/{id}/switch-models`
     pub async fn switch_team_models(
         &self,
@@ -1750,61 +2106,115 @@ impl TeamHubOrchestrator {
         let mut parsed_team =
             Team::from_row(&team_row).map_err(|e| ApiError::Internal(format!("Invalid team roster: {e}")))?;
 
-        let scope = req
-            .scope
+        let force_interrupt = req.force_interrupt.unwrap_or(false);
+
+        // Build `(slot_id, ModelTargetSpec)` plan (supporting `preset: "smart_split" | "quota_saver" | "all_free_cli"`)
+        let mut plan: Vec<(String, ModelTargetSpec)> = Vec::new();
+        let scope = if let Some(raw_preset) = req
+            .preset
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("all")
-            .to_owned();
-        let force_interrupt = req.force_interrupt.unwrap_or(false);
+        {
+            let normalized_preset = match raw_preset.to_ascii_lowercase().as_str() {
+                "smart_split" | "quota_saver" => "smart_split",
+                "all_free_cli" | "free_cli" => "all_free_cli",
+                other => {
+                    return Err(ApiError::BadRequest(format!(
+                        "Unsupported quota preset '{other}': expected 'smart_split' or 'all_free_cli'"
+                    )));
+                }
+            };
+            let catalog = self.list_connected_models(user_id).await?;
+            let preset_dto = catalog
+                .recommended_presets
+                .iter()
+                .find(|p| p.id == normalized_preset)
+                .or_else(|| catalog.recommended_presets.first())
+                .ok_or_else(|| {
+                    ApiError::BadRequest("No connected models available to apply quota preset".into())
+                })?;
 
-        // Build `(slot_id, ModelTargetSpec)` plan
-        let mut plan: Vec<(String, ModelTargetSpec)> = Vec::new();
-        match scope.as_str() {
-            "all" => {
-                let target = req
-                    .target
-                    .clone()
-                    .ok_or_else(|| ApiError::BadRequest("target is required when scope is 'all'".into()))?;
-                for agent in &parsed_team.agents {
-                    plan.push((agent.slot_id.clone(), target.clone()));
+            let wallet_hard_blocked = self
+                .bridge_repo
+                .is_wallet_hard_blocked(user_id)
+                .await
+                .unwrap_or(false);
+
+            for agent in &parsed_team.agents {
+                if agent.role == aionui_team::types::TeammateRole::Lead {
+                    if normalized_preset == "all_free_cli" {
+                        if let Some(ref lt) = preset_dto.lead_target.as_ref().or(preset_dto.worker_target.as_ref()) {
+                            plan.push((agent.slot_id.clone(), (*lt).clone()));
+                        }
+                    } else if wallet_hard_blocked
+                        && Self::classify_slot_wallet(&agent.backend, &agent.model) == WalletType::ApiKey
+                        && let Some(free_lead) = catalog
+                            .recommended_presets
+                            .iter()
+                            .find(|p| p.id == "all_free_cli")
+                            .and_then(|p| p.lead_target.as_ref().or(p.worker_target.as_ref()))
+                    {
+                        plan.push((agent.slot_id.clone(), free_lead.clone()));
+                    }
+                } else if let Some(ref wt) = preset_dto.worker_target.as_ref().or(preset_dto.lead_target.as_ref()) {
+                    plan.push((agent.slot_id.clone(), (*wt).clone()));
                 }
             }
-            "teammates_only" => {
-                let target = req
-                    .target
-                    .clone()
-                    .ok_or_else(|| ApiError::BadRequest("target is required when scope is 'teammates_only'".into()))?;
-                for agent in &parsed_team.agents {
-                    if agent.role != aionui_team::types::TeammateRole::Lead {
+            format!("preset:{normalized_preset}")
+        } else {
+            let explicit_scope = req
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("all")
+                .to_owned();
+            match explicit_scope.as_str() {
+                "all" => {
+                    let target = req
+                        .target
+                        .clone()
+                        .ok_or_else(|| ApiError::BadRequest("target is required when scope is 'all'".into()))?;
+                    for agent in &parsed_team.agents {
                         plan.push((agent.slot_id.clone(), target.clone()));
                     }
                 }
-            }
-            "slots" => {
-                if req.updates.is_empty() {
-                    if let Some(ref target) = req.target {
-                        for agent in &parsed_team.agents {
+                "teammates_only" => {
+                    let target = req.target.clone().ok_or_else(|| {
+                        ApiError::BadRequest("target is required when scope is 'teammates_only'".into())
+                    })?;
+                    for agent in &parsed_team.agents {
+                        if agent.role != aionui_team::types::TeammateRole::Lead {
                             plan.push((agent.slot_id.clone(), target.clone()));
                         }
-                    } else {
-                        return Err(ApiError::BadRequest(
-                            "updates must not be empty when scope is 'slots'".into(),
-                        ));
-                    }
-                } else {
-                    for upd in &req.updates {
-                        plan.push((upd.slot_id.clone(), upd.effective_target()));
                     }
                 }
+                "slots" => {
+                    if req.updates.is_empty() {
+                        if let Some(ref target) = req.target {
+                            for agent in &parsed_team.agents {
+                                plan.push((agent.slot_id.clone(), target.clone()));
+                            }
+                        } else {
+                            return Err(ApiError::BadRequest(
+                                "updates must not be empty when scope is 'slots'".into(),
+                            ));
+                        }
+                    } else {
+                        for upd in &req.updates {
+                            plan.push((upd.slot_id.clone(), upd.effective_target()));
+                        }
+                    }
+                }
+                other => {
+                    return Err(ApiError::BadRequest(format!(
+                        "Invalid scope '{other}': expected 'all', 'teammates_only', or 'slots'"
+                    )));
+                }
             }
-            other => {
-                return Err(ApiError::BadRequest(format!(
-                    "Invalid scope '{other}': expected 'all', 'teammates_only', or 'slots'"
-                )));
-            }
-        }
+            explicit_scope
+        };
 
         let mut results = Vec::with_capacity(plan.len());
         let mut roster_mutated = false;
@@ -2125,6 +2535,7 @@ impl TeamHubOrchestrator {
         if let Ok(Some(pending_swap)) = self.bridge_repo.take_pending_slot_swap(team_id, slot_id).await {
             let swap_req = SwitchTeamModelsRequest {
                 scope: Some("slots".to_owned()),
+                preset: None,
                 target: None,
                 updates: vec![PerSlotModelUpdate {
                     slot_id: slot_id.to_owned(),
@@ -2145,11 +2556,178 @@ impl TeamHubOrchestrator {
             }
         }
 
-        // 2. Compute & broadcast live context usage
+        // 2. Meter real per-slot token delta before computing live context status
+        if let Ok((msg_count, total_bytes)) = self
+            .bridge_repo
+            .estimate_conversation_tokens_fast(conversation_id)
+            .await
+        {
+            let mut slot_wallet = WalletType::CliSubscription;
+            let mut slot_model_id = String::new();
+            let mut slot_backend = String::new();
+            let mut slot_role = "teammate".to_owned();
+            if let Ok(team_snap) = self.team_service.get_team(user_id, team_id).await
+                && let Some(m) = team_snap.assistants.iter().find(|a| a.slot_id == slot_id)
+            {
+                slot_model_id = m.model.clone();
+                slot_backend = m.backend.clone();
+                slot_role = m.role.clone();
+                slot_wallet = Self::classify_slot_wallet_ext(
+                    &m.backend,
+                    &m.assistant_backend,
+                    None,
+                    &m.model,
+                    None,
+                    false,
+                );
+            }
+            let prev_econ = self
+                .bridge_repo
+                .get_team_slot_economy(team_id, slot_id)
+                .await
+                .ok()
+                .flatten();
+            let prev_bytes = prev_econ.as_ref().map(|e| e.last_seen_char_sum).unwrap_or(0);
+            let prev_usage_tokens = prev_econ.as_ref().map(|e| e.last_seen_usage_tokens).unwrap_or(0);
+            let prev_meta_seq = prev_econ.as_ref().map(|e| e.last_seen_meta_seq).unwrap_or(0);
+            let unbilled_wake = prev_econ.as_ref().map(|e| e.unbilled_wake_chars).unwrap_or(0);
+            let mut usage_val = self
+                .conversation_service
+                .get_usage(user_id, conversation_id)
+                .await
+                .ok()
+                .flatten();
+            // Claude emits `UsageDelta` immediately AFTER `TurnResult` on the `result` frame,
+            // so `on_slot_turn_settled` can race `persist_context_usage` by a few milliseconds.
+            if slot_backend.eq_ignore_ascii_case("claude") {
+                let current_seq = usage_val
+                    .as_ref()
+                    .and_then(|v| v.get("_meta"))
+                    .and_then(|m| m.get("seq"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                if current_seq == 0 || current_seq == prev_meta_seq {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if let Ok(Some(refreshed)) = self.conversation_service.get_usage(user_id, conversation_id).await {
+                        usage_val = Some(refreshed);
+                    }
+                }
+            }
+            let meta_obj = usage_val.as_ref().and_then(|v| v.get("_meta"));
+            let reported_meta_seq = meta_obj
+                .and_then(|m| m.get("seq"))
+                .and_then(serde_json::Value::as_i64);
+            let reported_total_tokens = usage_val.as_ref().and_then(|v| {
+                v.get("used")
+                    .or_else(|| v.get("totalTokens"))
+                    .or_else(|| v.get("total_tokens"))
+                    .and_then(serde_json::Value::as_i64)
+            });
+            let reported_input_tokens = meta_obj
+                .and_then(|m| m.get("input_tokens").or_else(|| m.get("inputTokens")))
+                .or_else(|| usage_val.as_ref().and_then(|v| v.get("input_tokens").or_else(|| v.get("inputTokens"))))
+                .and_then(serde_json::Value::as_i64);
+            let reported_output_tokens = meta_obj
+                .and_then(|m| m.get("output_tokens").or_else(|| m.get("outputTokens")))
+                .or_else(|| usage_val.as_ref().and_then(|v| v.get("output_tokens").or_else(|| v.get("outputTokens"))))
+                .and_then(serde_json::Value::as_i64);
+            let reported_cached_read_tokens = meta_obj
+                .and_then(|m| m.get("cached_read_tokens").or_else(|| m.get("cachedReadTokens")))
+                .or_else(|| {
+                    usage_val
+                        .as_ref()
+                        .and_then(|v| v.get("cached_read_tokens").or_else(|| v.get("cachedReadTokens")))
+                })
+                .and_then(serde_json::Value::as_i64);
+
+            let meta_advanced = reported_meta_seq.is_some_and(|s| s > 0 && s != prev_meta_seq);
+            let usage_advanced =
+                meta_advanced || reported_total_tokens.is_some_and(|t| t > 0 && t != prev_usage_tokens);
+            if (msg_count > 0 && (total_bytes > prev_bytes || unbilled_wake > 0)) || usage_advanced {
+                let _ = self
+                    .bridge_repo
+                    .settle_slot_economy_turn(SettleSlotEconomyParams {
+                        team_id: team_id.to_owned(),
+                        slot_id: slot_id.to_owned(),
+                        owner_user_id: user_id.to_owned(),
+                        role: slot_role,
+                        conversation_id: conversation_id.to_owned(),
+                        wallet_type: slot_wallet,
+                        backend: slot_backend,
+                        model_id: slot_model_id,
+                        current_msg_count: msg_count,
+                        current_char_sum: total_bytes,
+                        reported_total_tokens,
+                        reported_input_tokens,
+                        reported_output_tokens,
+                        reported_cached_read_tokens,
+                        reported_meta_seq,
+                    })
+                    .await;
+            }
+        }
+
+        // 3. Compute & broadcast live context usage
         let Ok(status) = self.get_team_context_status(user_id, team_id).await else {
             return;
         };
         self.broadcast_context_usage(user_id, &status);
+
+        // 4. Autonomous Runaway Loop Fuse (`max_turn_hops_per_run`)
+        {
+            let mut entry = self.active_run_turn_hops.entry(team_id.to_owned()).or_insert(0);
+            *entry += 1;
+            let current_hops = *entry;
+            drop(entry);
+            let max_hops = status.max_turn_hops_per_run.max(4);
+            if current_hops > max_hops {
+                self.active_run_turn_hops.remove(team_id);
+                let summary_text = format!(
+                    "Autonomous loop fuse paused team '{team_id}' after {current_hops} consecutive slot turns (limit: {max_hops})."
+                );
+                if let Ok(card) = self
+                    .bridge_repo
+                    .create_action_inbox_item(CreateActionInboxParams {
+                        id: None,
+                        owner_user_id: user_id.to_owned(),
+                        category: "loop_fuse".to_owned(),
+                        title: format!("Loop Fuse Paused ({current_hops}/{max_hops} turns)"),
+                        summary: summary_text.clone(),
+                        details_json: serde_json::json!({
+                            "team_id": team_id,
+                            "slot_id": slot_id,
+                            "turn_hops": current_hops,
+                            "max_turn_hops_per_run": max_hops,
+                        })
+                        .to_string(),
+                        target_type: Some("team".to_owned()),
+                        target_id: team_id.to_owned(),
+                        action_token: None,
+                        telegram_chat_id: None,
+                        telegram_msg_id: None,
+                    })
+                    .await
+                {
+                    self.event_bus.broadcast(WebSocketMessage::new(
+                        "inbox:item_added",
+                        serde_json::json!({
+                            "user_id": user_id,
+                            "item": crate::routes::ActionInboxCardDto::from_row(card),
+                        }),
+                    ));
+                }
+                self.event_bus.broadcast(WebSocketMessage::new(
+                    "team:loop_fuse_tripped",
+                    serde_json::json!({
+                        "user_id": user_id,
+                        "team_id": team_id,
+                        "slot_id": slot_id,
+                        "turn_hops": current_hops,
+                        "max_turn_hops_per_run": max_hops,
+                    }),
+                ));
+            }
+        }
 
         if !status.auto_compact_enabled {
             return;
@@ -2157,7 +2735,11 @@ impl TeamHubOrchestrator {
         let Some(slot_status) = status.slots.iter().find(|s| s.slot_id == slot_id) else {
             return;
         };
-        if slot_status.usage_percent < status.auto_compact_threshold_pct {
+        // Window-Calibrated Compactor: trigger at `min(threshold_pct * max_tokens, max_context_tokens)`
+        let hit_threshold = slot_status.usage_percent >= status.auto_compact_threshold_pct
+            || (slot_status.effective_compact_limit_tokens > 0
+                && slot_status.used_tokens >= slot_status.effective_compact_limit_tokens);
+        if !hit_threshold {
             return;
         }
 
@@ -2185,6 +2767,8 @@ impl TeamHubOrchestrator {
         info!(
             team_id,
             slot_id,
+            used_tokens = slot_status.used_tokens,
+            effective_limit = slot_status.effective_compact_limit_tokens,
             usage_percent = slot_status.usage_percent,
             threshold = status.auto_compact_threshold_pct,
             "auto-compacting slot context at safe turn boundary"
@@ -2198,6 +2782,10 @@ impl TeamHubOrchestrator {
                     mode: Some("rollover".to_owned()),
                     auto_compact_enabled: None,
                     threshold_pct: None,
+                    economy_mode: None,
+                    max_context_tokens: None,
+                    max_turn_hops_per_run: None,
+                    auto_fallback_free_cli: None,
                     force_interrupt: Some(false),
                 },
             )

@@ -34,7 +34,14 @@ impl<'a> TeamToolExecutor<'a> {
     }
 
     pub fn list_tools(&self, context: &TeamToolContext) -> Vec<TeamToolDescriptor> {
-        aionui_api_types::team_tool_descriptors_for_role(team_tool_role(context.caller_role))
+        let include_shared_room_tools = match self.service.upgrade() {
+            Some(svc) => svc.include_shared_room_tools(&context.team_id),
+            None => true,
+        };
+        aionui_api_types::team_tool_descriptors_for_context(
+            team_tool_role(context.caller_role),
+            include_shared_room_tools,
+        )
     }
 
     pub async fn execute(&self, context: &TeamToolContext, call: TeamToolCall) -> Result<Value, TeamToolErrorPayload> {

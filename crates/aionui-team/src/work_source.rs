@@ -13,6 +13,7 @@ pub(crate) enum WorkSource {
     LeadIntervention,
     McpSendMessage,
     McpShutdownRequest,
+    #[allow(dead_code)]
     SpawnWelcome,
     TeamMembershipChanged,
     SpawnAttachFailure,

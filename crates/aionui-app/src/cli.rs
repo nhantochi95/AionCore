@@ -215,6 +215,7 @@ pub(crate) enum TeamCommand {
     ClearAgentContext,
     ShutdownAgent,
     NotifyUser,
+    Batch,
     Room(TeamRoomArgs),
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
@@ -245,6 +246,7 @@ pub(crate) struct TeamTaskArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum TeamTaskCommand {
     Create,
+    CreateBatch,
     Update,
     List,
     #[command(external_subcommand)]
@@ -1448,6 +1450,39 @@ mod tests {
         assert!(
             Cli::try_parse_from(["aioncore", "skills", "show", "mermaid"]).is_err(),
             "`skills show <name>` must stay a parse error, so the index can never teach it again"
+        );
+    }
+
+    #[test]
+    fn team_cli_parses_batch_and_capabilities_expose_quick_cli_syntax() {
+        assert!(Cli::try_parse_from(["aioncore", "team", "batch"]).is_ok());
+        assert!(Cli::try_parse_from(["aioncore", "team", "task", "create-batch"]).is_ok());
+        assert!(Cli::try_parse_from(["aioncore", "team", "task-create-batch"]).is_ok());
+        assert!(Cli::try_parse_from(["aioncore", "team", "task-update"]).is_ok());
+        assert!(Cli::try_parse_from(["aioncore", "team", "call", "team_task_list"]).is_ok());
+
+        let caps = crate::commands::team_capabilities::data();
+        assert!(
+            caps.get("quick_cli_syntax").is_some(),
+            "team capabilities must expose top-level quick_cli_syntax cheatsheet"
+        );
+        assert!(
+            caps["quick_cli_syntax"]["powershell_generic_batch"]
+                .as_str()
+                .unwrap()
+                .contains("team batch")
+        );
+        assert!(
+            caps["quick_cli_syntax"]["powershell_1shot_task_complete_and_reply"]
+                .as_str()
+                .unwrap()
+                .contains("reply_message")
+        );
+        assert!(
+            caps["quick_cli_syntax"]["powershell_atomic_task_create_batch"]
+                .as_str()
+                .unwrap()
+                .contains("team task create-batch")
         );
     }
 }

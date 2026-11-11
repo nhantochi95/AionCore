@@ -758,6 +758,7 @@ async fn setup_session_with_turn_recorder_inner(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: "shared".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
@@ -816,6 +817,7 @@ async fn setup_session_with_runtime_ports(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: "shared".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
@@ -1940,7 +1942,6 @@ async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_ru
 /// mark_idle). This test is #[ignore] until the Error-status-preservation fix
 /// is merged into fix/team-communication-bugs.
 #[tokio::test]
-#[ignore = "Bug: mark_idle overwrites Error status with Idle (fix pending in fix/team-communication-bugs)"]
 async fn s10_error_finish_sets_agent_status_to_error() {
     let (session, _tm, _repo, _sent) = setup_session().await;
 
@@ -2315,6 +2316,160 @@ async fn empty_catalog_logs_warn_and_falls_back_to_wrapped_wake() {
         logs.contains("conversation_id="),
         "warn must carry conversation_id: {logs}"
     );
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn idle_notification_settles_without_phantom_recovery_drain_turn() {
+    let (session, _tm, _repo, _sent, turn_requests) = setup_session_with_turn_recorder().await;
+
+    session
+        .send_message_to_agent("worker-1", "inspect module silently", None)
+        .await
+        .expect("send_message_to_agent must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+
+    // Allow worker turn finalization + leader signal settle to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    let lead_turn_count = turn_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|req| req.slot_id == "lead-1")
+        .count();
+    assert_eq!(
+        lead_turn_count, 0,
+        "ephemeral IdleNotification must settle without firing a phantom RecoveryDrain turn on lead-1"
+    );
+
+    let remaining_unread = session
+        .mailbox()
+        .peek_unread("e2e-team", "lead-1")
+        .await
+        .expect("peek_unread");
+    assert!(
+        remaining_unread.is_empty(),
+        "ephemeral IdleNotification rows must be acknowledged on signal settle, got: {remaining_unread:?}"
+    );
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn parallel_worker_messages_coalesce_into_single_lead_wake() {
+    let (session, task_manager, _repo, sent, turn_requests) = setup_session_with_turn_recorder().await;
+
+    // Register a second teammate and mark both teammates actively working.
+    let mut worker2 = two_agents().remove(1);
+    worker2.slot_id = "worker-2".into();
+    worker2.conversation_id = "conv-worker-2".into();
+    worker2.name = "Worker Two".into();
+    task_manager.insert(
+        "conv-worker-2",
+        AgentInstance::Mock(Arc::new(RecordingAgent::new("conv-worker-2", sent))),
+    );
+    session.add_agent(&worker2).await;
+    let registry = session.event_loops().clone();
+    registry
+        .spawn(
+            &worker2.slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: worker2.slot_id.clone(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: registry.clone(),
+            },
+        )
+        .expect("register worker-2 test event loop");
+
+    session
+        .scheduler()
+        .set_status("worker-1", aionui_team::TeammateStatus::Working)
+        .await
+        .unwrap();
+    session
+        .scheduler()
+        .set_status("worker-2", aionui_team::TeammateStatus::Working)
+        .await
+        .unwrap();
+
+    // Worker 1 sends its report while Worker 2 is still Working.
+    session
+        .send_agent_message_from_agent("worker-1", "lead-1", "w1 finished slice A", None)
+        .await
+        .expect("worker-1 report must enqueue");
+    session
+        .scheduler()
+        .set_status("worker-1", aionui_team::TeammateStatus::Idle)
+        .await
+        .unwrap();
+
+    // Within 80ms (< 1500ms debounce) while Worker 2 is still Working, Lead must hold its wake.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(
+        turn_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|req| req.slot_id == "lead-1")
+            .count(),
+        0,
+        "lead wake must coalesce while sibling teammate worker-2 is still actively working"
+    );
+
+    // Worker 2 sends its report and settles -> Lead flushes immediately (0ms wait after last settle).
+    session
+        .send_agent_message_from_agent("worker-2", "lead-1", "w2 finished slice B", None)
+        .await
+        .expect("worker-2 report must enqueue");
+    session
+        .scheduler()
+        .set_status("worker-2", aionui_team::TeammateStatus::Idle)
+        .await
+        .unwrap();
+    session.event_loops().notify("lead-1");
+
+    tokio::time::timeout(std::time::Duration::from_millis(600), async {
+        loop {
+            let count = turn_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|req| req.slot_id == "lead-1")
+                .count();
+            if count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("lead must flush immediately once all teammates have settled");
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let lead_turns: Vec<String> = turn_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|req| req.slot_id == "lead-1")
+        .map(|req| req.content.clone())
+        .collect();
+    assert_eq!(
+        lead_turns.len(),
+        1,
+        "both parallel worker reports must coalesce into a single lead turn; got {} turns",
+        lead_turns.len()
+    );
+    assert!(lead_turns[0].contains("w1 finished slice A"));
+    assert!(lead_turns[0].contains("w2 finished slice B"));
+    // Turn-1 Lead wake must also include the compact 1-line Team Roster snapshot.
+    assert!(lead_turns[0].contains("## Team Roster"));
 
     session.stop();
 }

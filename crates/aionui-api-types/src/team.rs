@@ -97,6 +97,10 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
     }
 }
 
+fn default_workspace_mode() -> String {
+    "shared".to_owned()
+}
+
 /// Request body for `POST /api/teams`.
 ///
 /// Creates a team with the given name and agent list.
@@ -108,6 +112,8 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default, alias = "workspaceMode")]
+    pub workspace_mode: Option<String>,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.
@@ -589,6 +595,8 @@ pub struct TeamResponse {
     pub name: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(default = "default_workspace_mode", alias = "workspaceMode")]
+    pub workspace_mode: String,
     #[serde(alias = "agents")]
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
@@ -1276,6 +1284,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: "isolated".into(),
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -1302,6 +1311,7 @@ mod tests {
         assert_eq!(json["id"], "team-1");
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
+        assert_eq!(json["workspace_mode"], "isolated");
         assert_eq!(json["leader_assistant_id"], "slot-1");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
@@ -1315,6 +1325,7 @@ mod tests {
             id: "team-2".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            workspace_mode: "shared".into(),
             assistants: vec![],
             leader_assistant_id: None,
             created_at: 1700000000000,
@@ -1322,6 +1333,7 @@ mod tests {
         };
         let json = serde_json::to_value(&team).unwrap();
         assert!(json.get("leader_assistant_id").is_none());
+        assert_eq!(json["workspace_mode"], "shared");
         assert!(json["assistants"].as_array().unwrap().is_empty());
     }
 
@@ -1428,6 +1440,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: "isolated".into(),
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),
@@ -1614,9 +1627,26 @@ mod tests {
         });
         let team: TeamResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(team.id, "team-1");
+        assert_eq!(team.workspace_mode, "shared");
         assert!(team.assistants.is_empty());
         assert_eq!(team.leader_assistant_id.as_deref(), Some("s1"));
         assert_eq!(team.created_at, 1000);
+    }
+
+    #[test]
+    fn deserialize_create_team_request_workspace_mode() {
+        let raw = json!({
+            "name": "Isolated Team",
+            "workspace_mode": "isolated",
+            "agents": [{
+                "assistant_id": "a1",
+                "name": "Lead",
+                "role": "lead",
+                "model": "claude"
+            }]
+        });
+        let req: CreateTeamRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.workspace_mode.as_deref(), Some("isolated"));
     }
 
     // -- F. TeamSessionStatus / TeamSessionPhase serde roundtrip -----------------

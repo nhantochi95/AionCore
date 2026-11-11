@@ -495,7 +495,7 @@ fn wp2_wake_payload_includes_task_list() {
     assert!(payload.contains("pending"));
     assert!(payload.contains("w1"));
     assert!(payload.contains("w2"));
-    assert!(payload.contains("aaaaaaaa…"));
+    assert!(payload.contains("| aaaaaaaa |"));
     assert!(
         !payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
         "summary blocked_by column should use short task IDs"

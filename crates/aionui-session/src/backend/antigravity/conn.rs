@@ -72,7 +72,7 @@ fn cached_models() -> Option<Vec<ModelInfo>> {
     (!guard.is_empty()).then(|| guard.clone())
 }
 
-fn store_models(models: &[ModelInfo]) {
+pub(crate) fn store_models(models: &[ModelInfo]) {
     // Guard here rather than at the call site: caching "not signed in" would
     // pin an empty picker for the rest of the process.
     if models.is_empty() {
@@ -272,12 +272,15 @@ impl BackendConnection for AntigravityConnection {
             slash_commands,
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config,
             spawner: Arc::clone(&self.spawner),
             event_tx,
             turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(anchor)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -293,7 +296,13 @@ impl BackendConnection for AntigravityConnection {
         // already polls `capabilities()` for late discovery, so it picks this
         // up when it lands.
         let _ = backend.weak_self.set(Arc::downgrade(&backend));
-        backend.spawn_model_probe();
+        if let Some(cached) = cached_models()
+            && let Ok(mut guard) = backend.models.write()
+        {
+            *guard = cached;
+        } else {
+            backend.spawn_model_probe();
+        }
         backend.spawn_version_check();
         Ok(backend)
     }
@@ -316,16 +325,21 @@ pub struct AntigravitySessionBackend {
     models: Arc<std::sync::RwLock<Vec<ModelInfo>>>,
     /// Mode chosen at runtime, overriding the create-time seed.
     mode_override: Arc<std::sync::RwLock<Option<String>>>,
+    /// Model chosen at runtime, overriding the create-time seed.
+    model_override: Arc<std::sync::RwLock<Option<String>>>,
     config: SessionConfig,
     spawner: Arc<dyn Spawner>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     turn_gen: AtomicU64,
+    cancelled_turn_gen: AtomicU64,
     /// agy conversation id to resume with. Set from the first `init` frame and
     /// kept for every later turn.
     anchor: Arc<Mutex<Option<String>>>,
     /// The in-flight turn's process, retained so `Cancel` / `terminate` can
     /// reach it. `None` between turns — that is the normal resting state.
     current: Arc<Mutex<Option<Arc<aionui_process::ManagedProcess>>>>,
+    /// Persistent warm `agy acp` client when `config.antigravity_warm_acp` is enabled.
+    pub(crate) warm_acp: Arc<Mutex<Option<Arc<super::warm_acp::WarmAcpClient>>>>,
     /// Tool approvals raised by the PreToolUse hook and not yet answered.
     ///
     /// Each entry parks a hook process (which is holding agy's tool call open)
@@ -337,7 +351,7 @@ pub struct AntigravitySessionBackend {
     permission_seq: AtomicU64,
     /// True while a turn's process is alive. agy has no way to accept input
     /// mid-turn, so a Send arriving now has to wait for the next process.
-    in_flight: Arc<AtomicBool>,
+    pub(crate) in_flight: Arc<AtomicBool>,
     /// Whether the CURRENTLY RUNNING turn was spawned with the approval hook on disk.
     ///
     /// This is what decides whether a mid-turn mode switch can reach agy at all. The
@@ -419,12 +433,14 @@ impl AntigravitySessionBackend {
             return;
         }
 
+        let weak = self.weak_self.get().cloned();
         tokio::spawn(async move {
             let found = probe_models(&spawner, &program, &session_id, &spawn_env).await;
-            if !found.is_empty() {
+            let discovered_any = !found.is_empty();
+            if discovered_any {
                 store_models(&found);
             }
-            if found.is_empty() {
+            if !discovered_any {
                 tracing::info!(
                     session_id = %session_id,
                     "antigravity: `agy models` returned nothing (not signed in?); the model picker stays empty"
@@ -434,6 +450,18 @@ impl AntigravitySessionBackend {
             }
             if let Ok(mut guard) = slot.write() {
                 *guard = found;
+            }
+            if discovered_any
+                && let Some(backend) = weak.and_then(|w| w.upgrade())
+            {
+                let turn_gen = backend.turn_gen.load(Ordering::SeqCst);
+                backend.emit(
+                    turn_gen,
+                    SessionEvent::ConfigChanged {
+                        mode: backend.effective_mode(),
+                        model: backend.effective_model(),
+                    },
+                );
             }
         });
     }
@@ -524,6 +552,9 @@ impl AntigravitySessionBackend {
     /// calls back, so switching OUT of full auto has to put the file back or the
     /// session keeps running unattended behind a UI that says otherwise.
     fn sync_permission_hook(&self) {
+        if self.config.antigravity_warm_acp {
+            return;
+        }
         let Some(cwd) = self.config.cwd.as_deref() else {
             return;
         };
@@ -626,7 +657,12 @@ impl AntigravitySessionBackend {
     /// artifact, never a real agy id, so it is dropped even while the list is
     /// empty — this heals member sessions persisted before the AionUi fix.
     fn effective_model(&self) -> Option<String> {
-        let requested = self.config.model.clone()?;
+        let requested = self
+            .model_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.config.model.clone())?;
         let known = self.models.read().ok()?;
         if known.is_empty() {
             if requested == UI_PLACEHOLDER_MODEL {
@@ -650,7 +686,227 @@ impl AntigravitySessionBackend {
         None
     }
 
+    pub(crate) fn session_id_str(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn config_ref(&self) -> &SessionConfig {
+        &self.config
+    }
+
+    pub(crate) fn spawner_ref(&self) -> &Arc<dyn Spawner> {
+        &self.spawner
+    }
+
+    pub(crate) fn current_turn_gen(&self) -> u64 {
+        self.turn_gen.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn emit_event(&self, turn_gen: u64, event: SessionEvent) {
+        self.emit(turn_gen, event);
+    }
+
+    pub(crate) async fn current_anchor(&self) -> Option<String> {
+        self.anchor.lock().await.clone()
+    }
+
+    pub(crate) async fn set_anchor(&self, sid: String) {
+        *self.anchor.lock().await = Some(sid);
+    }
+
+    pub(crate) fn effective_model_id(&self) -> Option<String> {
+        self.effective_model()
+    }
+
+    pub(crate) fn effective_mode_id(&self) -> Option<String> {
+        self.effective_mode()
+    }
+
+    pub(crate) fn is_full_auto_enabled(&self) -> bool {
+        self.is_full_auto()
+    }
+
+    pub(crate) fn was_turn_cancelled(&self, turn_gen: u64) -> bool {
+        self.cancelled_turn_gen.load(Ordering::SeqCst) == turn_gen && turn_gen > 0
+    }
+
+    pub(crate) fn update_discovered_models(&self, found: Vec<ModelInfo>) {
+        let discovered_any = !found.is_empty();
+        if let Ok(mut guard) = self.models.write() {
+            *guard = found;
+        }
+        if discovered_any {
+            let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+            self.emit(
+                turn_gen,
+                SessionEvent::ConfigChanged {
+                    mode: self.effective_mode(),
+                    model: self.effective_model(),
+                },
+            );
+        }
+    }
+
+    pub(crate) async fn await_interactive_acp_permission(
+        &self,
+        turn_gen: u64,
+        tool_name: String,
+        input: serde_json::Value,
+        metadata: Option<serde_json::Value>,
+    ) -> PermissionDecision {
+        if self.is_full_auto() {
+            return PermissionDecision::Approved;
+        }
+        let request_id = format!("agy-perm-{}", self.permission_seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(
+            request_id.clone(),
+            PendingPermission {
+                tool_name: tool_name.clone(),
+                answer: tx,
+            },
+        );
+        self.emit(
+            turn_gen,
+            SessionEvent::Permission {
+                request_id: request_id.clone(),
+                kind: PermissionKind::Tool,
+                metadata,
+                tool_name: Some(tool_name),
+                input: Some(input),
+            },
+        );
+        match rx.await {
+            Ok(decision) => decision,
+            Err(_) => PermissionDecision::Denied,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_warm_for_test(mut config: SessionConfig, anchor: Option<String>) -> Arc<Self> {
+        config.antigravity_warm_acp = true;
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let backend = Arc::new(Self {
+            session_id: "warm-test-1".into(),
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
+            config,
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(anchor)),
+            current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let _ = backend.weak_self.set(Arc::downgrade(&backend));
+        backend
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_warm_acp_client_for_test(
+        self: &Arc<Self>,
+        io: Arc<dyn crate::adapter::AgentIo>,
+    ) -> Result<(), BackendError> {
+        let _ = self.weak_self.set(Arc::downgrade(self));
+        let client = super::warm_acp::WarmAcpClient::from_io(io, Arc::downgrade(self)).await?;
+        *self.warm_acp.lock().await = Some(client);
+        Ok(())
+    }
+
+    async fn ensure_warm_acp_client(&self) -> Result<Arc<super::warm_acp::WarmAcpClient>, BackendError> {
+        let mut guard = self.warm_acp.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.is_alive()
+        {
+            return Ok(Arc::clone(existing));
+        }
+        *guard = None;
+        let weak_self = self
+            .weak_self
+            .get()
+            .cloned()
+            .unwrap_or_else(std::sync::Weak::new);
+        let client = super::warm_acp::spawn_warm_acp_process(self, weak_self).await?;
+        *guard = Some(Arc::clone(&client));
+        Ok(client)
+    }
+
+    async fn start_warm_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
+        let client = self.ensure_warm_acp_client().await?;
+        let first_turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        // In warm ACP mode, `session/request_permission` consults `is_full_auto()` dynamically
+        // on every tool call, so a mid-turn mode switch governs the running turn immediately.
+        self.turn_started_hooked.store(true, Ordering::SeqCst);
+        self.in_flight.store(true, Ordering::SeqCst);
+
+        let backend_weak = self.weak_self.get().cloned();
+        let warm_slot = Arc::clone(&self.warm_acp);
+        tokio::spawn(async move {
+            let Some(backend) = backend_weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
+            let mut next_turn = Some((client, first_turn_gen, content));
+            while let Some((active_client, turn_gen, turn_content)) = next_turn.take() {
+                active_client.run_prompt_turn(&backend, turn_gen, turn_content).await;
+                if !active_client.is_alive() {
+                    let mut guard = warm_slot.lock().await;
+                    if guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, &active_client)) {
+                        *guard = None;
+                    }
+                }
+                backend.deny_all_pending().await;
+                if let Some(queued_content) = backend.queued.lock().await.pop_front() {
+                    // Keep `in_flight = true` while popping so a concurrent Command::Send
+                    // cannot race ahead of queued prompts on the same WarmAcpClient.
+                    let next_gen = backend.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    backend.emit(
+                        next_gen,
+                        SessionEvent::PromptAccepted {
+                            client_msg_id: String::new(),
+                        },
+                    );
+                    match backend.ensure_warm_acp_client().await {
+                        Ok(next_client) => {
+                            backend.turn_started_hooked.store(true, Ordering::SeqCst);
+                            next_turn = Some((next_client, next_gen, queued_content));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "antigravity: queued warm acp message could not be started");
+                            backend.settle_turn_end().await;
+                            backend.emit(
+                                next_gen,
+                                SessionEvent::TurnResult {
+                                    is_error: true,
+                                    api_error_status: None,
+                                    result_text: e.to_string(),
+                                    epoch: next_gen,
+                                    outcome: crate::event::TurnOutcome::Failed,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    backend.settle_turn_end().await;
+                }
+            }
+        });
+        Ok(first_turn_gen)
+    }
+
     async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
+        if self.config.antigravity_warm_acp {
+            return self.start_warm_turn(content).await;
+        }
         let turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let input = ArgvInput {
             prompt: Self::prompt_text(&content),
@@ -910,10 +1166,39 @@ impl SessionBackend for AntigravitySessionBackend {
                 if matches!(target, CancelTarget::Tool { .. }) {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
                 }
-                self.terminate().await;
-                // The user asked to stop — running what they queued afterwards
-                // would be the opposite of what they meant.
-                self.queued.lock().await.clear();
+                if self.config.antigravity_warm_acp {
+                    let active_gen = self.turn_gen.load(Ordering::SeqCst);
+                    self.cancelled_turn_gen.store(active_gen, Ordering::SeqCst);
+                    self.queued.lock().await.clear();
+                    self.deny_all_pending().await;
+                    if let Some(client) = self.warm_acp.lock().await.clone() {
+                        let sent = client.send_cancel_notification().await;
+                        if !sent {
+                            client.shutdown().await;
+                        } else {
+                            let weak = self.weak_self.get().cloned();
+                            let warm_slot = Arc::clone(&self.warm_acp);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                if let Some(b) = weak.and_then(|w| w.upgrade())
+                                    && b.in_flight.load(Ordering::SeqCst)
+                                    && b.turn_gen.load(Ordering::SeqCst) == active_gen
+                                {
+                                    client.shutdown().await;
+                                    let mut guard = warm_slot.lock().await;
+                                    if guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, &client)) {
+                                        *guard = None;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    self.terminate().await;
+                    // The user asked to stop — running what they queued afterwards
+                    // would be the opposite of what they meant.
+                    self.queued.lock().await.clear();
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,
@@ -973,17 +1258,51 @@ impl SessionBackend for AntigravitySessionBackend {
                         },
                     );
                 }
+                if self.config.antigravity_warm_acp && !self.in_flight.load(Ordering::SeqCst) {
+                    let desired_mode = self.effective_mode();
+                    if let Some(client) = self.warm_acp.lock().await.clone() {
+                        tokio::spawn(async move {
+                            if let Some(sid) = client.bound_session_id().await {
+                                client.sync_desired_config(&sid, None, desired_mode).await;
+                            }
+                        });
+                    }
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
                     turn_gen,
                 })
             }
-            Command::SetModel { .. } => Ok(CommandReceipt {
-                accepted: true,
-                admission: Admission::Started,
-                turn_gen: self.turn_gen.load(Ordering::SeqCst),
-            }),
+            Command::SetModel { ref model } => {
+                if let Ok(mut guard) = self.model_override.write() {
+                    *guard = Some(model.clone());
+                }
+                let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+                self.emit(
+                    turn_gen,
+                    SessionEvent::ConfigChanged {
+                        mode: None,
+                        model: Some(model.clone()),
+                    },
+                );
+                if self.config.antigravity_warm_acp && !self.in_flight.load(Ordering::SeqCst) {
+                    let desired_model = self.effective_model();
+                    let desired_mode = self.effective_mode();
+                    if let Some(client) = self.warm_acp.lock().await.clone() {
+                        tokio::spawn(async move {
+                            if let Some(sid) = client.bound_session_id().await {
+                                client.sync_desired_config(&sid, desired_model, desired_mode).await;
+                            }
+                        });
+                    }
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen,
+                })
+            }
             Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
             Command::Rewind { .. } => Err(BackendError::CommandNotSupported { command: "rewind" }),
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
@@ -1008,8 +1327,13 @@ impl SessionBackend for AntigravitySessionBackend {
         Capabilities {
             available_models: self.models.read().map(|m| m.clone()).unwrap_or_default(),
             available_modes: antigravity_modes(),
-            current_model: self.config.model.clone(),
-            current_mode: self.config.mode.clone(),
+            current_model: self
+                .model_override
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+                .or_else(|| self.config.model.clone()),
+            current_mode: self.effective_mode(),
             slash_commands: self.slash_commands.clone(),
             // agy runs one process per turn and `--mode` is a spawn flag, so a turn
             // already running keeps the mode it was spawned with; the switch reaches agy
@@ -1051,6 +1375,9 @@ impl SessionBackend for AntigravitySessionBackend {
     async fn terminate(&self) {
         if let Some(proc) = self.current.lock().await.take() {
             let _ = proc.kill(std::time::Duration::from_secs(2)).await;
+        }
+        if let Some(client) = self.warm_acp.lock().await.take() {
+            client.shutdown().await;
         }
         // The process that would have consumed these answers is gone.
         self.deny_all_pending().await;
@@ -1256,12 +1583,15 @@ mod tests {
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config: config("/w"),
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
             turn_gen: AtomicU64::new(1),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1390,13 +1720,16 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config: cfg,
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
             event_tx,
             turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1679,13 +2012,16 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config: cfg,
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
             event_tx,
             turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1750,6 +2086,7 @@ mod tests {
             }])),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config: SessionConfig {
                 cwd: Some("/w".into()),
                 model: Some("gemini-3.1-pro-high".into()),
@@ -1759,8 +2096,10 @@ mod tests {
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
             turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1886,6 +2225,7 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(
                 models
                     .iter()
@@ -1901,8 +2241,10 @@ mod tests {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
             event_tx,
             turn_gen: AtomicU64::new(0),
+            cancelled_turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            warm_acp: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),

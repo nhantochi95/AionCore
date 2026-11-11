@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole};
 
@@ -8,6 +8,119 @@ pub(super) const MAX_RECENT_COMPLETED_ROWS: usize = 8;
 pub(super) const MAX_TEAMMATE_RECENT_COMPLETED_ROWS: usize = 3;
 pub(super) const MAX_SUBJECT_CHARS: usize = 120;
 pub(super) const MAX_BLOCKED_BY_IDS: usize = 5;
+
+/// Per-slot task board digest cursor so subsequent turns only receive a 1-line
+/// unchanged marker or changed/new rows instead of re-sending the entire table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskBoardDigestCursor {
+    pub row_fingerprints: HashMap<String, String>,
+    pub active_count: usize,
+    pub completed_count: usize,
+    pub deleted_count: usize,
+    pub initialized: bool,
+}
+
+impl TaskBoardDigestCursor {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn task_row_fingerprint(task: &TeamTask, current_slot_ids: &HashSet<String>) -> String {
+    format!(
+        "| {} | {} | {} | {} | {} |",
+        short_task_id(&task.id),
+        truncate_subject(&task.subject),
+        task.status,
+        render_owner(task, current_slot_ids),
+        render_blocked_by(&task.blocked_by),
+    )
+}
+
+pub(super) fn render_task_board_delta(
+    agent: &TeamAgent,
+    tasks: &[TeamTask],
+    current_slot_ids: &HashSet<String>,
+    cursor: &mut TaskBoardDigestCursor,
+) -> String {
+    let visible_tasks = filter_summary_input(tasks, current_slot_ids);
+    let selection = select_summary_tasks(agent, &visible_tasks);
+    let selected = selection.tasks;
+    let active_count = tasks.iter().filter(|task| is_active(task.status)).count();
+    let completed_count = tasks.iter().filter(|task| task.status == TaskStatus::Completed).count();
+    let deleted_count = tasks.iter().filter(|task| task.status == TaskStatus::Deleted).count();
+
+    let next_fingerprints: HashMap<String, String> = selected
+        .iter()
+        .map(|task| (task.id.clone(), task_row_fingerprint(task, current_slot_ids)))
+        .collect();
+
+    if !cursor.initialized {
+        cursor.row_fingerprints = next_fingerprints;
+        cursor.active_count = active_count;
+        cursor.completed_count = completed_count;
+        cursor.deleted_count = deleted_count;
+        cursor.initialized = true;
+        return render_task_board_summary(agent, tasks, current_slot_ids);
+    }
+
+    if next_fingerprints == cursor.row_fingerprints
+        && active_count == cursor.active_count
+        && completed_count == cursor.completed_count
+        && deleted_count == cursor.deleted_count
+    {
+        return format!(
+            "## Task Board\n\nUnchanged since your last turn (active={active_count}, completed={completed_count}).\n\n"
+        );
+    }
+
+    let changed_rows: Vec<String> = selected
+        .iter()
+        .filter_map(|task| {
+            let rendered = next_fingerprints.get(&task.id)?;
+            if cursor.row_fingerprints.get(&task.id) == Some(rendered) {
+                None
+            } else {
+                Some(rendered.clone())
+            }
+        })
+        .collect();
+
+    let removed_ids: Vec<String> = cursor
+        .row_fingerprints
+        .keys()
+        .filter(|prev_id| !next_fingerprints.contains_key(*prev_id))
+        .map(|prev_id| short_task_id(prev_id))
+        .collect();
+
+    cursor.row_fingerprints = next_fingerprints;
+    cursor.active_count = active_count;
+    cursor.completed_count = completed_count;
+    cursor.deleted_count = deleted_count;
+
+    if tasks.is_empty() {
+        return "## Task Board Delta\n\nNo tasks on the board.\n\n".to_owned();
+    }
+
+    let mut output = String::with_capacity(512);
+    output.push_str(&format!(
+        "## Task Board Delta (active={active_count}, completed={completed_count}; {} updated)\n\n",
+        changed_rows.len()
+    ));
+    if !changed_rows.is_empty() {
+        output.push_str("| ID | Subject | Status | Owner | Blocked By |\n");
+        output.push_str("|---|---|---|---|---|\n");
+        for row in &changed_rows {
+            output.push_str(row);
+            output.push('\n');
+        }
+    }
+    if !removed_ids.is_empty() {
+        output.push_str(&format!("No longer in active window: {}\n", removed_ids.join(", ")));
+    }
+    output.push('\n');
+    output
+}
 
 pub(super) fn render_task_board_summary(
     agent: &TeamAgent,
@@ -291,8 +404,26 @@ fn render_owner(task: &TeamTask, current_slot_ids: &HashSet<String>) -> String {
     }
 }
 
-fn short_task_id(id: &str) -> String {
-    format!("{}…", id.chars().take(8).collect::<String>())
+fn is_uuid_v7(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[14] == b'7'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+        && id.split('-').all(|seg| seg.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+pub(crate) fn short_task_id(id: &str) -> String {
+    // UUIDv7 shares its leading 48-bit timestamp across tasks created in the
+    // same minute/millisecond; emit its trailing 8 random hex chars instead.
+    if is_uuid_v7(id) {
+        id[28..36].to_owned()
+    } else {
+        id.chars().take(8).collect()
+    }
 }
 
 fn truncate_subject(subject: &str) -> String {
@@ -420,8 +551,8 @@ mod tests {
         let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.contains("Showing 2 of 2 tasks."));
         assert!(payload.contains("Hidden: active=0, completed=0, deleted=0."));
-        assert!(payload.contains("| aaaaaaaa… | Owned active | in_progress | worker-1 | - |"));
-        assert!(payload.contains("| bbbbbbbb… | Other pending | pending | worker-2 | - |"));
+        assert!(payload.contains("| aaaaaaaa | Owned active | in_progress | worker-1 | - |"));
+        assert!(payload.contains("| bbbbbbbb | Other pending | pending | worker-2 | - |"));
     }
 
     #[test]
@@ -486,8 +617,8 @@ mod tests {
         assert_eq!(row_count(&payload), MAX_WAKE_TASK_ROWS);
         assert!(payload.contains("Showing 40 of 45 tasks."));
         assert!(payload.contains("Hidden: active=5, completed=0, deleted=0."));
-        assert!(payload.contains("| task0044… | Active 44 | pending | worker-2 | - |"));
-        assert!(!payload.contains("| task0004… | Active 4 | pending | worker-2 | - |"));
+        assert!(payload.contains("| task0044 | Active 44 | pending | worker-2 | - |"));
+        assert!(!payload.contains("| task0004 | Active 4 | pending | worker-2 | - |"));
     }
 
     #[test]
@@ -826,7 +957,7 @@ mod tests {
         ];
         let payload = render_task_board_summary(&agent("worker-1"), &[active], &default_roster());
         assert!(payload.contains(&format!("{}...", "x".repeat(MAX_SUBJECT_CHARS))));
-        assert!(payload.contains("block001…"));
+        assert!(payload.contains("block001"));
         assert!(payload.contains("+1 more"));
         assert!(!payload.contains("block006"));
     }
@@ -844,7 +975,7 @@ mod tests {
         active.blocked_by = vec!["bbbbbbbb-1234-5678".to_owned()];
         let payload = render_task_board_summary(&agent("worker-1"), &[active], &default_roster());
         assert!(
-            payload.contains("| aaaaaaaa… | Active | pending | 019f4056-fd18-7411-ab09-8868ff17cb36 | bbbbbbbb… |")
+            payload.contains("| aaaaaaaa | Active | pending | 019f4056-fd18-7411-ab09-8868ff17cb36 | bbbbbbbb |")
         );
         assert!(!payload.contains("bbbbbbbb-1234-5678"));
     }
@@ -903,8 +1034,8 @@ mod tests {
 
         assert!(payload.contains("Removed member blocker"));
         assert!(payload.contains("Current member blocked"));
-        assert!(payload.contains("| blockera… | Removed member blocker | in_progress | worker-2 (removed) | - |"));
-        assert!(payload.contains("| currenta… | Current member blocked | pending | worker-1 | blockera… |"));
+        assert!(payload.contains("| blockera | Removed member blocker | in_progress | worker-2 (removed) | - |"));
+        assert!(payload.contains("| currenta | Current member blocked | pending | worker-1 | blockera |"));
         assert!(payload.contains("Hidden: active=0, completed=0, deleted=0."));
     }
 
@@ -976,5 +1107,40 @@ mod tests {
         assert!(!payload.contains("Removed completed"));
         assert!(!payload.contains("Removed deleted"));
         assert!(payload.contains("Hidden: active=0, completed=1, deleted=1."));
+    }
+
+    #[test]
+    fn delta_cursor_emits_full_then_one_line_unchanged_then_changed_rows_only() {
+        let mut cursor = TaskBoardDigestCursor::default();
+        let mut tasks = vec![
+            task("aaaaaaaa-1111", "Task A", TaskStatus::InProgress, Some("worker-1"), 1, 10),
+            task("bbbbbbbb-1111", "Task B", TaskStatus::Pending, Some("worker-2"), 2, 20),
+        ];
+
+        // Turn 1: full summary
+        let turn1 = render_task_board_delta(&agent("lead-1"), &tasks, &default_roster(), &mut cursor);
+        assert!(turn1.contains("## Current Task Board Summary"));
+        assert!(turn1.contains("| aaaaaaaa | Task A | in_progress | worker-1 | - |"));
+        assert!(turn1.contains("| bbbbbbbb | Task B | pending | worker-2 | - |"));
+
+        // Turn 2 (no change): 1-line unchanged marker
+        let turn2 = render_task_board_delta(&agent("lead-1"), &tasks, &default_roster(), &mut cursor);
+        assert!(turn2.contains("Unchanged since your last turn (active=2, completed=0)."));
+        assert!(!turn2.contains("| aaaaaaaa |"));
+        assert!(!turn2.contains("| bbbbbbbb |"));
+
+        // Turn 3 (Task A completed, Task B untouched): only Task A row in delta!
+        tasks[0].status = TaskStatus::Completed;
+        tasks[0].updated_at = 30;
+        let turn3 = render_task_board_delta(&agent("lead-1"), &tasks, &default_roster(), &mut cursor);
+        assert!(turn3.contains("## Task Board Delta (active=1, completed=1; 1 updated)"));
+        assert!(turn3.contains("| aaaaaaaa | Task A | completed | worker-1 | - |"));
+        assert!(!turn3.contains("| bbbbbbbb |"), "unchanged Task B must be omitted in delta");
+
+        // Cursor reset (e.g. /clear or compaction rollover): emits full summary again
+        cursor.reset();
+        let after_reset = render_task_board_delta(&agent("lead-1"), &tasks, &default_roster(), &mut cursor);
+        assert!(after_reset.contains("## Current Task Board Summary"));
+        assert!(after_reset.contains("Task B"));
     }
 }

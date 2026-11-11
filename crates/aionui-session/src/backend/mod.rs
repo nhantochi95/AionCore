@@ -335,4 +335,12 @@ pub struct SessionConfig {
     /// SESSION-cumulative across process recycles and app restarts. `None`
     /// (default) = fresh conversation, base 0. Other backends ignore it.
     pub initial_cost_usd: Option<f64>,
+    /// Keep a persistent warm `agy acp` process across turns instead of spawning
+    /// a cold `agy -p` process per turn. Opt-in (`false` by default in `SessionConfig`)
+    /// so existing unit tests exercising the `-p` wire remain byte-identical while
+    /// production Antigravity sessions enable warm multi-turn execution.
+    pub antigravity_warm_acp: bool,
+    /// Pass `--include-default-customizations=false` when spawning `agy acp` so
+    /// background Team slots skip broken/slow global MCP servers and user skill scans.
+    pub antigravity_isolate_default_customizations: bool,
 }

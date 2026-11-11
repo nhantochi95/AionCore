@@ -338,6 +338,7 @@ pub async fn build_module_states(
         event_bus: services.event_bus.clone(),
         data_dir: services.data_dir.clone(),
         slot_locks: Arc::new(dashmap::DashMap::new()),
+        active_run_turn_hops: Arc::new(dashmap::DashMap::new()),
     };
     telegram_team_hub.set_team_hub_orchestrator(team_hub_orchestrator.clone());
     telegram_team_hub.spawn_event_watcher();

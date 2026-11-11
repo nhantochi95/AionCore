@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use aionui_api_types::TeamToolTransport;
 
-mod wake_summary;
+pub(crate) mod wake_summary;
 
 pub use aionui_team_prompts::AvailableAssistant;
+pub use wake_summary::TaskBoardDigestCursor;
 
 use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeamTask};
 
@@ -134,7 +135,7 @@ fn sanitize_handoff_msg_id(raw_id: &str) -> String {
     }
 }
 
-fn write_wake_overflow_handoff(
+pub(crate) fn write_mailbox_overflow_handoff(
     team_workspace: &str,
     msg: &MailboxMessage,
     type_label: &str,
@@ -181,10 +182,10 @@ fn format_budgeted_wake_message_body(
         return msg.content.clone();
     }
 
-    let saved_path = team_workspace.and_then(|ws| write_wake_overflow_handoff(ws, msg, type_label));
+    let saved_path = team_workspace.and_then(|ws| write_mailbox_overflow_handoff(ws, msg, type_label));
     let marker = match saved_path {
         Some(path) => format!(
-            "\n...[truncated — full report saved to {} or via team_read_messages]...\n",
+            "\n...[truncated — full report saved to {}; read that file directly]...\n",
             path.display()
         ),
         None => "\n...[truncated — full report saved via team_read_messages]...\n".to_owned(),
@@ -208,6 +209,15 @@ fn format_budgeted_wake_message_body(
     preview
 }
 
+#[derive(Default)]
+pub struct WakePayloadOptions<'a> {
+    pub team_workspace: Option<&'a str>,
+    pub include_workspace_banner: bool,
+    pub initial_roster_line: Option<&'a str>,
+    pub pending_roster_notes: &'a [String],
+    pub cursor: Option<&'a mut TaskBoardDigestCursor>,
+}
+
 pub fn build_wake_payload(
     agent: &TeamAgent,
     tasks: &[TeamTask],
@@ -224,7 +234,46 @@ pub fn build_wake_payload_with_workspace(
     current_slot_ids: &HashSet<String>,
     team_workspace: Option<&str>,
 ) -> String {
+    build_wake_payload_with_options(
+        agent,
+        tasks,
+        unread_messages,
+        current_slot_ids,
+        WakePayloadOptions {
+            team_workspace,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn build_wake_payload_with_options(
+    agent: &TeamAgent,
+    tasks: &[TeamTask],
+    unread_messages: &[MailboxMessage],
+    current_slot_ids: &HashSet<String>,
+    options: WakePayloadOptions<'_>,
+) -> String {
     let mut payload = String::with_capacity(2048);
+
+    if options.include_workspace_banner
+        && let Some(ws) = options.team_workspace.map(str::trim).filter(|ws| !ws.is_empty())
+    {
+        payload.push_str(&format!(
+            "## Team Workspace\n\nShared workspace: `{ws}`\n\n"
+        ));
+    }
+
+    if let Some(roster_line) = options.initial_roster_line.map(str::trim).filter(|s| !s.is_empty()) {
+        payload.push_str(&format!("## Team Roster\n\n{roster_line}\n\n"));
+    }
+
+    if !options.pending_roster_notes.is_empty() {
+        payload.push_str("## Roster Updates\n\n");
+        for note in options.pending_roster_notes {
+            payload.push_str(&format!("- {note}\n"));
+        }
+        payload.push('\n');
+    }
 
     if !unread_messages.is_empty() {
         payload.push_str("## New Messages\n\n");
@@ -236,7 +285,7 @@ pub fn build_wake_payload_with_workspace(
                 MailboxMessageType::ShutdownRequest => "shutdown_request",
             };
             let rendered_body =
-                format_budgeted_wake_message_body(msg, type_label, &mut used_unread_chars, team_workspace);
+                format_budgeted_wake_message_body(msg, type_label, &mut used_unread_chars, options.team_workspace);
             payload.push_str(&format!(
                 "- From `{}` [{}]: {}\n",
                 msg.from_agent_id, type_label, rendered_body,
@@ -250,7 +299,23 @@ pub fn build_wake_payload_with_workspace(
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
     }
 
-    payload.push_str(&wake_summary::render_task_board_summary(agent, tasks, current_slot_ids));
+    match options.cursor {
+        Some(cursor) => {
+            payload.push_str(&wake_summary::render_task_board_delta(
+                agent,
+                tasks,
+                current_slot_ids,
+                cursor,
+            ));
+        }
+        None => {
+            payload.push_str(&wake_summary::render_task_board_summary(
+                agent,
+                tasks,
+                current_slot_ids,
+            ));
+        }
+    }
 
     payload.push_str(&format!(
         "You are **{}** (role: {}). Proceed with your work.\n",
@@ -365,28 +430,27 @@ mod tests {
         let assistants = default_assistants();
         let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
 
-        // Workflow uses tools for dynamic state.
+        // Workflow uses roster snapshot / tools without mandatory Turn-1 polling.
         assert!(prompt.contains("## Workflow"));
-        assert!(prompt.contains("FIRST call `team_members`"));
+        assert!(prompt.contains("## Team Roster"));
+        assert!(!prompt.contains("FIRST call `team_members`"));
         assert!(prompt.contains("call `team_list_assistants`"));
-        assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
-        assert!(prompt.contains("End your turn after the proposal"));
+        assert!(prompt.contains("do NOT call `team_spawn_agent` in the proposal turn"));
+        assert!(prompt.contains("end your turn"));
 
         // Assistant selection, not model selection.
-        assert!(prompt.contains("## Assistant Selection Guidelines"));
         assert!(!prompt.contains("team_list_models"));
-        assert!(prompt.contains("Do not pass a model to `team_spawn_agent`"));
+        assert!(prompt.contains("never pass a model"));
 
         // Conversation Style — don't pitch proposals up-front
         assert!(prompt.contains("## Conversation Style"));
-        assert!(prompt.contains("reply warmly and naturally"));
+        assert!(prompt.contains("reply warmly"));
 
         // Idle, sequencing, shutdown, important rules
-        assert!(prompt.contains("## Teammate Idle State"));
+        assert!(prompt.contains("Idle signals are settled automatically"));
         assert!(prompt.contains("## Sequencing Dependent Work"));
-        assert!(prompt.contains("## Shutting Down Teammates"));
         assert!(prompt.contains("team_shutdown_agent"));
-        assert!(prompt.contains("## Important Rules"));
+        assert!(prompt.contains("## Lifecycle & Important Rules"));
 
         // Team coordination tool list still referenced
         assert!(prompt.contains("team_send_message"));
@@ -394,7 +458,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Do NOT call `team_read_messages` routinely"));
         assert!(prompt.contains("`since_message_id`"));
         assert!(prompt.contains("`content_truncated: true`"));
     }
@@ -469,8 +533,9 @@ mod tests {
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("team_send_message"));
         assert!(prompt.contains("team_task_update"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Do NOT call `team_read_messages` routinely"));
         assert!(prompt.contains("`next_since_message_id`"));
+        assert!(prompt.contains("DONE_WITH_CONCERNS"));
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
         assert!(prompt.contains("STOP GENERATING"));
@@ -538,7 +603,7 @@ mod tests {
         assert!(payload.contains("in_progress"));
         assert!(payload.contains("Test Y"));
         assert!(payload.contains("pending"));
-        assert!(payload.contains("aaaaaaaa…"));
+        assert!(payload.contains("| aaaaaaaa |"));
     }
 
     #[test]
@@ -548,9 +613,7 @@ mod tests {
         task.blocked_by = vec!["task-a".into(), "task-b".into()];
         let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
 
-        assert!(payload.contains("task-a…"));
-        assert!(payload.contains("task-b…"));
-        assert!(!payload.contains("task-a, task-b"));
+        assert!(payload.contains("task-a, task-b"));
     }
 
     #[test]
@@ -577,7 +640,7 @@ mod tests {
         let agent = make_lead();
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
         let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
-        assert!(payload.contains("short…"));
+        assert!(payload.contains("| short |"));
     }
 
     #[test]

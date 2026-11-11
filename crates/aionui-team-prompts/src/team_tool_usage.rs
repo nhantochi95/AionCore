@@ -15,47 +15,44 @@ pub fn build_team_tool_usage(role: TeamPromptRole, transport: TeamToolTransport)
 }
 
 fn render_mcp_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
-    let mut text = String::from(
-        "You MUST use the `team_*` MCP tools for ALL team coordination.\n\
-Your platform may provide similarly named built-in tools. Do NOT use those.\n\
-Always use the `team_*` MCP tool versions.\n\
-Use `slot_id` values for all agent targets.\n\n\
-If a single `team_*` MCP tool call fails because of invalid arguments, schema mismatch, or role/permission constraints,\n\
-use \"$AIONUI_HELPER_BIN\" team capabilities or \"$AIONUI_HELPER_BIN\" team help to inspect the Team contract,\n\
-then retry the MCP tool call with corrected arguments.\n\
-If the `team_*` MCP tools are unavailable, missing, disconnected, or continue to fail after correction,\n\
-use the Team CLI fallback through \"$AIONUI_HELPER_BIN\" team ... commands to continue Team coordination.\n\n\
-For exact schema, run team capabilities.\n\n\
-| When | MCP tool | Input summary |\n\
-| --- | --- | --- |\n",
+    let names = descriptors
+        .iter()
+        .map(|tool| format!("`{}`", tool.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = format!(
+        "You MUST use the `team_*` MCP tools for ALL team coordination. Do NOT use similarly named built-in tools.\n\
+Use `slot_id` values for all agent targets. Available MCP tools (full schemas in MCP `tools/list`): {names}.\n\
+If a `team_*` MCP call fails schema/permission checks, run `\"$AIONUI_HELPER_BIN\" team capabilities` or `team help`, then retry the MCP tool call with corrected arguments. If MCP tools are unavailable/disconnected, use the Team CLI fallback via `\"$AIONUI_HELPER_BIN\" team ...`.\n"
     );
-    for tool in descriptors {
-        text.push_str(&format!(
-            "| {} | `{}` | {} |\n",
-            tool.when, tool.name, tool.input_summary
-        ));
-    }
     if role == TeamPromptRole::Teammate {
-        text.push_str("\nLead-only tools are unavailable to teammates.\n");
+        text.push_str("Lead-only tools are unavailable to teammates.\n");
     }
     text
 }
 
 fn render_cli_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
     let mut text = String::from(
-        "You MUST use AionCore Team CLI for ALL team coordination:\n\
-\"$AIONUI_HELPER_BIN\" team ...\n\n\
-Run \"$AIONUI_HELPER_BIN\" team capabilities when you need command names,\n\
-stdin JSON schema, required fields, enum values, permissions, examples,\n\
-or error meanings.\n\n\
-Run \"$AIONUI_HELPER_BIN\" team help when you need a short readable guide.\n\n\
-Do not guess team_id, slot_id, role, permissions, or internal tokens.\n\
-Do not claim you used MCP tools in CLI transport.\n\
-Use slot_id values from this prompt, team context, or team members results\n\
-for all agent targets.\n\n\
-If the CLI returns schema_validation_failed, unknown_command, or permission_denied,\n\
-consult team capabilities or team help, correct the call, and retry at most once.\n\n\
-For exact schema, run team capabilities.\n\n\
+        "You MUST use AionCore Team CLI for ALL team coordination (all commands read JSON from stdin and accept no positional args):\n\
+- POSIX sh/bash: `printf '%s' '{...}' | \"$AIONUI_HELPER_BIN\" team ...`\n\
+- Windows PowerShell: `'{...}' | & \"$env:AIONUI_HELPER_BIN\" team ...` (never use bash `printf` in PowerShell)\n\n",
+    );
+    match role {
+        TeamPromptRole::Lead => text.push_str(
+            "Fast 1-shot Lead patterns:\n\
+- Dispatch 2+ tasks atomically in 1 call: `'[{\"subject\":\"...\",\"description\":\"...\",\"owner\":\"<slot_id>\"}]' | & \"$env:AIONUI_HELPER_BIN\" team task create-batch`\n\
+- Mixed tool batch in 1 call: `'[{\"tool\":\"team_task_update\",\"arguments\":{...}}]' | & \"$env:AIONUI_HELPER_BIN\" team batch`\n\n",
+        ),
+        TeamPromptRole::Teammate => text.push_str(
+            "Fast 1-shot Teammate pattern:\n\
+- Complete task + report to Lead in 1 atomic call (no extra send-message needed): `'{\"task_id\":\"<id>\",\"status\":\"completed\",\"reply_message\":\"Status: DONE...\"}' | & \"$env:AIONUI_HELPER_BIN\" team task update`\n\n",
+        ),
+    }
+    text.push_str(
+        "Run `\"$AIONUI_HELPER_BIN\" team help` for a concise guide or `\"$AIONUI_HELPER_BIN\" team capabilities` for full JSON schemas.\n\
+Do not guess team_id, slot_id, role, permissions, or internal tokens. Do not claim you used MCP tools in CLI transport.\n\
+Use `slot_id` values from this prompt, `team context`, or `team members` for all agent targets.\n\
+If the CLI returns `schema_validation_failed`, `unknown_command`, or `permission_denied`, consult `team help` or `team capabilities`, correct the call, and retry at most once.\n\n\
 | When | CLI command | Canonical tool | Input summary |\n\
 | --- | --- | --- | --- |\n",
     );
@@ -85,6 +82,15 @@ mod tests {
         assert!(usage.contains("team send-message"));
         assert!(!usage.contains("team spawn-agent"));
         assert!(usage.contains("Lead-only tools are unavailable to teammates"));
+        assert!(usage.contains("reply_message"));
+        assert!(!usage.contains("create-batch"), "teammate CLI guide must not advertise lead batch creation");
+    }
+
+    #[test]
+    fn cli_lead_usage_includes_create_batch_pattern() {
+        let usage = build_team_tool_usage(TeamPromptRole::Lead, TeamToolTransport::CliAssumed);
+        assert!(usage.contains("team task create-batch"));
+        assert!(usage.contains("team batch"));
     }
 
     #[test]

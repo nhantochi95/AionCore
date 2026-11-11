@@ -5,23 +5,9 @@ pub const TEAM_TOOLS_SCHEMA_VERSION: u32 = 1;
 
 pub const TEAM_SPAWN_AGENT_DESCRIPTION: &str = r#"Create a new teammate agent to join the team.
 
-Use this only when one of the following is true:
-- The user explicitly approved the proposed teammate lineup in a previous message
-- The user explicitly instructed you to create a specific teammate immediately
-
-Before calling this tool in the normal planning flow:
-- Start with one short sentence explaining why additional teammates would help
-- Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, and recommended assistant
-- Include each teammate's responsibility and recommended assistant
-- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
-- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
-- Do NOT call this tool in that same turn; wait for explicit approval in a later user message
-
-When calling this tool, always provide assistant_id from the available assistants catalog.
-Do not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.
-
-The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
+Use only when the user explicitly approved the proposed lineup or explicitly asked to create a teammate immediately.
+Before calling this tool in normal planning: briefly state why teammates help, present a table (name, responsibility, recommended assistant), remind the user they can adjust or replace teammates later, and wait for approval in a later user message.
+Always pass assistant_id from team_list_assistants; do not pass a model."#;
 
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str = "Get detailed information about an assistant before spawning it as a teammate.\n\n\
 Returns the assistant's full description, enabled skills, and example tasks so you can\n\
@@ -153,8 +139,9 @@ impl TeamToolDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamToolCall {
+    #[serde(alias = "tool_name", alias = "name")]
     pub tool: TeamToolName,
-    #[serde(default)]
+    #[serde(default, alias = "args")]
     pub arguments: Value,
 }
 
@@ -267,6 +254,11 @@ pub struct TeamToolRuntimeCallRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamToolRuntimeBatchCallRequest {
+    pub calls: Vec<TeamToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamToolRuntimeCallResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
@@ -290,11 +282,26 @@ pub fn team_tool_descriptors() -> Vec<TeamToolDescriptor> {
 }
 
 pub fn team_tool_descriptors_for_role(role: TeamToolRole) -> Vec<TeamToolDescriptor> {
+    team_tool_descriptors_for_context(role, true)
+}
+
+pub fn team_tool_descriptors_for_context(
+    role: TeamToolRole,
+    include_shared_room_tools: bool,
+) -> Vec<TeamToolDescriptor> {
     let is_lead = role == TeamToolRole::Lead;
     team_tool_descriptors()
         .into_iter()
         .filter(|descriptor| is_lead || !descriptor.permission.is_lead_only())
+        .filter(|descriptor| include_shared_room_tools || !is_shared_room_tool_name(&descriptor.name))
         .collect()
+}
+
+pub fn is_shared_room_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "team_room_read" | "team_room_post" | "team_room_task_create" | "team_room_task_update"
+    )
 }
 
 pub fn team_tool_descriptor(name: &str) -> Option<TeamToolDescriptor> {
@@ -424,27 +431,29 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamTaskUpdate,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Update an existing task on the team task board.",
+            description: "Update an existing task on the team task board (and optionally deliver a 1-shot reply_message to the Team Lead in the same atomic call).",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "task_id": { "type": "string", "description": "Task ID to update" },
+                    "task_id": { "type": "string", "description": "Task ID (full UUID or unambiguous 8+ char prefix)" },
                     "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted"], "description": "New status" },
                     "description": { "type": "string", "description": "New description" },
                     "owner": { "type": "string", "description": "New owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
+                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" },
+                    "reply_message": { "type": "string", "description": "Optional 1-shot message delivered atomically to the Team Lead mailbox when updating/completing this task (replaces a separate team_send_message call)" },
+                    "reply_files": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace file paths attached to reply_message" }
                 },
                 "required": ["task_id"]
             }),
             cli_command: &["task", "update"],
             when: "Update task",
-            input_summary: "task_id, optional status/owner/deps",
+            input_summary: "task_id, optional status/owner/deps/reply_message/reply_files",
         },
         TeamToolSpec {
             name: TeamToolName::TeamTaskList,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views.",
+            description: "List tasks on the team task board. Pass {} for up to 50 tasks, or use owner/status/include_deleted/limit for filtered views.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -477,7 +486,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum number of returned tasks. Values above 200 are clamped to 200."
+                        "description": "Maximum number of returned tasks (default 50, max 200)."
                     }
                 }
             }),
@@ -487,7 +496,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         },
         TeamToolSpec {
             name: TeamToolName::TeamListAssistants,
-            permission: TeamToolPermission::AnyTeamAgent,
+            permission: TeamToolPermission::LeadOnly,
             description: TEAM_LIST_ASSISTANTS_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
@@ -500,7 +509,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         },
         TeamToolSpec {
             name: TeamToolName::TeamDescribeAssistant,
-            permission: TeamToolPermission::AnyTeamAgent,
+            permission: TeamToolPermission::LeadOnly,
             description: TEAM_DESCRIBE_ASSISTANT_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
@@ -614,7 +623,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamRoomRead,
             permission: TeamToolPermission::LeadOnly,
-            description: "Read recent messages and cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only.",
+            description: "Read delta messages and open cross-team tasks from a Multi-Team Shared Room (Leader Hub). Lead only.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -623,16 +632,24 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                         "type": "string",
                         "description": "Optional Shared Room ID or name; defaults to the active pending handoff room or single joined room"
                     },
+                    "since_msg_id": {
+                        "type": "string",
+                        "description": "Optional message ID cursor; return only messages newer than this ID"
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum recent messages to return (default 30, max 100)"
+                        "description": "Maximum recent messages to return (default 12, max 50)"
+                    },
+                    "include_completed_tasks": {
+                        "type": "boolean",
+                        "description": "Include completed/cancelled cross-team tasks (default false)"
                     }
                 }
             }),
             cli_command: &["room", "read"],
-            when: "Read shared room messages/tasks",
-            input_summary: "optional room_id, limit",
+            when: "Read shared room delta",
+            input_summary: "optional room_id, since_msg_id, limit, include_completed_tasks",
         },
         TeamToolSpec {
             name: TeamToolName::TeamRoomPost,
@@ -694,7 +711,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                     "blocked_by": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Cross-team task IDs that must complete before waking the target team"
+                        "description": "Cross-team task IDs that must reach in_review/completed before waking the target team"
                     },
                     "files": {
                         "type": "array",
@@ -711,7 +728,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamRoomTaskUpdate,
             permission: TeamToolPermission::LeadOnly,
-            description: "Update the status, result summary, or output artifacts of a cross-team task in a Shared Room. Marking completed automatically unblocks and wakes dependent teams. Lead only.",
+            description: "Update cross-team task status, summary, or output artifacts in a Shared Room. Agents should set status=\"in_review\" when ready for human Done approval (which unblocks dependent teams) or \"blocked\" on blockers. Lead only.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -722,8 +739,8 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "in_progress", "completed", "cancelled"],
-                        "description": "Updated cross-team task status"
+                        "enum": ["pending", "in_progress", "in_review", "blocked", "completed", "cancelled"],
+                        "description": "Updated cross-team task status (use in_review when work is ready; completed is human-only)"
                     },
                     "result_summary": {
                         "type": "string",
@@ -817,8 +834,38 @@ mod tests {
         assert!(!names.contains(&"team_room_post".to_owned()));
         assert!(!names.contains(&"team_room_task_create".to_owned()));
         assert!(!names.contains(&"team_room_task_update".to_owned()));
+        assert!(!names.contains(&"team_list_assistants".to_owned()));
+        assert!(!names.contains(&"team_describe_assistant".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
+    }
+
+    #[test]
+    fn context_scoped_descriptors_gate_shared_room_tools_when_unbound() {
+        let standalone = team_tool_descriptors_for_context(TeamToolRole::Lead, false);
+        let standalone_names: Vec<&str> = standalone.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(standalone.len(), 14);
+        assert!(!standalone_names.contains(&"team_room_read"));
+        assert!(!standalone_names.contains(&"team_room_post"));
+        assert!(!standalone_names.contains(&"team_room_task_create"));
+        assert!(!standalone_names.contains(&"team_room_task_update"));
+        assert!(standalone_names.contains(&"team_spawn_agent"));
+
+        let room_bound = team_tool_descriptors_for_context(TeamToolRole::Lead, true);
+        assert_eq!(room_bound.len(), 18);
+
+        let room_read = team_tool_descriptor("team_room_read").expect("room_read");
+        let read_props = room_read.input_schema["properties"].as_object().unwrap();
+        assert!(read_props.contains_key("since_msg_id"));
+        assert!(read_props.contains_key("limit"));
+        assert!(read_props.contains_key("include_completed_tasks"));
+
+        let room_task_update = team_tool_descriptor("team_room_task_update").expect("room_task_update");
+        let statuses = room_task_update.input_schema["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(statuses.contains(&json!("in_review")));
+        assert!(statuses.contains(&json!("blocked")));
     }
 
     #[test]

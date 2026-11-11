@@ -198,7 +198,7 @@ fn load_session_params(sid: &str, config: &SessionConfig) -> Value {
 /// the spec's order — the app boundary already sorts them (parity with the legacy
 /// `session_server_to_sdk_mcp_server` deterministic sort) so hermetic assertions
 /// are stable.
-fn build_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Vec<Value> {
+pub(crate) fn build_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Vec<Value> {
     use crate::backend::McpTransport;
     let kv = |pairs: &[(String, String)]| -> Vec<Value> {
         pairs.iter().map(|(k, v)| json!({ "name": k, "value": v })).collect()
@@ -1628,7 +1628,7 @@ async fn handle_reverse_rpc(
 /// `extract_mcp_server_name`) and the answerable `options` (optionId + kind), so
 /// the conversation can both decide (server allowlist) and pick an allow option
 /// without re-reading the wire. Returns `None` when nothing useful is present.
-fn parse_permission_metadata(params: Option<&Value>) -> Option<Value> {
+pub(crate) fn parse_permission_metadata(params: Option<&Value>) -> Option<Value> {
     let params = params?;
     let tool_call = params.get("toolCall");
     let server_name = extract_mcp_server_name(tool_call);
@@ -1937,7 +1937,7 @@ pub(crate) fn map_plan_status(s: &str) -> crate::event::PlanStatus {
 
 /// LC-8a: map an ACP plan-step priority string → `PlanPriority` (None when absent /
 /// unknown — codex never sets one).
-fn map_plan_priority(s: Option<&str>) -> Option<crate::event::PlanPriority> {
+pub(crate) fn map_plan_priority(s: Option<&str>) -> Option<crate::event::PlanPriority> {
     use crate::event::PlanPriority;
     match s {
         Some("high") => Some(PlanPriority::High),
@@ -1961,16 +1961,21 @@ fn map_plan_priority(s: Option<&str>) -> Option<crate::event::PlanPriority> {
 /// (claude-agent-acp / hermes carry it: {inputTokens, outputTokens, totalTokens,
 /// cost:{amount}}). Previously DROPPED — only the streaming usage_update was read,
 /// which lacks the per-direction split. None when no usage present or all-zero.
-fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
+pub(crate) fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
     let usage = frame.get("result")?.get("usage")?;
     let input = usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
     let output = usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+    let breakdown = crate::event::UsageBreakdown {
+        cached_read_tokens: usage.get("cachedReadTokens").and_then(Value::as_u64).unwrap_or(0),
+        cached_write_tokens: usage.get("cachedWriteTokens").and_then(Value::as_u64).unwrap_or(0),
+        thought_tokens: usage.get("thoughtTokens").and_then(Value::as_u64).unwrap_or(0),
+    };
     let total = usage
         .get("totalTokens")
         .and_then(Value::as_u64)
-        .unwrap_or(input + output);
+        .unwrap_or(input + output + breakdown.cached_read_tokens + breakdown.cached_write_tokens);
     let cost_usd = usage.get("cost").and_then(|c| c.get("amount")).and_then(Value::as_f64);
-    if total == 0 && cost_usd.is_none() {
+    if total == 0 && cost_usd.is_none() && breakdown.is_empty() {
         return None;
     }
     Some(SessionEvent::UsageDelta {
@@ -1980,12 +1985,11 @@ fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
         cost_usd,
         // ACP spells the context window `size` (see the notification path above).
         context_window: usage.get("size").and_then(Value::as_u64),
-        // ACP's end-of-turn usage carries no per-turn split either.
-        breakdown: crate::event::UsageBreakdown::default(),
+        breakdown,
     })
 }
 
-fn synth_turn_result(frame: &Value, turn_gen: u64, stderr_tail: Option<&str>) -> SessionEvent {
+pub(crate) fn synth_turn_result(frame: &Value, turn_gen: u64, stderr_tail: Option<&str>) -> SessionEvent {
     // A JSON-RPC error response (the prompt itself failed) → error terminal.
     if let Some(err) = frame.get("error") {
         let raw = err
@@ -2099,7 +2103,7 @@ fn reconcile_plan(
 }
 
 /// Map an ACP `stopReason` (snake_case wire) → `TurnOutcome`.
-fn map_stop_reason(stop: &str) -> TurnOutcome {
+pub(crate) fn map_stop_reason(stop: &str) -> TurnOutcome {
     match stop {
         "end_turn" => TurnOutcome::Completed {
             stop_reason: StopReason::EndTurn,
@@ -2126,7 +2130,7 @@ fn map_stop_reason(stop: &str) -> TurnOutcome {
 /// Map our multimodal `ContentBlock`s → ACP `session/prompt.prompt` content
 /// blocks (camelCase wire). Text + image (advertised); others dropped (UI gated
 /// by prompt_blocks).
-fn build_prompt_blocks(content: &[ContentBlock]) -> Vec<Value> {
+pub(crate) fn build_prompt_blocks(content: &[ContentBlock]) -> Vec<Value> {
     content
         .iter()
         .filter_map(|b| match b {
@@ -2154,7 +2158,7 @@ fn build_prompt_blocks(content: &[ContentBlock]) -> Vec<Value> {
 /// screenshot / vision tool) → decoded to `Image` (base64 `data` + `mimeType`);
 /// audio / resource_link / unknown have no neutral mapping yet and are dropped.
 /// Wire is camelCase; we also accept snake_case defensively.
-fn parse_acp_tool_content(update: &Value) -> Vec<crate::event::ToolResultContent> {
+pub(crate) fn parse_acp_tool_content(update: &Value) -> Vec<crate::event::ToolResultContent> {
     use crate::event::ToolResultContent;
     let mut out = Vec::new();
     if let Some(items) = update.get("content").and_then(Value::as_array) {
@@ -3766,6 +3770,20 @@ mod tests {
             }) => {
                 assert_eq!((input_tokens, output_tokens, total_tokens), (900, 50, 950));
                 assert_eq!(cost_usd, Some(0.007));
+            }
+            other => panic!("expected UsageDelta, got {other:?}"),
+        }
+        // When totalTokens is omitted, fallback total includes cachedReadTokens + cachedWriteTokens.
+        let cache_frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "stopReason": "end_turn",
+                "usage": { "inputTokens": 500, "outputTokens": 200, "cachedReadTokens": 18000, "cachedWriteTokens": 1000 } }
+        });
+        match parse_acp_result_usage(&cache_frame) {
+            Some(SessionEvent::UsageDelta { total_tokens, breakdown, .. }) => {
+                assert_eq!(total_tokens, 19_700);
+                assert_eq!(breakdown.cached_read_tokens, 18_000);
+                assert_eq!(breakdown.cached_write_tokens, 1_000);
             }
             other => panic!("expected UsageDelta, got {other:?}"),
         }

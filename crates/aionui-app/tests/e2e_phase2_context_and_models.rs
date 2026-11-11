@@ -941,3 +941,358 @@ async fn e2e_turn_settled_drains_queued_model_swap_and_triggers_80_pct_auto_comp
         "turn-settle auto-compact must not loop on zero new messages"
     );
 }
+
+#[tokio::test]
+async fn e2e_quota_presets_economy_prefs_160k_cap_and_wallets_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services, _hub) = build_temp_app(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    make_cli_agents_online(&services).await;
+    let openrouter_id = seed_openrouter_provider(&services).await;
+
+    // 1. Connected models catalog must expose `recommended_presets` (`smart_split` + `all_free_cli`)
+    let cat_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/team-hub/connected-models", &token))
+        .await
+        .unwrap();
+    assert_eq!(cat_resp.status(), StatusCode::OK);
+    let cat_data = body_json(cat_resp).await["data"].clone();
+    let presets = cat_data["recommended_presets"].as_array().unwrap();
+    assert!(presets.iter().any(|p| p["id"] == "smart_split"));
+    assert!(presets.iter().any(|p| p["id"] == "all_free_cli"));
+
+    // 2. Create a 2-slot team and switch BOTH Lead and Worker onto Paid API (`aionrs` OpenRouter)
+    let ws_team = tmp.path().join("ws_preset");
+    std::fs::create_dir_all(&ws_team).unwrap();
+    let created_team = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            json!({
+                "name": "PresetEconomyTeam",
+                "workspace": ws_team.to_string_lossy(),
+                "workspace_mode": "isolated",
+                "agents": [
+                    {
+                        "name": "ReasoningLead",
+                        "role": "lead",
+                        "model": "claude",
+                        "assistant_id": format!("bare:{CLAUDE_AGENT_ID}")
+                    },
+                    {
+                        "name": "BuilderWorker",
+                        "role": "teammate",
+                        "model": "codex",
+                        "assistant_id": format!("bare:{CODEX_AGENT_ID}")
+                    }
+                ]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created_team.status(), StatusCode::CREATED);
+    let team_json = body_json(created_team).await["data"].clone();
+    assert_eq!(
+        team_json["workspace_mode"], "isolated",
+        "POST /api/teams must persist and return workspace_mode=\"isolated\": {team_json}"
+    );
+    let team_id = team_json["id"].as_str().unwrap().to_owned();
+    let get_team_resp = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(get_team_resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(get_team_resp).await["data"]["workspace_mode"],
+        "isolated",
+        "GET /api/teams/{{id}} must round-trip workspace_mode=\"isolated\""
+    );
+    let init_status_resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/team-hub/teams/{team_id}/context-status"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(init_status_resp.status(), StatusCode::OK);
+    let init_slots = body_json(init_status_resp).await["data"]["slots"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let lead_slot_id = init_slots
+        .iter()
+        .find(|a| a["role"] == "lead")
+        .unwrap()["slot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let worker_slot_id = init_slots
+        .iter()
+        .find(|a| a["role"] != "lead")
+        .unwrap()["slot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let put_on_paid_resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/team-hub/teams/{team_id}/switch-models"),
+            json!({
+                "scope": "slots",
+                "updates": [
+                    {
+                        "slot_id": lead_slot_id,
+                        "backend": "aionrs",
+                        "provider_id": &openrouter_id,
+                        "model_id": "google/gemini-2.5-pro"
+                    },
+                    {
+                        "slot_id": worker_slot_id,
+                        "backend": "aionrs",
+                        "provider_id": &openrouter_id,
+                        "model_id": "openai/gpt-4.1"
+                    }
+                ]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_on_paid_resp.status(), StatusCode::OK);
+    let paid_slots = body_json(put_on_paid_resp).await["data"]["context_status"]["slots"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(paid_slots.iter().all(|s| s["wallet_type"] == "api_key"));
+
+    // 3. Apply `POST /api/team-hub/teams/{id}/apply-quota-preset` with `{}` empty body -> defaults to `smart_split`
+    let apply_resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/team-hub/teams/{team_id}/apply-quota-preset"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(apply_resp.status(), StatusCode::OK);
+    let apply_data = body_json(apply_resp).await["data"].clone();
+    let slots = apply_data["context_status"]["slots"].as_array().unwrap();
+    let worker_after = slots.iter().find(|s| s["role"] != "lead").unwrap();
+    assert_eq!(
+        worker_after["wallet_type"], "cli_subscription",
+        "smart_split must route worker slot to $0 cli_subscription: {worker_after}"
+    );
+
+    // 4. PATCH `/api/team-hub/teams/{id}/economy-prefs` and verify 160K Window-Calibrated Cap on 1M-token Gemini Lead!
+    let econ_resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/team-hub/teams/{team_id}/economy-prefs"),
+            json!({
+                "economy_mode": "lean",
+                "max_context_tokens": 160_000,
+                "max_turn_hops_per_run": 12,
+                "auto_fallback_free_cli": true
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(econ_resp.status(), StatusCode::OK);
+    let econ_data = body_json(econ_resp).await["data"].clone();
+    assert_eq!(econ_data["economy_mode"], "lean");
+    assert_eq!(econ_data["max_context_tokens"], 160_000);
+    assert_eq!(econ_data["max_turn_hops_per_run"], 12);
+    assert_eq!(econ_data["auto_fallback_free_cli"], true);
+
+    let lead_slot = econ_data["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "lead")
+        .unwrap();
+    assert!(
+        lead_slot["effective_compact_limit_tokens"].as_i64().unwrap() <= 160_000,
+        "160K economy cap must clamp effective_compact_limit_tokens even on large context windows: {lead_slot}"
+    );
+
+    // 5. Record a ledger entry and verify `GET /api/wallets/ledger`
+    let bridge_repo = SqliteCustomBridgeRepository::new(services.database.pool().clone());
+    bridge_repo
+        .record_cost_run(aionui_db::custom_bridge_schema::RecordCostRunParams {
+            owner_user_id: OWNER_ID.to_owned(),
+            run_id: "run-ledger-e2e-1".to_owned(),
+            team_id: team_id.clone(),
+            agent_id: "lead-slot".to_owned(),
+            wallet_type: WalletType::ApiKey.as_str().to_owned(),
+            tokens_input: 2_400,
+            tokens_output: 600,
+            cost_usd: 0.0162,
+        })
+        .await
+        .unwrap();
+
+    let ledger_resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/wallets/ledger?team_id={team_id}&limit=10"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ledger_resp.status(), StatusCode::OK);
+    let ledger_rows = body_json(ledger_resp).await["data"].as_array().unwrap().clone();
+    assert_eq!(ledger_rows.len(), 1);
+    assert_eq!(ledger_rows[0]["run_id"], "run-ledger-e2e-1");
+    assert_eq!(ledger_rows[0]["tokens_input"], 2_400);
+
+    // 6. Regression (`#21` §3.2): When `auto_fallback_free_cli` is off and a Paid API worker hits 429/quota,
+    //    `TelegramTeamHub` emits a `quota_fallback` card with `action_token` + `fallback_target`, and approving via
+    //    `POST /api/inbox/{id}/resolve` actually switches the slot to `$0 CLI` and emits `team:models-switched`!
+    let _ = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/team-hub/teams/{team_id}/economy-prefs"),
+            json!({ "auto_fallback_free_cli": false }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let _ = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/team-hub/teams/{team_id}/switch-models"),
+            json!({
+                "scope": "slots",
+                "updates": [{
+                    "slot_id": &worker_slot_id,
+                    "backend": "aionrs",
+                    "provider_id": &openrouter_id,
+                    "model_id": "openai/gpt-4.1"
+                }]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+
+    use aionui_api_types::WebSocketMessage;
+    use aionui_realtime::EventBroadcaster;
+    use aionui_team::events::TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT;
+    services.event_bus.broadcast(WebSocketMessage::new(
+        TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT,
+        json!({
+            "user_id": OWNER_ID,
+            "team_id": &team_id,
+            "slot_id": &worker_slot_id,
+            "conversation_id": "conv-qf-test",
+            "status": "failed",
+            "error": "HTTP 429 rate limit / quota exhausted"
+        }),
+    ));
+
+    // Wait briefly for async event watcher to persist the `quota_fallback` inbox card
+    let mut qf_card = None;
+    for _ in 0..25 {
+        let inbox_resp = app
+            .clone()
+            .oneshot(get_with_token("/api/inbox", &token))
+            .await
+            .unwrap();
+        let items = body_json(inbox_resp).await["data"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if let Some(found) = items
+            .into_iter()
+            .find(|c| c["category"] == "quota_fallback" && c["status"] == "pending")
+        {
+            qf_card = Some(found);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let qf_card = qf_card.expect("quota_fallback card must be persisted on 429 failure");
+    let qf_id = qf_card["id"].as_str().unwrap().to_owned();
+    let qf_action_token = qf_card["action_token"]
+        .as_str()
+        .expect("quota_fallback card must carry action_token for 2-way sync")
+        .to_owned();
+    assert!(
+        qf_card["details"]["fallback_target"]["backend"].as_str().is_some(),
+        "quota_fallback details must carry concrete fallback_target: {qf_card}"
+    );
+
+    let mut ws_rx = services.event_bus.subscribe();
+    let resolve_qf = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/inbox/{qf_id}/resolve"),
+            json!({
+                "action": "approve",
+                "payload": qf_card["details"]["fallback_target"]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resolve_qf.status(), StatusCode::OK);
+
+    // Token must be atomically consumed (Telegram tap blocked)
+    assert!(
+        !bridge_repo.consume_action_token_once(&qf_action_token).await.unwrap(),
+        "Desktop resolve must consume action_token once"
+    );
+
+    // Verify `team:models_switched` WS event with `user_id` AND worker slot now on `$0 cli_subscription`
+    let mut saw_models_switched = false;
+    while let Ok(ev) = ws_rx.try_recv() {
+        if ev.name == "team:models_switched" {
+            assert_eq!(ev.data["user_id"], OWNER_ID);
+            saw_models_switched = true;
+        }
+    }
+    assert!(saw_models_switched, "approving quota_fallback must emit team:models_switched");
+
+    let post_qf_status = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/team-hub/teams/{team_id}/context-status"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let post_qf_slots = body_json(post_qf_status).await["data"]["slots"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let worker_post_qf = post_qf_slots
+        .iter()
+        .find(|s| s["slot_id"] == worker_slot_id)
+        .unwrap();
+    assert_eq!(
+        worker_post_qf["wallet_type"], "cli_subscription",
+        "approving quota_fallback must switch worker slot to $0 cli_subscription: {worker_post_qf}"
+    );
+}

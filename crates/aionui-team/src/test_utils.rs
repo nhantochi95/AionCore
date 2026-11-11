@@ -1793,6 +1793,7 @@ pub(crate) mod workspace_harness {
                 conversation_id: None,
             }],
             workspace: None,
+            workspace_mode: None,
         }
     }
 }
