@@ -16,7 +16,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::canonical;
-use crate::runtime::{Budget, CancellationToken, Command, Kind, MatchMode, NameMatcher, ShardOutput, Subscriber};
+use crate::runtime::{
+    Budget, CancellationToken, Command, FsError, Kind, MatchMode, NameMatcher, ShardOutput, Subscriber,
+};
 use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 
 use super::actor::FsMonitorActor;
@@ -117,15 +119,30 @@ impl FsMonitorActor {
             let resolved = match self.resolve(user_id, &target, FileOp::Browse).await {
                 Ok(r) => r,
                 Err((code, message)) => {
-                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
+                    if code == wire::CODE_RESOURCE_NOT_FOUND {
+                        tracing::debug!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            "fs subscribe rejected: target not found"
+                        );
+                    } else {
+                        tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
+                    }
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
             };
             // Fold to the identity the watcher/apply chain keys on (case-folding
-            // platforms differ) — otherwise events would fail to attribute back.
-            let canonical = match canonical::canonicalize(&resolved.resource_uri) {
-                Ok(c) => c.as_str().to_owned(),
+            // platforms differ) while registering the case-preserved URI so OS
+            // watchers and providers never mutate real directory casing.
+            let preserved_uri = resolved_preserved_uri(&resolved);
+            let canonical = match canonical::canonicalize(&preserved_uri) {
+                Ok(c) => {
+                    canonical::remember_preserved_uri(c.as_str(), c.preserved_str());
+                    c.as_str().to_owned()
+                }
                 Err(_) => {
                     tracing::warn!(session, code = "provider_unavailable", pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(
@@ -172,17 +189,28 @@ impl FsMonitorActor {
                 Err(err) => {
                     failed += 1;
                     let (code, message) = wire::fs_error_to_rpc(&err);
-                    // Degraded target — safely handled, but an operator needs the
-                    // cause: `code` is the stable protocol name the wire carries,
-                    // `reason` the provider/watcher detail that name hides.
-                    tracing::warn!(
-                        session,
-                        code = message,
-                        pe_id = %target.pe_id,
-                        rel = %target.relative_path,
-                        reason = wire::fs_error_detail(&err),
-                        "fs subscribe: target mount failed"
-                    );
+                    // Non-existent watch targets (ENOENT / NotFound) are expected
+                    // when watching transient or not-yet-created paths; log at debug!
+                    // instead of warn!.
+                    if is_watch_target_not_found(&err) {
+                        tracing::debug!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            reason = wire::fs_error_detail(&err),
+                            "fs subscribe: target mount skipped (not found)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            reason = wire::fs_error_detail(&err),
+                            "fs subscribe: target mount failed"
+                        );
+                    }
                     first_failure.get_or_insert_with(|| (code, message, ref_data(&target)));
                 }
             }
@@ -230,13 +258,27 @@ impl FsMonitorActor {
             let resolved = match self.resolve(user_id, &target, FileOp::Browse).await {
                 Ok(r) => r,
                 Err((code, message)) => {
-                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs remount rejected");
+                    if code == wire::CODE_RESOURCE_NOT_FOUND {
+                        tracing::debug!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            "fs remount rejected: target not found"
+                        );
+                    } else {
+                        tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs remount rejected");
+                    }
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
             };
-            let canonical = match canonical::canonicalize(&resolved.resource_uri) {
-                Ok(c) => c.as_str().to_owned(),
+            let preserved_uri = resolved_preserved_uri(&resolved);
+            let canonical = match canonical::canonicalize(&preserved_uri) {
+                Ok(c) => {
+                    canonical::remember_preserved_uri(c.as_str(), c.preserved_str());
+                    c.as_str().to_owned()
+                }
                 Err(_) => {
                     tracing::warn!(session, code = "provider_unavailable", pe_id = %target.pe_id, "fs remount rejected");
                     self.push(
@@ -275,14 +317,25 @@ impl FsMonitorActor {
                 Err(err) => {
                     failed += 1;
                     let (code, message) = wire::fs_error_to_rpc(&err);
-                    tracing::warn!(
-                        session,
-                        code = message,
-                        pe_id = %target.pe_id,
-                        rel = %target.relative_path,
-                        reason = wire::fs_error_detail(&err),
-                        "fs remount: target re-mount failed"
-                    );
+                    if is_watch_target_not_found(&err) {
+                        tracing::debug!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            reason = wire::fs_error_detail(&err),
+                            "fs remount: target re-mount skipped (not found)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            session,
+                            code = message,
+                            pe_id = %target.pe_id,
+                            rel = %target.relative_path,
+                            reason = wire::fs_error_detail(&err),
+                            "fs remount: target re-mount failed"
+                        );
+                    }
                     first_failure.get_or_insert_with(|| (code, message, ref_data(&target)));
                 }
             }
@@ -836,6 +889,55 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
+/// Extract the case-preserving `file:` URI for a resolved target (preferring
+/// `resolved.absolute_path` / `resolved.root_resource_uri` over the case-folded
+/// `resolved.resource_uri`) and register the root's preserved URI as well.
+fn resolved_preserved_uri(resolved: &ResolvedResource) -> String {
+    if let Ok(norm_root) = canonical::normalize_preserving_case(&resolved.root_resource_uri) {
+        canonical::remember_preserved_uri(&resolved.root_resource_canonical, &norm_root);
+    }
+    if let Some(abs) = resolved.absolute_path.as_deref()
+        && let Ok(raw_uri) = canonical::to_file_uri(Path::new(abs))
+        && let Ok(norm_uri) = canonical::normalize_preserving_case(&raw_uri)
+    {
+        return norm_uri;
+    }
+    if let Ok(mut root_path) = canonical::uri_to_path(&resolved.root_resource_uri) {
+        if !resolved.relative_path.is_empty() {
+            for seg in resolved.relative_path.split('/') {
+                if !seg.is_empty() {
+                    root_path.push(seg);
+                }
+            }
+        }
+        if let Ok(raw_uri) = canonical::to_file_uri(&root_path)
+            && let Ok(norm_uri) = canonical::normalize_preserving_case(&raw_uri)
+        {
+            return norm_uri;
+        }
+    }
+    resolved.resource_uri.clone()
+}
+
+/// Returns `true` when a watch/mount failure represents a missing target path
+/// (`FsError::NotFound` or `notify`'s `ENOENT` surfaced via `FsError::Io`).
+fn is_watch_target_not_found(err: &FsError) -> bool {
+    match err {
+        FsError::NotFound { .. } => true,
+        FsError::Io { message, .. } => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("not found")
+                || lower.contains("no such file or directory")
+                || lower.contains("enoent")
+                || lower.contains("(os error 2)")
+                || lower.contains("(os error 3)")
+                || lower.contains("cannot find the file")
+                || lower.contains("cannot find the path")
+        }
+        _ => false,
+    }
+}
+
 /// Realpath containment: the access-time symlink/alias escape guard that stage 0
 /// deferred. `resolve_reference` already did lexical containment; here the target
 /// (or its deepest existing ancestor, for not-yet-created paths) is realpath'd
@@ -855,6 +957,33 @@ fn guard_realpath(resolved: &ResolvedResource) -> Result<(), (i64, &'static str)
 #[cfg(test)]
 #[path = "dispatch_test.rs"]
 mod dispatch_test;
+
+#[cfg(test)]
+mod watch_hygiene_tests {
+    use super::*;
+
+    #[test]
+    fn watch_target_not_found_recognises_not_found_and_enoent_io_errors() {
+        assert!(is_watch_target_not_found(&FsError::NotFound {
+            uri: "file:///missing".into()
+        }));
+        assert!(is_watch_target_not_found(&FsError::Io {
+            uri: "file:///missing".into(),
+            message: "No such file or directory (os error 2)".into()
+        }));
+        assert!(is_watch_target_not_found(&FsError::Io {
+            uri: "file:///missing".into(),
+            message: "The system cannot find the path specified. (os error 3) - path not found".into()
+        }));
+        assert!(!is_watch_target_not_found(&FsError::PermissionDenied {
+            uri: "file:///secret".into()
+        }));
+        assert!(!is_watch_target_not_found(&FsError::Io {
+            uri: "file:///busy".into(),
+            message: "Too many open files (os error 24)".into()
+        }));
+    }
+}
 
 /// Whether `target`'s deepest existing ancestor realpath is inside `root`'s
 /// realpath. Walking to the deepest existing ancestor lets not-yet-created

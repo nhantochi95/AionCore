@@ -463,18 +463,29 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                         "description": "Return only tasks owned by this exact agent slot_id"
                     },
                     "status": {
-                        "description": "Return only tasks with these statuses. Accepts one status string or an array of status strings.",
+                        "description": "Return only tasks with these statuses. Accepts one status string (including comma-separated values or \"all\") or an array of status strings (empty array [] means all). Supports canonical statuses (pending, in_progress, completed, deleted) and governance aliases (todo, open, active, in_review, blocked, done, cancelled, canceled).",
                         "anyOf": [
                             {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed", "deleted"]
+                                "type": "string"
                             },
                             {
                                 "type": "array",
-                                "minItems": 1,
                                 "items": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "deleted"]
+                                    "type": "string"
+                                }
+                            }
+                        ]
+                    },
+                    "statuses": {
+                        "description": "Alias for status. Accepts one status string or an array of status strings.",
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
                                 }
                             }
                         ]

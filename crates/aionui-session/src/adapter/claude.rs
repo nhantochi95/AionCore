@@ -660,18 +660,19 @@ impl ClaudeAdapter {
             // streamed no `message_delta` at all (no `--include-partial-messages`,
             // or a resumed/consolidated frame); it is exact for a single-call turn
             // and only overstates once tool rounds appear.
-            let total_tokens = self.last_call_tokens.unwrap_or_else(|| {
-                usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(input_tokens + output_tokens + cache_creation + cache_read)
-            });
+            let turn_billed = usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(input_tokens + output_tokens + cache_creation + cache_read);
+            let total_tokens = self.last_call_tokens.unwrap_or(turn_billed);
             out.push(SessionEvent::UsageDelta {
                 input_tokens,
                 output_tokens,
                 total_tokens,
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
                 context_window: self.result_context_window(v),
+                occupancy_tokens: (total_tokens > 0).then_some(total_tokens),
+                turn_billed_tokens: (turn_billed > 0).then_some(turn_billed),
                 // Per-turn detail line. These stay on the AGGREGATE `result.usage`
                 // (unlike `total_tokens`, which must be the last call's occupancy):
                 // the breakdown answers "what did this turn cost", so counting every
@@ -3004,6 +3005,44 @@ mod tests {
             .expect("UsageDelta emitted");
         assert_eq!(total, 120, "no cache buckets → total is base input+output");
         assert_eq!(cost, None, "no total_cost_usd → cost_usd is None");
+    }
+
+    #[test]
+    fn multi_call_result_separates_occupancy_tokens_from_turn_billed_tokens() {
+        let mut a = ClaudeAdapter::new();
+        // Simulate last API call's message_delta reporting 27,467 occupancy tokens,
+        // followed by turn result reporting 107,974 aggregate billed tokens across 4 calls.
+        let delta = concat!(
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"#,
+            r#""usage":{"input_tokens":2000,"cache_creation_input_tokens":467,"cache_read_input_tokens":24500,"output_tokens":500}}}"#,
+            "\n"
+        );
+        let _ = a.parse_chunk(delta.as_bytes());
+        let res = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":8000,"cache_creation_input_tokens":1974,"cache_read_input_tokens":96000,"output_tokens":2000}}"#,
+            "\n"
+        );
+        let (occ, billed, total) = a
+            .parse_chunk(res.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta {
+                    occupancy_tokens,
+                    turn_billed_tokens,
+                    total_tokens,
+                    ..
+                } => Some((occupancy_tokens, turn_billed_tokens, total_tokens)),
+                _ => None,
+            })
+            .expect("UsageDelta emitted");
+        assert_eq!(occ, Some(27_467), "occupancy_tokens must stay on last API call");
+        assert_eq!(total, 27_467, "total_tokens mirrors occupancy_tokens");
+        assert_eq!(
+            billed,
+            Some(107_974),
+            "turn_billed_tokens must preserve full multi-call turn aggregate"
+        );
     }
 
     /// AskUserQuestion projection (forward path): a `can_use_tool` for

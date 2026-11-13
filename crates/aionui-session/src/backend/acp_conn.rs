@@ -309,7 +309,7 @@ pub struct AcpSessionBackend {
     /// response). Behind a sync Mutex so the sync `capabilities()` merges them
     /// without awaiting (the static base cannot carry per-session discovery).
     discovered: Arc<std::sync::Mutex<Discovered>>,
-    rpc_id: AtomicU64,
+    rpc_id: Arc<AtomicU64>,
     /// Live turn epoch (bumped on dispatch(Send), read by the reader to stamp).
     turn_gen: Arc<AtomicU64>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
@@ -554,6 +554,7 @@ impl AcpSessionBackend {
         idle_ttl_ms: Option<i64>,
     ) -> Self {
         let io: Arc<dyn AgentIo> = Arc::from(io);
+        let rpc_id = Arc::new(AtomicU64::new(0));
         let turn_gen = Arc::new(AtomicU64::new(0));
         let acp_session_id = Arc::new(Mutex::new(None));
         let pending_resume_sid = Arc::new(Mutex::new(None));
@@ -565,16 +566,19 @@ impl AcpSessionBackend {
         let pending_perm_options = Arc::new(Mutex::new(HashMap::new()));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_streaming_occupancy_in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback_new_session_params = new_session_params(&wake.config);
         let (event_tx, _) = broadcast::channel(1024);
 
         let (stdin, stdout) = match io.take_stdio().await {
-            Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
+            Some((stdin, stdout)) => (Some(stdin, ), Some(stdout)),
             None => (None, None),
         };
         let stdin = Arc::new(Mutex::new(stdin));
 
         let reader_state = AcpReaderState {
             session_id: session_id.clone(),
+            rpc_id: rpc_id.clone(),
             turn_gen: turn_gen.clone(),
             event_tx: event_tx.clone(),
             acp_session_id: acp_session_id.clone(),
@@ -588,6 +592,8 @@ impl AcpSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            saw_streaming_occupancy_in_turn: saw_streaming_occupancy_in_turn.clone(),
+            new_session_params: fallback_new_session_params,
         };
         let reader = start_acp_reader(&reader_state, stdout, io.clone());
 
@@ -636,7 +642,7 @@ impl AcpSessionBackend {
             session_id,
             capabilities: acp_capabilities(),
             discovered,
-            rpc_id: AtomicU64::new(0),
+            rpc_id,
             turn_gen,
             stdin,
             event_tx,
@@ -880,6 +886,7 @@ async fn write_frame_to(
 /// Reader-task context (grouped to avoid a too-many-arguments fn).
 struct ReaderCtx {
     session_id: String,
+    rpc_id: Arc<AtomicU64>,
     stdout: Option<aionui_process::BoxedStdout>,
     io: Arc<dyn AgentIo>,
     turn_gen: Arc<AtomicU64>,
@@ -895,6 +902,8 @@ struct ReaderCtx {
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    saw_streaming_occupancy_in_turn: Arc<std::sync::atomic::AtomicBool>,
+    new_session_params: Value,
 }
 
 /// The process-independent share of `ReaderCtx`: everything cloned into the
@@ -904,6 +913,7 @@ struct ReaderCtx {
 #[derive(Clone)]
 struct AcpReaderState {
     session_id: String,
+    rpc_id: Arc<AtomicU64>,
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     acp_session_id: Arc<Mutex<Option<String>>>,
@@ -920,6 +930,8 @@ struct AcpReaderState {
     /// terminal (synthesized TurnResult / Detached). The idle timer reads it so a
     /// streaming turn is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    saw_streaming_occupancy_in_turn: Arc<std::sync::atomic::AtomicBool>,
+    new_session_params: Value,
 }
 
 /// Spawn an ACP JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -933,6 +945,7 @@ fn start_acp_reader(
     tokio::spawn(async move {
         reader_task(ReaderCtx {
             session_id: state.session_id,
+            rpc_id: state.rpc_id,
             stdout,
             io,
             turn_gen: state.turn_gen,
@@ -948,6 +961,8 @@ fn start_acp_reader(
             discovered: state.discovered,
             stdin: state.stdin,
             turn_in_flight: state.turn_in_flight,
+            saw_streaming_occupancy_in_turn: state.saw_streaming_occupancy_in_turn,
+            new_session_params: state.new_session_params,
         })
         .await;
     })
@@ -990,6 +1005,7 @@ async fn reader_task(ctx: ReaderCtx) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let ReaderCtx {
         session_id,
+        rpc_id,
         stdout,
         io,
         turn_gen,
@@ -1005,6 +1021,8 @@ async fn reader_task(ctx: ReaderCtx) {
         discovered,
         stdin,
         turn_in_flight,
+        saw_streaming_occupancy_in_turn,
+        new_session_params,
     } = ctx;
 
     let Some(stdout) = stdout else {
@@ -1084,6 +1102,15 @@ async fn reader_task(ctx: ReaderCtx) {
                             let events = map_update(params, &current_model, &discovered).await;
                             if !replaying {
                                 for ev in events {
+                                    if matches!(
+                                        &ev,
+                                        SessionEvent::UsageDelta {
+                                            occupancy_tokens: Some(_),
+                                            ..
+                                        }
+                                    ) {
+                                        saw_streaming_occupancy_in_turn.store(true, Ordering::SeqCst);
+                                    }
                                     emit(&event_tx, &session_id, cur, ev);
                                 }
                             }
@@ -1134,12 +1161,50 @@ async fn reader_task(ctx: ReaderCtx) {
                                     &discovered,
                                 )
                                 .await;
-                            } else if frame.get("error").is_some() {
+                            } else if let Some(err) = frame.get("error") {
+                                // Orphaned / stale resume anchor recovery (e.g. Gemini CLI
+                                // `-32603` `Invalid session identifier` / `No previous sessions
+                                // found` or `-32002` `Session not found`): clear the stale
+                                // anchor and transparently open a fresh `session/new` on the
+                                // same live ACP connection while keeping `pending_open` armed
+                                // on the fallback request id.
+                                let stale_resume = pending_resume_sid.lock().await.take();
+                                if let Some(rejected_sid) = stale_resume
+                                    && is_stale_session_load_error(err)
+                                {
+                                    tracing::warn!(
+                                        conversation_id = %session_id,
+                                        stale_session_id = %rejected_sid,
+                                        error = ?err,
+                                        "ACP session/load rejected stale session identifier; falling back to session/new"
+                                    );
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        turn_gen.load(Ordering::SeqCst),
+                                        SessionEvent::BackendBound {
+                                            backend_session_id: None,
+                                        },
+                                    );
+                                    let fallback_id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                                    *pending_open.lock().await = Some(fallback_id);
+                                    if write_frame_to(
+                                        &stdin,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": fallback_id,
+                                            "method": "session/new",
+                                            "params": new_session_params.clone(),
+                                        }),
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        continue;
+                                    }
+                                }
                                 // 9a-ACP: a connect-time `session/new`|`session/load` ERROR
-                                // (auth required / bad resume sid / setup rejected) was
-                                // previously swallowed → opaque hang. Synthesize an error
-                                // terminal (reducer Starting → Error{Backend{message}}), with
-                                // the stderr cause enriched in.
+                                // (auth required / setup rejected) → synthesize error terminal.
                                 emit_connect_error(&frame, &io, &event_tx, &session_id, &turn_gen).await;
                             }
                             // G6: clear `pending_open` ONLY AFTER discovery is filled (or the
@@ -1243,7 +1308,8 @@ async fn reader_task(ctx: ReaderCtx) {
                             // was previously DROPPED (only the streaming usage_update,
                             // which lacks the per-direction split, was read). Emit a
                             // UsageDelta BEFORE the terminal (mirrors claude C-2).
-                            if let Some(usage_ev) = parse_acp_result_usage(&frame) {
+                            let saw_streaming = saw_streaming_occupancy_in_turn.swap(false, Ordering::SeqCst);
+                            if let Some(usage_ev) = parse_acp_result_usage(&frame, saw_streaming) {
                                 emit(&event_tx, &session_id, pending.turn_gen, usage_ev);
                             }
                             let ev = synth_turn_result(&frame, pending.turn_gen, stderr_tail.as_deref());
@@ -1797,6 +1863,8 @@ async fn map_update(
                 // ACP spells the context window `size` (the UsageUpdate shape the
                 // frontend indicator reads back as its denominator).
                 context_window: update.get("size").and_then(Value::as_u64),
+                occupancy_tokens: (total > 0).then_some(total),
+                turn_billed_tokens: None,
                 // ACP's UsageUpdate carries no per-turn split, so the detail
                 // line stays empty and the renderer omits it.
                 breakdown: crate::event::UsageBreakdown::default(),
@@ -1961,7 +2029,42 @@ pub(crate) fn map_plan_priority(s: Option<&str>) -> Option<crate::event::PlanPri
 /// (claude-agent-acp / hermes carry it: {inputTokens, outputTokens, totalTokens,
 /// cost:{amount}}). Previously DROPPED — only the streaming usage_update was read,
 /// which lacks the per-direction split. None when no usage present or all-zero.
-pub(crate) fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
+pub(crate) fn is_stale_session_load_error(err: &Value) -> bool {
+    fn contains_stale_phrase(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("session not found")
+            || lower.contains("invalid session identifier")
+            || lower.contains("no previous sessions found")
+    }
+    fn walk(value: &Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match value {
+            Value::String(s) => {
+                if contains_stale_phrase(s) {
+                    return true;
+                }
+                let trimmed = s.trim();
+                if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                    && let Ok(nested) = serde_json::from_str::<Value>(trimmed)
+                {
+                    return walk(&nested, depth + 1);
+                }
+                false
+            }
+            Value::Array(items) => items.iter().any(|v| walk(v, depth + 1)),
+            Value::Object(map) => map.values().any(|v| walk(v, depth + 1)),
+            _ => false,
+        }
+    }
+
+    let code = err.get("code").and_then(Value::as_i64);
+    let known_code = matches!(code, Some(-32001 | -32002 | -32602 | -32603) | None);
+    known_code && walk(err, 0)
+}
+
+pub(crate) fn parse_acp_result_usage(frame: &Value, saw_streaming_occupancy: bool) -> Option<SessionEvent> {
     let usage = frame.get("result")?.get("usage")?;
     let input = usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
     let output = usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
@@ -1978,13 +2081,26 @@ pub(crate) fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
     if total == 0 && cost_usd.is_none() && breakdown.is_empty() {
         return None;
     }
+    let context_window = usage.get("size").and_then(Value::as_u64);
+    let occupancy_tokens = if saw_streaming_occupancy {
+        None
+    } else if total > 0 {
+        Some(match context_window {
+            Some(sz) if sz > 0 => total.min(sz),
+            _ => total,
+        })
+    } else {
+        None
+    };
     Some(SessionEvent::UsageDelta {
         input_tokens: input,
         output_tokens: output,
-        total_tokens: total,
+        total_tokens: occupancy_tokens.unwrap_or(total),
         cost_usd,
         // ACP spells the context window `size` (see the notification path above).
-        context_window: usage.get("size").and_then(Value::as_u64),
+        context_window,
+        occupancy_tokens,
+        turn_billed_tokens: (total > 0).then_some(total),
         breakdown,
     })
 }
@@ -2266,6 +2382,9 @@ impl SessionBackend for AcpSessionBackend {
                 // F-4: mark the turn in flight so the idle timer won't suspend the
                 // ACP CLI mid-turn (the reader clears it at the prompt-response terminal).
                 self.turn_in_flight.store(true, Ordering::SeqCst);
+                self.reader_state
+                    .saw_streaming_occupancy_in_turn
+                    .store(false, Ordering::SeqCst);
                 let sid = self.bound_session().await?;
                 let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
                 let id = self.next_rpc_id();
@@ -3760,16 +3879,33 @@ mod tests {
                 "usage": { "inputTokens": 900, "outputTokens": 50, "totalTokens": 950,
                            "cost": { "amount": 0.007 } } }
         });
-        match parse_acp_result_usage(&frame) {
+        match parse_acp_result_usage(&frame, false) {
             Some(SessionEvent::UsageDelta {
                 input_tokens,
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                occupancy_tokens,
+                turn_billed_tokens,
                 ..
             }) => {
                 assert_eq!((input_tokens, output_tokens, total_tokens), (900, 50, 950));
+                assert_eq!(occupancy_tokens, Some(950));
+                assert_eq!(turn_billed_tokens, Some(950));
                 assert_eq!(cost_usd, Some(0.007));
+            }
+            other => panic!("expected UsageDelta, got {other:?}"),
+        }
+        // When streaming usage_update already reported occupancy in the turn,
+        // parse_acp_result_usage keeps occupancy_tokens=None while preserving turn_billed_tokens.
+        match parse_acp_result_usage(&frame, true) {
+            Some(SessionEvent::UsageDelta {
+                occupancy_tokens,
+                turn_billed_tokens,
+                ..
+            }) => {
+                assert_eq!(occupancy_tokens, None);
+                assert_eq!(turn_billed_tokens, Some(950));
             }
             other => panic!("expected UsageDelta, got {other:?}"),
         }
@@ -3779,7 +3915,7 @@ mod tests {
             "result": { "stopReason": "end_turn",
                 "usage": { "inputTokens": 500, "outputTokens": 200, "cachedReadTokens": 18000, "cachedWriteTokens": 1000 } }
         });
-        match parse_acp_result_usage(&cache_frame) {
+        match parse_acp_result_usage(&cache_frame, false) {
             Some(SessionEvent::UsageDelta { total_tokens, breakdown, .. }) => {
                 assert_eq!(total_tokens, 19_700);
                 assert_eq!(breakdown.cached_read_tokens, 18_000);
@@ -3789,7 +3925,30 @@ mod tests {
         }
         // No usage in result → None (no spurious event).
         let bare = serde_json::json!({ "result": { "stopReason": "end_turn" } });
-        assert!(parse_acp_result_usage(&bare).is_none());
+        assert!(parse_acp_result_usage(&bare, false).is_none());
+    }
+
+    #[test]
+    fn stale_session_load_error_recognizes_gemini_32603_and_nested_data() {
+        assert!(is_stale_session_load_error(&serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "details": "Invalid session identifier 'abc-123'" }
+        })));
+        assert!(is_stale_session_load_error(&serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "cause": "No previous sessions found for this project" }
+        })));
+        assert!(is_stale_session_load_error(&serde_json::json!({
+            "code": -32002,
+            "message": "Resource not found: Session not found: sid-9"
+        })));
+        assert!(!is_stale_session_load_error(&serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "details": "Authentication required" }
+        })));
     }
 
     /// A `ConfigChanged { mode: None, model: Some(_) }` (model-only change) is real,

@@ -307,22 +307,25 @@ pub(super) async fn build(
         arc.set_session_id(sid).await;
     }
 
-    // Open the ACP session eagerly so runtime preparation returns only after
-    // session/new (or claude-meta-resume / session/load) and the first
-    // reconcile pass have completed. Matches aionrs factory behaviour:
-    // the caller sees "warmed up" == "ready for PUT /mode | /model".
-    arc.warmup_session().await?;
-
-    let instance = AgentInstance::Acp(Arc::clone(&arc));
-
-    // Hand the service the domain event receiver so it can
-    // persist user intent changes without reverse-engineering
-    // them from CLI observations.
+    // Attach the domain-event persistence consumer BEFORE `warmup_session()` so
+    // `SessionCleared` / `SessionAssigned` emitted when `open_session_resume`
+    // heals a stale session id (`-32603`) are persisted immediately even if a
+    // subsequent step in warmup fails.
     deps.acp_agent_service
         .attach(ctx.user_id, ctx.conversation_id, domain_rx)
         .await;
 
-    Ok(instance)
+    // Open the ACP session eagerly so runtime preparation returns only after
+    // session/new (or claude-meta-resume / session/load) and the first
+    // reconcile pass have completed. On error, explicitly terminate the spawned
+    // CLI process and background tracker tasks so nothing leaks!
+    if let Err(err) = arc.warmup_session().await {
+        arc.kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
+            .await;
+        return Err(err);
+    }
+
+    Ok(AgentInstance::Acp(arc))
 }
 
 pub(super) async fn resolve_catalog_metadata(

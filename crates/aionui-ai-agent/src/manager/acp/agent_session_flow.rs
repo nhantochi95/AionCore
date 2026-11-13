@@ -84,7 +84,11 @@ impl AcpAgentManager {
     /// Used as the rescue path when resume helpers see `SessionNotFound`.
     /// Emits a `warn!` so ops can still see the original failure that
     /// triggered the rebuild.
-    async fn rebuild_after_session_not_found(&self, stale_sid: &str, err: &AcpError) -> Result<String, AgentError> {
+    pub(super) async fn rebuild_after_session_not_found(
+        &self,
+        stale_sid: &str,
+        err: &AcpError,
+    ) -> Result<String, AgentError> {
         warn!(
             conversation_id = %self.params.conversation_id,
             stale_session_id = %stale_sid,
@@ -325,6 +329,17 @@ impl AcpAgentManager {
         session_id: Option<&str>,
         matched_command: Option<&SlashCommandItem>,
     ) -> Result<PromptOutcome, AcpSendFailure> {
+        self.prompt_existing_session_with_options(data, session_id, matched_command, true)
+            .await
+    }
+
+    pub(super) async fn prompt_existing_session_with_options(
+        &self,
+        data: &SendMessageData,
+        session_id: Option<&str>,
+        matched_command: Option<&SlashCommandItem>,
+        emit_start: bool,
+    ) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = session_id
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
             .map_err(AcpSendFailure::from)?;
@@ -340,10 +355,12 @@ impl AcpAgentManager {
         // calls); see `is_empty_turn` below.
         let mut probe_rx = self.runtime.subscribe();
 
-        // Emit Start event
-        self.runtime.emit(AgentStreamEvent::Start(StartEventData {
-            session_id: Some(sid.to_owned()),
-        }));
+        if emit_start {
+            // Emit Start event
+            self.runtime.emit(AgentStreamEvent::Start(StartEventData {
+                session_id: Some(sid.to_owned()),
+            }));
+        }
 
         // Scope stderr classification to this prompt so stale lines from an
         // earlier turn cannot override a later benign empty turn.
@@ -357,22 +374,24 @@ impl AcpAgentManager {
 
         // End-of-turn usage: agents that never emit UsageUpdate notifications
         // report token usage on the prompt response instead — either via the
-        // unstable `usage` field or a `_meta` dialect. Re-emit it as the same
-        // AcpContextUsage frame the notification path produces — it must
-        // precede the Finish frame, because the stream relay stops forwarding
-        // a turn once Finish is seen. The session event tracker only observes
-        // CLI notifications, not runtime-emitted frames, so the snapshot
-        // (which backs GET /usage) is updated here directly.
+        // unstable `usage` field or a `_meta` dialect. When a mid-turn
+        // `UsageUpdate` notification ALREADY reported true context occupancy,
+        // preserve that occupancy (`used` + `size`) while stamping per-turn
+        // `_meta.turn_total_tokens` and monotonic `_meta.seq`.
         if let Some(mut frame) = end_turn_usage_frame_from_response(&prompt_response) {
-            if let Ok(mut update) = serde_json::from_value::<UsageUpdate>(frame.clone()) {
+            {
                 let mut session = self.session.write().await;
-                // Agents like OpenCode report through BOTH channels: a mid-turn
-                // UsageUpdate notification carrying the real window size, and an
-                // end-of-turn usage without one. Never let the sizeless end-of-turn
-                // write clobber a window size the session already knows.
-                preserve_known_window(&mut update, &mut frame, session.context_usage());
-                session.apply_context_usage(update);
-                self.commit_session_changes(&mut session).await;
+                let next_seq = crate::session_agent::next_usage_meta_seq(session.last_usage_meta_seq());
+                finalize_end_turn_usage_for_session(
+                    &mut frame,
+                    session.context_usage(),
+                    session.saw_streaming_occupancy_in_turn(),
+                    next_seq,
+                );
+                if let Ok(update) = serde_json::from_value::<UsageUpdate>(frame.clone()) {
+                    session.apply_context_usage(update);
+                    self.commit_session_changes(&mut session).await;
+                }
             }
             self.runtime.emit(AgentStreamEvent::AcpContextUsage(frame));
         }
@@ -562,12 +581,12 @@ fn is_empty_turn(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) ->
 }
 
 /// What a single drain of the turn-scoped receiver observed.
-struct TurnObservations {
+pub(super) struct TurnObservations {
     /// The turn produced no user-visible output (see `is_empty_turn`).
-    empty: bool,
+    pub(super) empty: bool,
     /// The tolerant transport absorbed at least one CodeBuddy dialect signal
     /// (`session_end` or token-pressure/compaction) during this turn/near-window.
-    dialect_signal: bool,
+    pub(super) dialect_signal: bool,
 }
 
 /// Drain the turn-scoped receiver once, recording both the empty-turn condition
@@ -575,7 +594,7 @@ struct TurnObservations {
 /// original semantics for `empty` (visible output → not empty; `Lagged` → not
 /// empty) while additionally surfacing the dialect signal so the empty-turn
 /// judgment can prefer accurate token-limit attribution over the auth hint.
-fn drain_turn_observations(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> TurnObservations {
+pub(super) fn drain_turn_observations(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> TurnObservations {
     let mut empty = true;
     let mut dialect_signal = false;
     loop {
@@ -624,6 +643,7 @@ fn end_turn_usage_frame(usage: &Usage) -> Value {
     let mut breakdown = serde_json::json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
+        "turn_total_tokens": usage.total_tokens,
     });
     if let Some(thought) = usage.thought_tokens {
         breakdown["thought_tokens"] = thought.into();
@@ -662,8 +682,32 @@ fn end_turn_usage_frame_from_response(response: &PromptResponse) -> Option<Value
     Some(serde_json::json!({
         "used": used,
         "size": 0,
-        "_meta": { "input_tokens": input, "output_tokens": output },
+        "_meta": {
+            "input_tokens": input,
+            "output_tokens": output,
+            "turn_total_tokens": used,
+        },
     }))
+}
+
+fn finalize_end_turn_usage_for_session(
+    frame: &mut Value,
+    existing: Option<&UsageUpdate>,
+    saw_streaming_occupancy: bool,
+    next_seq: i64,
+) {
+    if saw_streaming_occupancy
+        && let Some(known) = existing
+        && known.used > 0
+    {
+        frame["used"] = known.used.into();
+    }
+    if let Some(meta) = frame.get_mut("_meta").and_then(Value::as_object_mut) {
+        meta.insert("seq".into(), serde_json::json!(next_seq));
+    }
+    if let Ok(mut update) = serde_json::from_value::<UsageUpdate>(frame.clone()) {
+        preserve_known_window(&mut update, frame, existing);
+    }
 }
 
 /// Carry previously-reported fields the end-of-turn write doesn't know —
@@ -965,6 +1009,19 @@ mod tests {
         let mut priced: UsageUpdate = serde_json::from_value(priced_frame.clone()).unwrap();
         preserve_known_window(&mut priced, &mut priced_frame, Some(&existing));
         assert_eq!(priced.cost.as_ref().map(|c| c.amount), Some(0.5));
+    }
+
+    #[test]
+    fn finalize_end_turn_usage_preserves_streaming_occupancy_while_stamping_turn_total_and_seq() {
+        let existing = UsageUpdate::new(185_000, 1_000_000);
+        let mut frame = end_turn_usage_frame(&Usage::new(27_400_000, 25_000_000, 2_400_000));
+
+        super::finalize_end_turn_usage_for_session(&mut frame, Some(&existing), true, 123_456);
+
+        assert_eq!(frame["used"], 185_000, "must preserve streaming occupancy instead of cumulative billed total");
+        assert_eq!(frame["size"], 1_000_000);
+        assert_eq!(frame["_meta"]["turn_total_tokens"], 27_400_000);
+        assert_eq!(frame["_meta"]["seq"], 123_456);
     }
 
     fn make_session() -> AcpSession {

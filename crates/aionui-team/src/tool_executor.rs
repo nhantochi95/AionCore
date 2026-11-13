@@ -123,7 +123,9 @@ pub(crate) async fn execute_sessionless_tool(
 }
 
 fn map_tool_error(error: ToolCallError) -> TeamToolErrorPayload {
-    let code = if error.message.starts_with("Unknown tool:") {
+    let code = if let Some(code) = error.tool_error_code {
+        code
+    } else if error.message.starts_with("Unknown tool:") {
         TeamToolErrorCode::UnknownTool
     } else if error.message.starts_with("Only Lead") {
         TeamToolErrorCode::PermissionDenied
@@ -160,5 +162,32 @@ mod tests {
         let err = team_tool_call_from_name("missing_tool", json!({})).unwrap_err();
         assert_eq!(err.code, TeamToolErrorCode::UnknownTool);
         assert!(err.message.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn typed_team_errors_preserve_classified_error_codes() {
+        use crate::error::TeamError;
+
+        let busy = map_tool_error(ToolCallError::from_team_error(TeamError::MemberBusy {
+            team_id: "t1".into(), slot_id: "s1".into(), conversation_id: "c1".into(),
+        }));
+        assert_eq!(busy.code, TeamToolErrorCode::TransportUnavailable);
+
+        let starting = map_tool_error(ToolCallError::from_team_error(TeamError::MemberRuntimeStarting {
+            team_id: "t1".into(), slot_id: "s1".into(), conversation_id: "c1".into(),
+        }));
+        assert_eq!(starting.code, TeamToolErrorCode::TransportUnavailable);
+
+        let missing_session = map_tool_error(ToolCallError::from_team_error(TeamError::SessionNotFound("t1".into())));
+        assert_eq!(missing_session.code, TeamToolErrorCode::TeamNotFound);
+
+        let missing_agent = map_tool_error(ToolCallError::from_team_error(TeamError::AgentNotFound("slot-9".into())));
+        assert_eq!(missing_agent.code, TeamToolErrorCode::AgentNotFound);
+
+        let forbidden = map_tool_error(ToolCallError::from_team_error(TeamError::LeaderOnly("notify".into())));
+        assert_eq!(forbidden.code, TeamToolErrorCode::PermissionDenied);
+
+        let invalid = map_tool_error(ToolCallError::from_team_error(TeamError::InvalidRequest("bad filter".into())));
+        assert_eq!(invalid.code, TeamToolErrorCode::SchemaValidationFailed);
     }
 }

@@ -11,6 +11,102 @@ use tracing::{error, info, warn};
 
 const MAX_RECONCILE_ACTIONS: usize = 8;
 
+/// Returns `true` when an ACP backend rejects a privileged approval mode
+/// (such as Gemini CLI `set_mode("yolo")`) because the workspace directory is
+/// not marked trusted.
+fn is_untrusted_folder_privileged_mode_error(err: &AcpError) -> bool {
+    fn contains_untrusted_mode_marker(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("untrusted folder") || lower.contains("privileged approval modes")
+    }
+
+    if contains_untrusted_mode_marker(&err.to_string()) {
+        return true;
+    }
+
+    match err {
+        AcpError::AgentInternal {
+            message,
+            data: Some(data),
+            ..
+        }
+        | AcpError::OtherProtocolError {
+            message,
+            data: Some(data),
+            ..
+        } => contains_untrusted_mode_marker(message) || contains_untrusted_mode_marker(&data.to_string()),
+        _ => false,
+    }
+}
+
+/// Latch `desired.mode_id` back to `observed.mode_id` (falling back to the
+/// advertised current mode or `"default"`) so subsequent reconcile passes do
+/// not re-issue a rejected privileged `set_mode` on every turn.
+fn latch_rejected_privileged_mode(session: &mut crate::manager::acp::AcpSession) -> ModeId {
+    let fallback = session
+        .observed_mode_id()
+        .cloned()
+        .or_else(|| session.current_mode_id().map(ModeId::new))
+        .unwrap_or_else(|| ModeId::new("default"));
+    // Emit `DesiredModeChanged` when accepted by the catalog so DB persistence
+    // aligns with the latched fallback, then confirm both desired + observed.
+    let _ = session.set_desired_mode(fallback.clone());
+    session.confirm_mode(fallback.clone());
+    fallback
+}
+
+/// Outcome of handling a `set_mode` error during `reconcile_session`.
+#[derive(Debug)]
+enum SetModeErrorDisposition {
+    /// Stale session id — caller must abort reconcile and surface the error.
+    AbortSessionNotFound(AcpError),
+    /// Privileged mode rejected in untrusted folder — `desired.mode_id` latched
+    /// to `fallback_mode` and logged once at `WARN`.
+    LatchedUntrustedFolder {
+        #[cfg_attr(not(test), allow(dead_code))]
+        fallback_mode: ModeId,
+    },
+    /// Other non-fatal `set_mode` error — logged at `ERROR` and skipped.
+    SkippedOtherError,
+}
+
+fn handle_set_mode_reconcile_error(
+    session: &mut crate::manager::acp::AcpSession,
+    conversation_id: &str,
+    attempted_mode: &str,
+    err: AcpError,
+) -> SetModeErrorDisposition {
+    if is_acp_session_not_found(&err) {
+        warn!(
+            conversation_id = %conversation_id,
+            mode_id = %attempted_mode,
+            error = %err,
+            "reconcile_session: set_mode hit SessionNotFound; aborting reconcile"
+        );
+        return SetModeErrorDisposition::AbortSessionNotFound(err);
+    }
+
+    if is_untrusted_folder_privileged_mode_error(&err) {
+        let fallback_mode = latch_rejected_privileged_mode(session);
+        warn!(
+            conversation_id = %conversation_id,
+            mode_id = %attempted_mode,
+            fallback_mode = %fallback_mode,
+            error = %err,
+            "ACP backend rejected privileged mode in untrusted folder; keeping current mode"
+        );
+        return SetModeErrorDisposition::LatchedUntrustedFolder { fallback_mode };
+    }
+
+    error!(
+        conversation_id = %conversation_id,
+        mode_id = %attempted_mode,
+        error = %err,
+        "reconcile_session: set_mode failed"
+    );
+    SetModeErrorDisposition::SkippedOtherError
+}
+
 /// Actions the session driver must execute to align CLI state with user intent.
 ///
 /// Produced by `AcpSession::plan_reconcile` — a pure function that compares
@@ -92,21 +188,22 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if is_acp_session_not_found(&e) {
-                            warn!(
-                                conversation_id = %self.params.conversation_id,
-                                mode_id = %normalized,
-                                error = %e,
-                                "reconcile_session: set_mode hit SessionNotFound; aborting reconcile"
+                        let disposition = {
+                            let mut session = self.session.write().await;
+                            let disposition = handle_set_mode_reconcile_error(
+                                &mut session,
+                                &self.params.conversation_id,
+                                &normalized,
+                                e,
                             );
-                            return Err(e);
+                            if matches!(disposition, SetModeErrorDisposition::LatchedUntrustedFolder { .. }) {
+                                self.commit_session_changes(&mut session).await;
+                            }
+                            disposition
+                        };
+                        if let SetModeErrorDisposition::AbortSessionNotFound(err) = disposition {
+                            return Err(err);
                         }
-                        error!(
-                            conversation_id = %self.params.conversation_id,
-                            mode_id = %normalized,
-                            error = %e,
-                            "reconcile_session: set_mode failed"
-                        );
                         continue;
                     }
                 }
@@ -216,6 +313,30 @@ impl AcpAgentManager {
                                 );
                                 return Err(err);
                             }
+                            if key.as_str() == "mode" && is_untrusted_folder_privileged_mode_error(&err) {
+                                let fallback = {
+                                    let mut session = self.session.write().await;
+                                    let observed = session
+                                        .config_snapshot()
+                                        .options
+                                        .into_iter()
+                                        .find(|opt| opt.id == "mode")
+                                        .and_then(|opt| opt.current_value)
+                                        .unwrap_or_else(|| "default".to_owned());
+                                    session.set_desired_config(key.clone(), ConfigValue::new(observed.clone()));
+                                    self.commit_session_changes(&mut session).await;
+                                    observed
+                                };
+                                warn!(
+                                    conversation_id = %self.params.conversation_id,
+                                    config_id = %key,
+                                    desired = %resolved_value,
+                                    fallback_mode = %fallback,
+                                    error = %err,
+                                    "ACP backend rejected privileged mode in untrusted folder; keeping current mode"
+                                );
+                                continue;
+                            }
                             info!(
                                 conversation_id = %self.params.conversation_id,
                                 config_id = %key,
@@ -312,5 +433,84 @@ mod tests {
 
         let events = session.drain_events();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn gemini_untrusted_folder_yolo_rejection_latches_mode_and_skips_second_turn_set_mode() {
+        use agent_client_protocol::schema::v1::{SessionMode, SessionModeState};
+
+        let mut session = AcpSession::new(Some(ModeId::new("yolo")), None, HashMap::new());
+        session.apply_advertised_modes(SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("autoEdit", "Auto Edit"),
+                SessionMode::new("yolo", "YOLO"),
+            ],
+        ));
+        session.drain_events();
+
+        let mut set_mode_calls: Vec<String> = Vec::new();
+
+        // Turn 1: `plan_reconcile` requests `SetMode { mode: "yolo" }`, Gemini rejects
+        // privileged approval modes in an untrusted folder.
+        let turn1_actions = session.plan_reconcile();
+        assert_eq!(
+            turn1_actions,
+            vec![ReconcileAction::SetMode {
+                mode: ModeId::new("yolo")
+            }]
+        );
+        for action in turn1_actions {
+            if let ReconcileAction::SetMode { mode } = action {
+                set_mode_calls.push(mode.as_str().to_owned());
+                let err = AcpError::InvalidParams {
+                    message: "Cannot enable privileged approval modes in an untrusted folder.".to_owned(),
+                };
+                let disposition = handle_set_mode_reconcile_error(&mut session, "conv-gemini-1", mode.as_str(), err);
+                assert!(
+                    matches!(
+                        disposition,
+                        SetModeErrorDisposition::LatchedUntrustedFolder { ref fallback_mode }
+                            if fallback_mode.as_str() == "default"
+                    ),
+                    "unexpected disposition: {disposition:?}"
+                );
+            }
+        }
+        assert_eq!(set_mode_calls, vec!["yolo"]);
+        assert_eq!(session.desired_mode(), Some("default"));
+        assert_eq!(session.observed_mode_id(), Some(&ModeId::new("default")));
+
+        // Turn 2: `reconcile_session` runs again before the next prompt and MUST NOT
+        // re-issue `set_mode("yolo")`.
+        let turn2_actions = session.plan_reconcile();
+        assert!(
+            turn2_actions.is_empty(),
+            "expected 0 reconcile actions on turn 2 after latching mode, got {turn2_actions:?}"
+        );
+        for action in turn2_actions {
+            if let ReconcileAction::SetMode { mode } = action {
+                set_mode_calls.push(mode.as_str().to_owned());
+            }
+        }
+        assert_eq!(set_mode_calls, vec!["yolo"], "turn 2 must not re-send set_mode(\"yolo\")");
+    }
+
+    #[test]
+    fn untrusted_folder_detector_matches_case_insensitively_and_json_rpc_data() {
+        let internal_with_data = AcpError::AgentInternal {
+            message: "Internal error".to_owned(),
+            code: -32603,
+            data: Some(serde_json::json!({
+                "details": "Workspace is an Untrusted Folder; privileged mode denied"
+            })),
+        };
+        assert!(is_untrusted_folder_privileged_mode_error(&internal_with_data));
+
+        let unrelated = AcpError::InvalidParams {
+            message: "Unknown mode: super-turbo".to_owned(),
+        };
+        assert!(!is_untrusted_folder_privileged_mode_error(&unrelated));
     }
 }

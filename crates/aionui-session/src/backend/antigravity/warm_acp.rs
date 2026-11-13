@@ -178,6 +178,7 @@ pub(crate) struct WarmAcpClient {
     pending_rpcs: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     alive: Arc<AtomicBool>,
     suppress_updates: Arc<AtomicBool>,
+    saw_streaming_occupancy_in_turn: Arc<AtomicBool>,
     active_turn_gen: Arc<AtomicU64>,
     bound_session_id: Mutex<Option<String>>,
     preamble_delivered: AtomicBool,
@@ -200,12 +201,14 @@ impl WarmAcpClient {
         let pending_rpcs: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let suppress_updates = Arc::new(AtomicBool::new(false));
+        let saw_streaming_occupancy_in_turn = Arc::new(AtomicBool::new(false));
         let active_turn_gen = Arc::new(AtomicU64::new(0));
 
         let reader_stdin = Arc::clone(&stdin);
         let reader_pending = Arc::clone(&pending_rpcs);
         let reader_alive = Arc::clone(&alive);
         let reader_suppress = Arc::clone(&suppress_updates);
+        let reader_saw_streaming = Arc::clone(&saw_streaming_occupancy_in_turn);
         let reader_turn_gen = Arc::clone(&active_turn_gen);
 
         let reader_task = tokio::spawn(async move {
@@ -223,7 +226,7 @@ impl WarmAcpClient {
                         Self::handle_reverse_rpc(&reader_stdin, &backend, &reader_turn_gen, method, req_id, &frame)
                             .await;
                     } else if method == "session/update" && !reader_suppress.load(Ordering::SeqCst) {
-                        Self::handle_session_update(&backend, &reader_turn_gen, &frame);
+                        Self::handle_session_update(&backend, &reader_turn_gen, &reader_saw_streaming, &frame);
                     }
                 } else if let Some(id) = frame.get("id").and_then(Value::as_u64)
                     && let Some(tx) = reader_pending.lock().await.remove(&id)
@@ -245,6 +248,7 @@ impl WarmAcpClient {
             pending_rpcs,
             alive,
             suppress_updates,
+            saw_streaming_occupancy_in_turn,
             active_turn_gen,
             bound_session_id: Mutex::new(None),
             preamble_delivered: AtomicBool::new(false),
@@ -517,6 +521,7 @@ impl WarmAcpClient {
         content: Vec<ContentBlock>,
     ) {
         self.active_turn_gen.store(turn_gen, Ordering::SeqCst);
+        self.saw_streaming_occupancy_in_turn.store(false, Ordering::SeqCst);
 
         let sid = match self.ensure_initialized(backend).await {
             Ok(sid) => sid,
@@ -574,7 +579,8 @@ impl WarmAcpClient {
 
         match resp {
             Ok(frame) => {
-                if let Some(usage_event) = parse_acp_result_usage(&frame) {
+                let saw_streaming = self.saw_streaming_occupancy_in_turn.swap(false, Ordering::SeqCst);
+                if let Some(usage_event) = parse_acp_result_usage(&frame, saw_streaming) {
                     backend.emit_event(turn_gen, usage_event);
                 }
                 let stderr_tail = if frame.get("error").is_some() {
@@ -701,6 +707,7 @@ impl WarmAcpClient {
     fn handle_session_update(
         backend_weak: &std::sync::Weak<AntigravitySessionBackend>,
         active_turn_gen: &Arc<AtomicU64>,
+        saw_streaming_occupancy_in_turn: &Arc<AtomicBool>,
         frame: &Value,
     ) {
         let Some(backend) = backend_weak.upgrade() else {
@@ -786,6 +793,9 @@ impl WarmAcpClient {
                     .unwrap_or(input + output);
                 let cost_usd = update.get("cost").and_then(|c| c.get("amount")).and_then(Value::as_f64);
                 let context_window = update.get("size").and_then(Value::as_u64);
+                if total > 0 {
+                    saw_streaming_occupancy_in_turn.store(true, Ordering::SeqCst);
+                }
                 if total > 0 || cost_usd.is_some() || context_window.is_some() {
                     backend.emit_event(
                         turn_gen,
@@ -795,6 +805,8 @@ impl WarmAcpClient {
                             total_tokens: total,
                             cost_usd,
                             context_window,
+                            occupancy_tokens: (total > 0).then_some(total),
+                            turn_billed_tokens: None,
                             breakdown: crate::event::UsageBreakdown::default(),
                         },
                     );
@@ -1542,5 +1554,136 @@ mod tests {
         let p3_text = srv2.await.unwrap();
         assert_eq!(p3_text, "turn 3 after crash", "session/load recovery must not duplicate preamble");
         assert_eq!(streamed_turn3, "RECOVERED_OK", "session/load history replay must be suppressed");
+    }
+
+    #[tokio::test]
+    async fn warm_acp_multistep_result_usage_keeps_occupancy_none_when_streaming_reported() {
+        let backend = AntigravitySessionBackend::new_warm_for_test(SessionConfig::default(), None);
+        let (io, mut srv_in, mut srv_out) = DuplexAgentIo::pair();
+        backend.inject_warm_acp_client_for_test(io).await.unwrap();
+        let mut events = backend.events();
+
+        let srv = tokio::spawn(async move {
+            let init_req = read_rpc(&mut srv_in).await;
+            write_rpc(
+                &mut srv_out,
+                &json!({"jsonrpc":"2.0","id":init_req["id"],"result":{"protocolVersion":1}}),
+            )
+            .await;
+            let new_req = read_rpc(&mut srv_in).await;
+            write_rpc(
+                &mut srv_out,
+                &json!({"jsonrpc":"2.0","id":new_req["id"],"result":{"sessionId":"sid-occ-1","modes":{"currentModeId":"default"}}}),
+            )
+            .await;
+
+            // Turn 1: <1M multi-step (48k occupancy, 700k cumulative turn total)
+            let p1 = read_rpc(&mut srv_in).await;
+            write_rpc(
+                &mut srv_out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sid-occ-1",
+                        "update": { "sessionUpdate": "usage_update", "used": 48_000, "size": 1_000_000 }
+                    }
+                }),
+            )
+            .await;
+            write_rpc(
+                &mut srv_out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": p1["id"],
+                    "result": {
+                        "stopReason": "end_turn",
+                        "usage": {
+                            "inputTokens": 40_000,
+                            "outputTokens": 10_000,
+                            "cachedReadTokens": 650_000,
+                            "totalTokens": 700_000
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            // Turn 2: >1M multi-step (42k occupancy, 27.4M cumulative turn total)
+            let p2 = read_rpc(&mut srv_in).await;
+            write_rpc(
+                &mut srv_out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sid-occ-1",
+                        "update": { "sessionUpdate": "usage_update", "used": 42_150, "size": 1_000_000 }
+                    }
+                }),
+            )
+            .await;
+            write_rpc(
+                &mut srv_out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": p2["id"],
+                    "result": {
+                        "stopReason": "end_turn",
+                        "usage": {
+                            "inputTokens": 410_000,
+                            "outputTokens": 90_000,
+                            "cachedReadTokens": 26_900_000,
+                            "totalTokens": 27_400_000
+                        }
+                    }
+                }),
+            )
+            .await;
+        });
+
+        backend.dispatch(send_cmd("sub-1m multistep")).await.unwrap();
+        let mut t1_usages = Vec::new();
+        while let Some(env) = events.next().await {
+            if let SessionEvent::UsageDelta {
+                occupancy_tokens,
+                turn_billed_tokens,
+                ..
+            } = env.event
+            {
+                t1_usages.push((occupancy_tokens, turn_billed_tokens));
+            } else if matches!(env.event, SessionEvent::TurnResult { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            t1_usages,
+            vec![(Some(48_000), None), (None, Some(700_000))],
+            "700k <1M multi-step turn must NOT overwrite 48k streaming occupancy"
+        );
+        while backend.in_flight.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        backend.dispatch(send_cmd("27m multistep")).await.unwrap();
+        let mut t2_usages = Vec::new();
+        while let Some(env) = events.next().await {
+            if let SessionEvent::UsageDelta {
+                occupancy_tokens,
+                turn_billed_tokens,
+                ..
+            } = env.event
+            {
+                t2_usages.push((occupancy_tokens, turn_billed_tokens));
+            } else if matches!(env.event, SessionEvent::TurnResult { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            t2_usages,
+            vec![(Some(42_150), None), (None, Some(27_400_000))],
+            "27.4M multi-step turn must set occupancy_tokens=None and turn_billed_tokens=Some(27.4M)"
+        );
+        srv.await.unwrap();
     }
 }

@@ -846,13 +846,24 @@ async fn ttl6_task_list_rejects_invalid_filter_arguments() {
 
     for (id, args, expected) in [
         (2, json!({"slot_id": "worker-1"}), "Invalid params"),
-        (3, json!({"status": "blocked"}), "Invalid params"),
-        (4, json!({"status": []}), "Invalid params"),
+        (3, json!({"status": "unknown_status"}), "Invalid params"),
+        (4, json!({"status": ["pending", "not_a_status"]}), "Invalid params"),
         (5, json!({"limit": 0}), "Invalid params"),
     ] {
         let resp = call_tool(&mut stream, id, "team_task_list", args).await;
         assert!(is_error_response(&resp), "expected error response: {resp}");
         assert!(extract_text(&resp).contains(expected));
+    }
+
+    // Governance status aliases, empty array [], "all", comma-delimited strings, and `statuses` alias succeed
+    for (id, ok_args) in [
+        (6, json!({"status": []})),
+        (7, json!({"status": "all"})),
+        (8, json!({"status": "todo,in_review,blocked,done,cancelled"})),
+        (9, json!({"statuses": ["open", "active", "canceled"]})),
+    ] {
+        let resp = call_tool(&mut stream, id, "team_task_list", ok_args).await;
+        assert!(!is_error_response(&resp), "expected valid governance filter response: {resp}");
     }
 
     env.server.stop();

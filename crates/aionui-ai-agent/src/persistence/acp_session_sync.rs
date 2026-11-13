@@ -134,13 +134,28 @@ impl AcpSessionSyncService {
     /// spawned task is tied to the sender being dropped when the manager
     /// is destroyed.
     pub async fn attach(&self, user_id: String, conversation_id: String, domain_rx: mpsc::Receiver<AcpSessionEvent>) {
+        let prev = {
+            let mut guard = self.active.write().await;
+            guard.remove(&conversation_id)
+        };
+        if let Some(mut prev_handle) = prev {
+            // Allow any in-flight flush on the prior consumer to drain cleanly for up to
+            // 200ms before aborting so terminal runtime writes are not lost on rebuild.
+            if tokio::time::timeout(Duration::from_millis(200), &mut prev_handle)
+                .await
+                .is_err()
+            {
+                prev_handle.abort();
+            }
+        }
+
         let repo = self.repo.clone();
         let cid = conversation_id.clone();
         let task = tokio::spawn(domain_event_consumer(user_id, cid, domain_rx, repo));
 
         let mut guard = self.active.write().await;
-        if let Some(prev) = guard.insert(conversation_id, task) {
-            prev.abort();
+        if let Some(raced) = guard.insert(conversation_id, task) {
+            raced.abort();
         }
     }
 }
@@ -251,8 +266,34 @@ async fn domain_event_consumer(
                     }
                     continue;
                 }
+                if matches!(event, AcpSessionEvent::SessionCleared) {
+                    match repo.clear_session_id_for_user(&user_id, &conversation_id).await {
+                        Ok(true) => {}
+                        Ok(false) => debug!(
+                            user_id,
+                            conversation_id, "session-sync: acp_session row missing; session_id not cleared"
+                        ),
+                        Err(err) => warn!(
+                            user_id,
+                            conversation_id,
+                            error = %err,
+                            "session-sync: clear_session_id failed"
+                        ),
+                    }
+                    continue;
+                }
+                let immediate_usage_flush = matches!(
+                    &event,
+                    AcpSessionEvent::ObservedContextUsageChanged { usage_json }
+                        if usage_json_has_meta_seq(usage_json)
+                );
                 if pending.merge_from_domain_event(&event) {
-                    flush_at = Some(Instant::now() + DEBOUNCE_WINDOW);
+                    if immediate_usage_flush {
+                        flush(&repo, &user_id, &conversation_id, &mut pending).await;
+                        flush_at = None;
+                    } else {
+                        flush_at = Some(Instant::now() + DEBOUNCE_WINDOW);
+                    }
                 }
             }
             None => {
@@ -295,6 +336,13 @@ async fn flush(
         }
     }
     *pending = PendingUpdate::default();
+}
+
+fn usage_json_has_meta_seq(usage_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(usage_json)
+        .ok()
+        .and_then(|v| v.get("_meta")?.get("seq")?.as_i64())
+        .is_some_and(|seq| seq > 0)
 }
 
 #[cfg(test)]
@@ -586,5 +634,66 @@ mod tests {
         assert_eq!(row.session_id.as_deref(), Some("sess-42"));
         drop(tx);
         sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_cleared_clears_session_id_immediately() {
+        let (_svc, repo) = setup().await;
+        let (tx, rx) = mpsc::channel(64);
+
+        let cid = "conv-1".to_owned();
+        tokio::spawn(domain_event_consumer("user-1".to_owned(), cid, rx, repo.clone()));
+
+        tx.send(AcpSessionEvent::SessionAssigned {
+            session_id: SessionId::new("sess-stale"),
+        })
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            repo.get_for_user("user-1", "conv-1").await.unwrap().unwrap().session_id.as_deref(),
+            Some("sess-stale")
+        );
+
+        tx.send(AcpSessionEvent::SessionCleared).await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            repo.get_for_user("user-1", "conv-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none(),
+            "SessionCleared must immediately null out persisted session_id without waiting for debounce"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_usage_with_meta_seq_flushes_immediately() {
+        let (_svc, repo) = setup().await;
+        let (tx, rx) = mpsc::channel(64);
+
+        let cid = "conv-1".to_owned();
+        tokio::spawn(domain_event_consumer("user-1".to_owned(), cid, rx, repo.clone()));
+
+        tx.send(AcpSessionEvent::ObservedContextUsageChanged {
+            usage_json: r#"{"used":185000,"size":1000000,"_meta":{"turn_total_tokens":720000,"seq":999}}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+
+        // Must be flushed in < 50ms (well below the 500ms DEBOUNCE_WINDOW) so
+        // handle_slot_turn_settled never reads stale pre-turn SQLite usage.
+        sleep(Duration::from_millis(50)).await;
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = state.context_usage_json.expect("terminal _meta.seq usage must flush in 0ms");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["used"], 185000);
+        assert_eq!(parsed["_meta"]["turn_total_tokens"], 720000);
+        assert_eq!(parsed["_meta"]["seq"], 999);
     }
 }

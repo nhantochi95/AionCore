@@ -741,6 +741,10 @@ impl ConversationService {
         &self.acp_session_repo
     }
 
+    pub(crate) fn agent_metadata_repo(&self) -> &Arc<dyn IAgentMetadataRepository> {
+        &self.agent_metadata_repo
+    }
+
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
         self.runtime_state.clone()
     }
@@ -4275,7 +4279,25 @@ impl ConversationService {
     /// target agent's conversation so the UI shows who spoke).
     pub async fn insert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
         self.conversation_repo.insert_message(user_id, row).await?;
+        self.broadcast_raw_message_stream(user_id, row);
+        Ok(())
+    }
 
+    /// Atomically insert a raw message row using `ON CONFLICT(id) DO NOTHING`,
+    /// broadcasting `message.stream` ONLY when a new row was actually inserted.
+    pub async fn insert_raw_message_if_absent(
+        &self,
+        user_id: &str,
+        row: &MessageRow,
+    ) -> Result<bool, ConversationError> {
+        let inserted = self.conversation_repo.insert_message_if_absent(user_id, row).await?;
+        if inserted {
+            self.broadcast_raw_message_stream(user_id, row);
+        }
+        Ok(inserted)
+    }
+
+    fn broadcast_raw_message_stream(&self, user_id: &str, row: &MessageRow) {
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
@@ -4292,7 +4314,6 @@ impl ConversationService {
         });
         self.broadcaster
             .broadcast(WebSocketMessage::new("message.stream", payload));
-        Ok(())
     }
 
     /// Stop the current streaming response for a conversation.

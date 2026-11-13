@@ -1714,12 +1714,37 @@ fn clear_stale_model(
 ) -> Option<String> {
     use crate::manager::acp::config_option_catalog::extract_models_from_value;
     let model = model?;
-    let Some(catalog) = metadata
+    let is_default_sentinel = model.trim().eq_ignore_ascii_case("default");
+    let catalog = metadata
         .handshake
         .available_models
         .as_ref()
-        .and_then(extract_models_from_value)
-    else {
+        .and_then(extract_models_from_value);
+
+    if is_default_sentinel {
+        // Keep `"default"` only when the backend explicitly advertises a `"default"`
+        // catalog row (e.g. Claude, whose backend suppresses `--model default` in
+        // `desired_model_from_config`). For Antigravity/Codex (or before handshake),
+        // normalize silently to `None` so `--model default` is never passed to the CLI
+        // and no false-positive stale-model `WARN` is emitted.
+        if let Some(ref cat) = catalog
+            && cat
+                .available_models
+                .iter()
+                .any(|entry| entry.model_id.eq_ignore_ascii_case("default"))
+        {
+            return Some(model);
+        }
+        tracing::debug!(
+            conversation_id,
+            agent_id = %metadata.id,
+            requested_model = %model,
+            "normalizing generic 'default' model selection to None for CLI native default"
+        );
+        return None;
+    }
+
+    let Some(catalog) = catalog else {
         return Some(model);
     };
     if catalog.available_models.is_empty() || catalog.available_models.iter().any(|entry| entry.model_id == model) {
@@ -2837,6 +2862,24 @@ fn spawn_event_pump(
         // window precisely: a trailing result rides the OLD gen (FIFO stdout), the
         // next turn's frames ride the new gen.
         let mut last_seen_turn_gen: u64 = 0;
+        let mut usage_acc = PumpUsageAccumulator {
+            last_occupancy: if let Some(repo) = session_repo.as_ref() {
+                repo.load_runtime_state_for_user(&user_id, &conversation_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.context_usage_json)
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| {
+                        let used = v.get("used").and_then(serde_json::Value::as_u64).filter(|&u| u > 0)?;
+                        let size = v.get("size").and_then(serde_json::Value::as_u64).filter(|&sz| sz > 0);
+                        Some((used, size))
+                    })
+            } else {
+                None
+            },
+            ..Default::default()
+        };
         // 1s heartbeat for live progress cards. A background task has NO frames
         // between task_started and its terminal notification (verified: the
         // 2.1.220 bg capture goes 27 task_started → 41 task_updated with nothing
@@ -2893,6 +2936,7 @@ fn spawn_event_pump(
                 workflow_inflight.clear();
                 finish_suppressed_pending = false;
                 synthetic_finish_emitted = false;
+                usage_acc.reset_turn();
             }
 
             // The deferred DUPLICATE terminal: claude ends a turn twice — the
@@ -2935,6 +2979,7 @@ fn spawn_event_pump(
                             "session-pump: content after settled terminal — CLI-initiated turn begins"
                         );
                         terminal_result_seen = false;
+                        usage_acc.reset_turn();
                     }
                     _ => {}
                 }
@@ -3220,6 +3265,7 @@ fn spawn_event_pump(
                     workflow_inflight.clear();
                     finish_suppressed_pending = false;
                     synthetic_finish_emitted = false;
+                    usage_acc.reset_turn();
                 }
                 // Track the call's open/closed lifecycle. Also remember the name for
                 // `stamp_tool_name` — the map was previously never populated, so
@@ -3354,21 +3400,23 @@ fn spawn_event_pump(
                 } => runtime.set_session_id(bid.clone()),
                 _ => {}
             }
+            let mut event_for_consumers = env.event;
+            usage_acc.normalize(&mut event_for_consumers);
             // Persist the Tier-2 side-effects the legacy ACP path wrote via
             // AcpSessionSyncService (which this direct-CLI path bypasses). Best-effort:
             // a repo error is warn-logged, never fatal to the stream.
             if let Some(repo) = session_repo.as_ref() {
-                persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
+                persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &event_for_consumers).await;
             }
             // Usage must ALSO reach the live view directly. claude reports it on the
             // `result` frame, which lands after the relay has already broken on
             // Finish, so the translated frame below would be shouted into an empty
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
-            if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
-                broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
+            if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&event_for_consumers)) {
+                broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &event_for_consumers);
             }
-            for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
+            for mut ev in translate_event(event_for_consumers, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
                 // empty, and the upsert-by-call_id persistence would otherwise clobber
@@ -3602,9 +3650,112 @@ async fn persist_side_effects(
 /// 27_238, not `post_tokens`' 2_065. `post_tokens` counts only the compacted
 /// transcript while `usage` also carries the system prompt and tool definitions
 /// (~25k here). Different baselines; mixing them would understate occupancy ~13x.
+#[derive(Debug, Clone, Default)]
+struct PumpUsageAccumulator {
+    last_occupancy: Option<(u64, Option<u64>)>,
+    turn_billed_tokens: u64,
+    turn_input_tokens: u64,
+    turn_output_tokens: u64,
+    turn_breakdown: aionui_session::UsageBreakdown,
+}
+
+impl PumpUsageAccumulator {
+    fn reset_turn(&mut self) {
+        self.turn_billed_tokens = 0;
+        self.turn_input_tokens = 0;
+        self.turn_output_tokens = 0;
+        self.turn_breakdown = aionui_session::UsageBreakdown::default();
+    }
+
+    fn normalize(&mut self, event: &mut SessionEvent) {
+        let SessionEvent::UsageDelta {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            context_window,
+            occupancy_tokens,
+            turn_billed_tokens,
+            breakdown,
+            ..
+        } = event
+        else {
+            return;
+        };
+
+        if let Some(occ) = *occupancy_tokens {
+            if occ > 0 {
+                let size = context_window.or_else(|| self.last_occupancy.and_then(|(_, sz)| sz));
+                self.last_occupancy = Some((occ, size));
+                if context_window.is_none() {
+                    *context_window = size;
+                }
+            }
+        } else if let Some((cached_used, cached_size)) = self.last_occupancy {
+            // Terminal PromptResponse.usage with occupancy_tokens == None:
+            // populate numeric `used` (and `size`) from cached streaming occupancy so
+            // both SQLite and live frontend (`useAcpMessage.ts:494`) keep exact occupancy!
+            *occupancy_tokens = Some(cached_used);
+            if context_window.is_none() {
+                *context_window = cached_size;
+            }
+        } else if *total_tokens > 0 {
+            *occupancy_tokens = Some(*total_tokens);
+            self.last_occupancy = Some((*total_tokens, *context_window));
+        }
+
+        if let Some(step_billed) = *turn_billed_tokens
+            && step_billed > 0
+        {
+            self.turn_billed_tokens = self.turn_billed_tokens.saturating_add(step_billed);
+            self.turn_input_tokens = self.turn_input_tokens.saturating_add(*input_tokens);
+            self.turn_output_tokens = self.turn_output_tokens.saturating_add(*output_tokens);
+            self.turn_breakdown.cached_read_tokens = self
+                .turn_breakdown
+                .cached_read_tokens
+                .saturating_add(breakdown.cached_read_tokens);
+            self.turn_breakdown.cached_write_tokens = self
+                .turn_breakdown
+                .cached_write_tokens
+                .saturating_add(breakdown.cached_write_tokens);
+            self.turn_breakdown.thought_tokens = self
+                .turn_breakdown
+                .thought_tokens
+                .saturating_add(breakdown.thought_tokens);
+
+            *turn_billed_tokens = Some(self.turn_billed_tokens);
+            *input_tokens = self.turn_input_tokens;
+            *output_tokens = self.turn_output_tokens;
+            *breakdown = self.turn_breakdown.clone();
+        }
+    }
+}
+
+pub(crate) fn next_usage_meta_seq(prev_seq: i64) -> i64 {
+    static USAGE_META_SEQ: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    let counter = USAGE_META_SEQ.get_or_init(|| {
+        let seed = aionui_common::now_ms().max(1).saturating_mul(1000);
+        std::sync::atomic::AtomicI64::new(seed)
+    });
+    let candidate = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if candidate <= prev_seq {
+        let bumped = prev_seq.saturating_add(1);
+        let _ = counter.fetch_max(bumped.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        bumped
+    } else {
+        candidate
+    }
+}
+
 fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
     match event {
-        SessionEvent::UsageDelta { total_tokens, .. } if *total_tokens > 0 => Some(event),
+        SessionEvent::UsageDelta {
+            total_tokens,
+            occupancy_tokens,
+            turn_billed_tokens,
+            ..
+        } if *total_tokens > 0 || occupancy_tokens.unwrap_or(0) > 0 || turn_billed_tokens.unwrap_or(0) > 0 => {
+            Some(event)
+        }
         // Discarding is silent otherwise, which makes "the indicator is stuck on an
         // old number" undiagnosable from logs. One line per no-op turn is cheap.
         SessionEvent::UsageDelta { .. } => {
@@ -3679,12 +3830,15 @@ async fn persist_context_usage(
         total_tokens: used,
         cost_usd,
         context_window,
+        occupancy_tokens,
+        turn_billed_tokens,
         breakdown,
     } = event
     else {
         return;
     };
-    let (used, cost_usd, context_window) = (*used, *cost_usd, *context_window);
+    let (used, cost_usd, context_window, occupancy_tokens, turn_billed_tokens) =
+        (*used, *cost_usd, *context_window, *occupancy_tokens, *turn_billed_tokens);
     let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
         Ok(Some(state)) => state
             .context_usage_json
@@ -3698,27 +3852,43 @@ async fn persist_context_usage(
             return;
         }
     };
-    usage.insert("used".into(), serde_json::json!(used));
+    if let Some(occ) = occupancy_tokens {
+        usage.insert("used".into(), serde_json::json!(occ));
+    } else if turn_billed_tokens.is_some() {
+        // Terminal billed-only frame where streaming occupancy already populated SQLite:
+        // keep the numeric `used` in SQLite, falling back to `used` only if absent.
+        if usage.get("used").and_then(serde_json::Value::as_u64).is_none() {
+            usage.insert("used".into(), serde_json::json!(used));
+        }
+    } else {
+        usage.insert("used".into(), serde_json::json!(used));
+    }
     if let Some(size) = context_window {
         usage.insert("size".into(), serde_json::json!(size));
     }
     if let Some(cost) = cost_usd {
         usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
     }
-    static USAGE_META_SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
     let prev_seq = usage
         .get("_meta")
         .and_then(|m| m.get("seq"))
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
-    // The detail line and Team Economy telemetry must survive a reload too —
-    // persist `_meta` with a monotonic `seq` whenever the turn reported real
-    // input/output or breakdown tokens, and clear stale `_meta` when a bare
-    // occupancy-only `usage_update` arrives on a subsequent turn.
-    if !breakdown.is_empty() || *input_tokens > 0 || *output_tokens > 0 {
-        let next_seq = prev_seq
-            .saturating_add(1)
-            .max(USAGE_META_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let effective_turn_billed = turn_billed_tokens.or_else(|| {
+        (!breakdown.is_empty() || *input_tokens > 0 || *output_tokens > 0).then(|| {
+            (*input_tokens
+                + *output_tokens
+                + breakdown.cached_read_tokens
+                + breakdown.cached_write_tokens
+                + breakdown.thought_tokens)
+                .max(used)
+        })
+    });
+    // Persist `_meta` with an epoch-monotonic `seq` and `turn_total_tokens` whenever
+    // the event carries per-turn billed counters. Streaming occupancy-only `usage_update`
+    // frames NEVER remove `_meta` so an un-settled previous turn's `_meta` cannot be erased.
+    if let Some(turn_total_tokens) = effective_turn_billed {
+        let next_seq = next_usage_meta_seq(prev_seq);
         usage.insert(
             "_meta".into(),
             serde_json::json!({
@@ -3727,11 +3897,10 @@ async fn persist_context_usage(
                 "cached_read_tokens": breakdown.cached_read_tokens,
                 "cached_write_tokens": breakdown.cached_write_tokens,
                 "thought_tokens": breakdown.thought_tokens,
+                "turn_total_tokens": turn_total_tokens,
                 "seq": next_seq,
             }),
         );
-    } else {
-        usage.remove("_meta");
     }
     let json = match serde_json::to_string(&usage) {
         Ok(j) => j,
@@ -4472,39 +4641,35 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             total_tokens,
             cost_usd,
             context_window,
+            occupancy_tokens,
+            turn_billed_tokens,
             breakdown,
         } => {
-            // The frontend ContextUsageIndicator reads `used` (tokens consumed) and,
-            // optionally, `size` (context window) + `cost` — the exact shape the ACP
-            // path forwards (the claude-agent-acp SDK's UsageUpdate: {used, size,
-            // cost:{amount,currency}}). Emitting the raw {input_tokens,…} shape left
-            // the indicator blank (no `used` key).
-            //
-            // `used` = total_tokens, which BOTH direct backends compute as current
-            // context occupancy, not a per-turn delta: codex reports `last.totalTokens`
-            // (its `inputTokens` already includes the cached part) and claude's
-            // adapter sums input + output + both cache buckets. The cumulative
-            // counters (codex `total.*`) are deliberately NOT used — they outgrow the
-            // window on a long session.
-            //
-            // `size` is emitted only when the backend reported a window; the frontend
-            // guards `if size>0`, so `None` degrades to a counter with no percentage.
-            let mut usage = serde_json::json!({ "used": total_tokens });
+            // `useAcpMessage.ts:494` requires numeric `used` on every `acp_context_usage`
+            // frame (`typeof usageData.used !== 'number'` drops the frame!). Prefer
+            // `occupancy_tokens` (populated from streaming `usage_update` or cached
+            // `last_occupancy` in `PumpUsageAccumulator`), falling back to `total_tokens`.
+            let effective_used = occupancy_tokens.unwrap_or(total_tokens);
+            let mut usage = serde_json::json!({ "used": effective_used });
             if let Some(size) = context_window {
                 usage["size"] = serde_json::json!(size);
             }
-            // Per-turn detail line ("input · output · cache read · thinking").
-            // The renderer reads these five keys out of `_meta` (AionUi
-            // useAcpMessage.ts `BREAKDOWN_KEYS`) and drops the line when none are
-            // present — so a backend that reports nothing simply has no line,
-            // rather than a row of zeros.
-            if !breakdown.is_empty() {
+            if !breakdown.is_empty() || turn_billed_tokens.is_some() {
+                let turn_total = turn_billed_tokens.unwrap_or_else(|| {
+                    (input_tokens
+                        + output_tokens
+                        + breakdown.cached_read_tokens
+                        + breakdown.cached_write_tokens
+                        + breakdown.thought_tokens)
+                        .max(total_tokens)
+                });
                 usage["_meta"] = serde_json::json!({
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "cached_read_tokens": breakdown.cached_read_tokens,
                     "cached_write_tokens": breakdown.cached_write_tokens,
                     "thought_tokens": breakdown.thought_tokens,
+                    "turn_total_tokens": turn_total,
                 });
             }
             if let Some(cost) = cost_usd {
@@ -5191,6 +5356,41 @@ mod build_mapping_tests {
         assert_eq!(model.as_deref(), Some("default"));
     }
 
+    #[test]
+    fn clear_stale_model_normalizes_default_silently_when_absent_from_catalog() {
+        // Antigravity / Codex catalogs do not include a `"default"` row; requesting
+        // `"default"` (any casing) must normalize silently to `None` so `--model default`
+        // is never passed to the CLI.
+        let agy_md = metadata_with_models(&["gemini-2.5-pro", "claude-sonnet-4-6"]);
+        for sentinel in ["default", "Default", "DEFAULT", " default "] {
+            assert_eq!(
+                clear_stale_model(&agy_md, Some(sentinel.to_owned()), "conv_agy_default"),
+                None,
+                "expected {sentinel:?} to normalize to None when absent from catalog"
+            );
+        }
+
+        // Cold open before handshake (`available_models == None` or empty) also normalizes
+        // `"default"` to `None` so `--model default` never reaches `agy` or `codex`.
+        let cold_codex = test_metadata(Some("codex"), None);
+        assert_eq!(
+            clear_stale_model(&cold_codex, Some("default".to_owned()), "conv_cold_codex"),
+            None
+        );
+        let empty_catalog = metadata_with_models(&[]);
+        assert_eq!(
+            clear_stale_model(&empty_catalog, Some("default".to_owned()), "conv_empty_cat"),
+            None
+        );
+
+        // When `"default"` IS explicitly advertised in `available_models` (Claude), keep it.
+        let claude_md = metadata_with_models(&["default", "sonnet", "opus"]);
+        assert_eq!(
+            clear_stale_model(&claude_md, Some("default".to_owned()), "conv_claude_default").as_deref(),
+            Some("default")
+        );
+    }
+
     /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
     /// invalid — dropping it there would break the very first session of every agent,
     /// including codex/ACP backends that share this path.
@@ -5488,6 +5688,8 @@ mod translate_tests {
                 total_tokens: total,
                 cost_usd: cost,
                 context_window: window,
+                occupancy_tokens: None,
+                turn_billed_tokens: None,
                 breakdown: Default::default(),
             },
             "conv-1",
@@ -5523,6 +5725,8 @@ mod translate_tests {
                 total_tokens: 18_400,
                 cost_usd: None,
                 context_window: Some(256_000),
+                occupancy_tokens: Some(18_400),
+                turn_billed_tokens: Some(18_515),
                 breakdown: aionui_session::UsageBreakdown {
                     cached_read_tokens: 16_900,
                     cached_write_tokens: 79,
@@ -5731,6 +5935,8 @@ mod translate_tests {
                 total_tokens: 30,
                 cost_usd: Some(0.5),
                 context_window: None,
+                occupancy_tokens: Some(30),
+                turn_billed_tokens: None,
                 breakdown: Default::default(),
             },
             "conv-1",
@@ -6156,6 +6362,8 @@ mod persist_tests {
             total_tokens: total,
             cost_usd: cost,
             context_window: window,
+            occupancy_tokens: (total > 0).then_some(total),
+            turn_billed_tokens: None,
             breakdown: Default::default(),
         }
     }
@@ -6233,7 +6441,7 @@ mod persist_tests {
     }
 
     #[tokio::test]
-    async fn persist_context_usage_writes_meta_even_when_cache_and_thought_are_zero() {
+    async fn persist_context_usage_writes_meta_and_preserves_it_across_streaming_occupancy_updates() {
         let (repo, _db) = seeded_repo().await;
         persist_side_effects(
             repo.as_ref(),
@@ -6245,6 +6453,8 @@ mod persist_tests {
                 total_tokens: 14_236,
                 cost_usd: None,
                 context_window: Some(200_000),
+                occupancy_tokens: Some(14_236),
+                turn_billed_tokens: Some(14_236),
                 breakdown: Default::default(),
             },
         )
@@ -6254,15 +6464,90 @@ mod persist_tests {
         assert_eq!(stored["_meta"]["input_tokens"], 13_811);
         assert_eq!(stored["_meta"]["output_tokens"], 425);
         assert_eq!(stored["_meta"]["cached_read_tokens"], 0);
+        assert_eq!(stored["_meta"]["turn_total_tokens"], 14_236);
         let seq1 = stored["_meta"]["seq"].as_i64().expect("meta seq stamped");
         assert!(seq1 > 0);
 
-        // A subsequent bare usage_update (0 input/output, empty breakdown) clears stale _meta
-        // so Team Economy settlement never re-bills Turn 1 tokens onto Turn 2.
+        // Streaming occupancy-only `usage_update` MUST preserve existing `_meta` (never call `usage.remove("_meta")`)
+        // without advancing `seq` so an un-settled turn's `_meta` survives and already-settled `seq` is idempotent.
         persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(18_500, None, None)).await;
         let after_bare = stored_usage(repo.as_ref()).await;
         assert_eq!(after_bare["used"], 18_500);
-        assert!(after_bare.get("_meta").is_none(), "bare usage_update must clear stale _meta");
+        assert_eq!(
+            after_bare["_meta"]["seq"].as_i64(),
+            Some(seq1),
+            "streaming occupancy-only update must preserve _meta without advancing seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_acp_and_codex_multistep_usage_separates_numeric_occupancy_from_turn_total_tokens() {
+        let (repo, _db) = seeded_repo().await;
+        let mut acc = PumpUsageAccumulator::default();
+
+        // WarmACP streaming usage_update (185k occupancy on 1M window)
+        let mut warm_stream = SessionEvent::UsageDelta {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 185_000,
+            cost_usd: None,
+            context_window: Some(1_000_000),
+            occupancy_tokens: Some(185_000),
+            turn_billed_tokens: None,
+            breakdown: Default::default(),
+        };
+        acc.normalize(&mut warm_stream);
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &warm_stream).await;
+
+        // WarmACP terminal PromptResponse.usage (27.4M cumulative billed across sub-calls, occupancy_tokens = None)
+        let mut warm_terminal = SessionEvent::UsageDelta {
+            input_tokens: 25_000_000,
+            output_tokens: 400_000,
+            total_tokens: 27_400_000,
+            cost_usd: None,
+            context_window: None,
+            occupancy_tokens: None,
+            turn_billed_tokens: Some(27_400_000),
+            breakdown: aionui_session::UsageBreakdown {
+                cached_read_tokens: 2_000_000,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+            },
+        };
+        acc.normalize(&mut warm_terminal);
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &warm_terminal).await;
+
+        let live_frame = match translate_event(warm_terminal, "conv-1", false).into_iter().next() {
+            Some(AgentStreamEvent::AcpContextUsage(v)) => v,
+            other => panic!("expected AcpContextUsage, got {other:?}"),
+        };
+        assert_eq!(live_frame["used"], 185_000, "live WS frame must carry numeric occupancy for useAcpMessage.ts:494");
+        assert_eq!(live_frame["size"], 1_000_000);
+        assert_eq!(live_frame["_meta"]["turn_total_tokens"], 27_400_000);
+
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 185_000, "SQLite used must stay at 185k occupancy");
+        assert_eq!(stored["_meta"]["turn_total_tokens"], 27_400_000);
+
+        // Next turn: Codex 3-step turn (40k + 55k + 70k = 165k billed, 70k final occupancy)
+        acc.reset_turn();
+        for (in_tok, out_tok, tot) in [(38_000, 2_000, 40_000), (52_000, 3_000, 55_000), (66_000, 4_000, 70_000)] {
+            let mut codex_step = SessionEvent::UsageDelta {
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+                total_tokens: tot,
+                cost_usd: None,
+                context_window: None,
+                occupancy_tokens: Some(tot),
+                turn_billed_tokens: Some(tot),
+                breakdown: Default::default(),
+            };
+            acc.normalize(&mut codex_step);
+            persist_side_effects(repo.as_ref(), "user-1", "conv-1", &codex_step).await;
+        }
+        let codex_stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(codex_stored["used"], 70_000, "Codex occupancy must reflect latest sub-call");
+        assert_eq!(codex_stored["_meta"]["turn_total_tokens"], 165_000, "Codex turn_total_tokens must sum all sub-calls");
     }
 
     /// A `/compact` turn ends with an all-zero `usage` object (live-captured on

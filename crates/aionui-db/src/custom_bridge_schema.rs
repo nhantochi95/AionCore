@@ -323,6 +323,136 @@ pub fn classify_agent_wallet(
     WalletType::ApiKey
 }
 
+fn is_llm_custom_api_key_name(raw_key: &str, allow_generic_api_key_suffix: bool) -> bool {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "api_key" | "apikey" | "custom_api_key" | "customapikey" | "anthropic_auth_token"
+    ) {
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "ANTHROPIC_API_KEY"
+            | "ANTHROPIC_AUTH_TOKEN"
+            | "OPENAI_API_KEY"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "DEEPSEEK_API_KEY"
+            | "FACTORY_API_KEY"
+            | "DASHSCOPE_API_KEY"
+            | "ZHIPU_API_KEY"
+            | "MOONSHOT_API_KEY"
+            | "MISTRAL_API_KEY"
+            | "XAI_API_KEY"
+            | "GROQ_API_KEY"
+            | "COHERE_API_KEY"
+            | "AZURE_OPENAI_API_KEY"
+            | "CLAUDE_API_KEY"
+            | "CODEX_API_KEY"
+            | "MINIMAX_API_KEY"
+            | "SILICONFLOW_API_KEY"
+            | "TOGETHER_API_KEY"
+            | "FIREWORKS_API_KEY"
+            | "PERPLEXITY_API_KEY"
+            | "ARK_API_KEY"
+            | "VOLCENGINE_API_KEY"
+    ) {
+        return true;
+    }
+    if allow_generic_api_key_suffix
+        && upper.ends_with("_API_KEY")
+        && !upper.starts_with("AIONUI_")
+        && !upper.starts_with("MCP_")
+        && !upper.starts_with("BRAVE_")
+        && !upper.starts_with("GITHUB_")
+        && !upper.starts_with("TAVILY_")
+    {
+        return true;
+    }
+    false
+}
+
+fn json_env_has_custom_api_key(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
+            is_llm_custom_api_key_name(k, true)
+                && v.as_str().map(str::trim).is_some_and(|s| !s.is_empty())
+        }),
+        serde_json::Value::Array(items) => items.iter().any(|item| {
+            let key_opt = item
+                .get("name")
+                .or_else(|| item.get("key"))
+                .and_then(serde_json::Value::as_str);
+            let val_opt = item
+                .get("value")
+                .or_else(|| item.get("val"))
+                .and_then(serde_json::Value::as_str);
+            match (key_opt, val_opt) {
+                (Some(k), Some(v)) => {
+                    is_llm_custom_api_key_name(k, true) && !v.trim().is_empty()
+                }
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
+/// Shared helper determining whether a slot/agent has a real custom LLM API key configured
+/// across `conversations.extra`, `agent_metadata.env`, or `agent_metadata.env_override`.
+/// Deliberately ignores MCP tool snapshots (`mcp_servers`, `team_mcp_stdio_config`) so `$0.00`
+/// CLI OAuth slots using external MCP tools remain `WalletType::CliSubscription` (`AGENTS.md` §3).
+pub fn slot_has_custom_api_key(
+    conv_extra_json: Option<&str>,
+    agent_env_json: Option<&str>,
+    agent_env_override_json: Option<&str>,
+) -> bool {
+    if let Some(raw_extra) = conv_extra_json.map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw_extra)
+    {
+        for (k, v) in &map {
+            if is_llm_custom_api_key_name(k, false)
+                && v.as_str().map(str::trim).is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+            if matches!(
+                k.as_str(),
+                "cc_switch_provider_id" | "ccSwitchProviderId"
+            ) && v.as_str().map(str::trim).is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+            if matches!(
+                k.as_str(),
+                "env" | "custom_env" | "customEnv" | "env_override" | "envOverride"
+            ) && json_env_has_custom_api_key(v)
+            {
+                return true;
+            }
+        }
+    }
+
+    for raw_env in [agent_env_json, agent_env_override_json].into_iter().flatten() {
+        let trimmed = raw_env.trim();
+        if !trimmed.is_empty()
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && json_env_has_custom_api_key(&val)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SlotWalletFacts<'a> {
     pub slot_backend: Option<&'a str>,
@@ -613,6 +743,9 @@ pub struct CustomTeamContextPrefRow {
     #[serde(default)]
     #[sqlx(default)]
     pub auto_fallback_free_cli: i64,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub enforce_hard_cap_on_cli: i64,
     pub updated_at: i64,
 }
 
@@ -652,6 +785,10 @@ impl CustomTeamContextPrefRow {
     pub fn is_auto_fallback_free_cli_enabled(&self) -> bool {
         self.auto_fallback_free_cli != 0
     }
+
+    pub fn is_enforce_hard_cap_on_cli_enabled(&self) -> bool {
+        self.enforce_hard_cap_on_cli != 0
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -663,6 +800,7 @@ pub struct UpsertTeamContextPrefParams {
     pub max_context_tokens: Option<i64>,
     pub max_turn_hops_per_run: Option<i64>,
     pub auto_fallback_free_cli: Option<bool>,
+    pub enforce_hard_cap_on_cli: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, FromRow)]
@@ -709,6 +847,7 @@ pub struct SettleSlotEconomyParams {
     pub current_msg_count: i64,
     pub current_char_sum: i64,
     pub reported_total_tokens: Option<i64>,
+    pub reported_turn_total_tokens: Option<i64>,
     pub reported_input_tokens: Option<i64>,
     pub reported_output_tokens: Option<i64>,
     pub reported_cached_read_tokens: Option<i64>,
@@ -1050,6 +1189,7 @@ pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbErro
             coalesced_wakes_saved INTEGER NOT NULL DEFAULT 0,
             max_turn_hops_per_run INTEGER NOT NULL DEFAULT 24,
             auto_fallback_free_cli INTEGER NOT NULL DEFAULT 0,
+            enforce_hard_cap_on_cli INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         )
         "#,
@@ -1134,6 +1274,10 @@ pub async fn ensure_custom_bridge_tables(pool: &SqlitePool) -> Result<(), DbErro
         (
             "auto_fallback_free_cli",
             "ALTER TABLE custom_team_context_prefs ADD COLUMN auto_fallback_free_cli INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "enforce_hard_cap_on_cli",
+            "ALTER TABLE custom_team_context_prefs ADD COLUMN enforce_hard_cap_on_cli INTEGER NOT NULL DEFAULT 0",
         ),
     ];
 
@@ -3388,6 +3532,88 @@ impl SqliteCustomBridgeRepository {
         Ok(row.map(|(sid,)| sid.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none()))
     }
 
+    pub async fn slot_has_custom_api_key_in_db(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        backend: &str,
+        assistant_id: Option<&str>,
+    ) -> bool {
+        let mut target_agent_id = assistant_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("bare:").unwrap_or(s).to_owned());
+
+        let conv_trimmed = conversation_id.trim();
+        if !conv_trimmed.is_empty()
+            && let Ok(Some((conv_type, extra))) = sqlx::query_as::<_, (String, String)>(
+                "SELECT type, extra FROM conversations WHERE id = ? AND (user_id = ? OR ? = '') LIMIT 1",
+            )
+            .bind(conv_trimmed)
+            .bind(user_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            if conv_type.eq_ignore_ascii_case("aionrs") {
+                return true;
+            }
+            if slot_has_custom_api_key(Some(&extra), None, None) {
+                return true;
+            }
+            if target_agent_id.is_none()
+                && let Ok(extra_val) = serde_json::from_str::<serde_json::Value>(&extra)
+                && let Some(aid) = extra_val
+                    .get("agent_id")
+                    .or_else(|| extra_val.get("agentId"))
+                    .or_else(|| extra_val.get("custom_agent_id"))
+                    .or_else(|| extra_val.get("customAgentId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                target_agent_id = Some(aid.strip_prefix("bare:").unwrap_or(aid).to_owned());
+            }
+        }
+
+        let backend_trimmed = backend.trim();
+        if backend_trimmed.eq_ignore_ascii_case("aionrs") {
+            return true;
+        }
+        let agent_id_param = target_agent_id.unwrap_or_default();
+        if agent_id_param.is_empty() && backend_trimmed.is_empty() {
+            return false;
+        }
+
+        if let Ok(rows) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT env, env_override
+            FROM agent_metadata
+            WHERE (user_id = ? OR user_id IS NULL)
+              AND (
+                  (? != '' AND id = ?)
+                  OR (? != '' AND LOWER(COALESCE(backend, agent_type)) = LOWER(?))
+              )
+            "#,
+        )
+        .bind(user_id)
+        .bind(&agent_id_param)
+        .bind(&agent_id_param)
+        .bind(backend_trimmed)
+        .bind(backend_trimmed)
+        .fetch_all(&self.pool)
+        .await
+        {
+            for (env_json, env_override_json) in rows {
+                if slot_has_custom_api_key(None, env_json.as_deref(), env_override_json.as_deref()) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub async fn get_or_default_team_context_pref(
         &self,
         team_id: &str,
@@ -3397,7 +3623,7 @@ impl SqliteCustomBridgeRepository {
             SELECT team_id, auto_compact_enabled, threshold_pct,
                    economy_mode, max_context_tokens, tokens_saved_estimate,
                    coalesced_wakes_saved, max_turn_hops_per_run, auto_fallback_free_cli,
-                   updated_at
+                   enforce_hard_cap_on_cli, updated_at
             FROM custom_team_context_prefs
             WHERE team_id = ?
             "#,
@@ -3421,6 +3647,7 @@ impl SqliteCustomBridgeRepository {
             coalesced_wakes_saved: 0,
             max_turn_hops_per_run: default_max_turn_hops_per_run(),
             auto_fallback_free_cli: 0,
+            enforce_hard_cap_on_cli: 0,
             updated_at: aionui_common::now_ms(),
         })
     }
@@ -3476,6 +3703,10 @@ impl SqliteCustomBridgeRepository {
             .auto_fallback_free_cli
             .map(|b| if b { 1_i64 } else { 0_i64 })
             .unwrap_or(current.auto_fallback_free_cli);
+        let next_enforce_cli_cap = params
+            .enforce_hard_cap_on_cli
+            .map(|b| if b { 1_i64 } else { 0_i64 })
+            .unwrap_or(current.enforce_hard_cap_on_cli);
 
         sqlx::query(
             r#"
@@ -3483,8 +3714,8 @@ impl SqliteCustomBridgeRepository {
                 team_id, auto_compact_enabled, threshold_pct,
                 economy_mode, max_context_tokens, tokens_saved_estimate,
                 coalesced_wakes_saved, max_turn_hops_per_run, auto_fallback_free_cli,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enforce_hard_cap_on_cli, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(team_id) DO UPDATE SET
                 auto_compact_enabled = excluded.auto_compact_enabled,
                 threshold_pct = excluded.threshold_pct,
@@ -3492,6 +3723,7 @@ impl SqliteCustomBridgeRepository {
                 max_context_tokens = excluded.max_context_tokens,
                 max_turn_hops_per_run = excluded.max_turn_hops_per_run,
                 auto_fallback_free_cli = excluded.auto_fallback_free_cli,
+                enforce_hard_cap_on_cli = excluded.enforce_hard_cap_on_cli,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -3504,6 +3736,7 @@ impl SqliteCustomBridgeRepository {
         .bind(current.coalesced_wakes_saved)
         .bind(next_max_hops)
         .bind(next_auto_fallback)
+        .bind(next_enforce_cli_cap)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -3841,9 +4074,25 @@ impl SqliteCustomBridgeRepository {
         .await
         .map_err(DbError::Query)?;
 
+        // Always reset `last_seen_usage_tokens` and `last_seen_meta_seq` on any slot economy row
+        // bound to this conversation so post-rollover turns never stall `_meta.seq` settlement.
+        let econ_upd = sqlx::query(
+            r#"
+            UPDATE custom_team_slot_economy
+            SET last_seen_usage_tokens = 0, last_seen_meta_seq = 0, updated_at = ?
+            WHERE last_seen_conv_id = ? AND owner_user_id = ?
+            "#,
+        )
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+
         let Some(raw_cfg) = existing_cfg else {
-            tx.rollback().await.map_err(DbError::Query)?;
-            return Ok(false);
+            tx.commit().await.map_err(DbError::Query)?;
+            return Ok(econ_upd.rows_affected() > 0);
         };
 
         let mut cfg_json: serde_json::Value =
@@ -3872,7 +4121,7 @@ impl SqliteCustomBridgeRepository {
         .map_err(DbError::Query)?;
 
         tx.commit().await.map_err(DbError::Query)?;
-        Ok(upd.rows_affected() > 0)
+        Ok(upd.rows_affected() > 0 || econ_upd.rows_affected() > 0)
     }
 
     pub async fn list_conversation_messages_for_anchor(
@@ -4091,12 +4340,15 @@ impl SqliteCustomBridgeRepository {
             .max(128);
 
         let rep_cached = params.reported_cached_read_tokens.unwrap_or(0).max(0);
+        let rep_turn_total = params.reported_turn_total_tokens.filter(|&v| v > 0);
         let (delta_in, delta_out, delta_cached, next_usage_tokens, next_meta_seq) = match (
             params.reported_input_tokens.filter(|&v| v >= 0),
             params.reported_output_tokens.filter(|&v| v >= 0),
             params.reported_total_tokens.filter(|&v| v > 0),
         ) {
-            (Some(rep_in), Some(rep_out), total_opt) if rep_in > 0 || rep_out > 0 || rep_cached > 0 => {
+            (Some(rep_in), Some(rep_out), total_opt)
+                if rep_in > 0 || rep_out > 0 || rep_cached > 0 || rep_turn_total.is_some() =>
+            {
                 // Codex `last.inputTokens` includes `cachedInputTokens`, whereas Claude and Antigravity
                 // report uncached `inputTokens` separately from `cachedReadTokens`. Normalize so
                 // `input_tokens_total` always tracks uncached prompt tokens and `input + cached_read`
@@ -4106,10 +4358,16 @@ impl SqliteCustomBridgeRepository {
                 } else {
                     rep_in
                 };
-                let total = total_opt.unwrap_or(uncached_in + rep_out + rep_cached);
+                let component_sum = uncached_in + rep_out + rep_cached;
+                let billed_turn_total = rep_turn_total.unwrap_or(component_sum).max(component_sum);
+                // Any residual billed tokens in `_meta.turn_total_tokens` (e.g. `thought_tokens`
+                // or `cached_write_tokens`) fold into `effective_out` while `occupancy` strictly
+                // tracks window occupancy `usage["used"]`.
+                let effective_out = rep_out + (billed_turn_total - component_sum).max(0);
+                let occupancy = total_opt.unwrap_or(prev_usage_tokens.max(component_sum));
                 let meta_is_stale = match params.reported_meta_seq.filter(|&s| s > 0) {
                     Some(seq) => same_conv && prev_meta_seq > 0 && seq == prev_meta_seq,
-                    None => same_conv && prev_usage_tokens > 0 && total == prev_usage_tokens,
+                    None => same_conv && prev_usage_tokens > 0 && occupancy == prev_usage_tokens,
                 };
                 if meta_is_stale {
                     // Snapshot did not advance on this turn (e.g. mid-turn error before UsageDelta);
@@ -4117,7 +4375,24 @@ impl SqliteCustomBridgeRepository {
                     (est_context_in_tokens, est_out_from_chars, 0, prev_usage_tokens, prev_meta_seq)
                 } else {
                     let seq_out = params.reported_meta_seq.filter(|&s| s > 0).unwrap_or(prev_meta_seq);
-                    (uncached_in, rep_out, rep_cached, total, seq_out)
+                    (uncached_in, effective_out, rep_cached, occupancy, seq_out)
+                }
+            }
+            (_, _, total_opt) if rep_turn_total.is_some() => {
+                let turn_total = rep_turn_total.unwrap_or(0);
+                let occupancy = total_opt.unwrap_or(prev_usage_tokens);
+                let meta_is_stale = match params.reported_meta_seq.filter(|&s| s > 0) {
+                    Some(seq) => same_conv && prev_meta_seq > 0 && seq == prev_meta_seq,
+                    None => false,
+                };
+                if meta_is_stale {
+                    (est_context_in_tokens, est_out_from_chars, 0, prev_usage_tokens, prev_meta_seq)
+                } else {
+                    let seq_out = params.reported_meta_seq.filter(|&s| s > 0).unwrap_or(prev_meta_seq);
+                    let d_out = est_out_from_chars.min(turn_total);
+                    let d_cached = rep_cached.min((turn_total - d_out).max(0));
+                    let d_in = (turn_total - d_out - d_cached).max(0);
+                    (d_in, d_out, d_cached, occupancy, seq_out)
                 }
             }
             (_, _, Some(total)) if !(same_conv && prev_usage_tokens > 0 && total == prev_usage_tokens) => {
@@ -4821,6 +5096,7 @@ mod tests {
         let pref = repo.get_or_default_team_context_pref("team-econ-1").await.unwrap();
         assert_eq!(pref.effective_economy_mode(), "lean");
         assert_eq!(pref.effective_max_context_tokens(), 160_000);
+        assert!(!pref.is_enforce_hard_cap_on_cli_enabled());
 
         repo.record_slot_wake_delivery("team-econ-1", "slot-lead", "system_default_user", "lead", 4_800)
             .await
@@ -4838,6 +5114,7 @@ mod tests {
                 current_msg_count: 2,
                 current_char_sum: 2_400,
                 reported_total_tokens: None,
+                reported_turn_total_tokens: None,
                 reported_input_tokens: None,
                 reported_output_tokens: None,
                 reported_cached_read_tokens: None,
@@ -4864,6 +5141,7 @@ mod tests {
                 current_msg_count: 2,
                 current_char_sum: 1_800,
                 reported_total_tokens: Some(14_236),
+                reported_turn_total_tokens: Some(14_236),
                 reported_input_tokens: Some(13_811),
                 reported_output_tokens: Some(425),
                 reported_cached_read_tokens: Some(0),
@@ -4888,6 +5166,7 @@ mod tests {
                 current_msg_count: 4,
                 current_char_sum: 3_100,
                 reported_total_tokens: Some(15_650),
+                reported_turn_total_tokens: Some(15_650),
                 reported_input_tokens: Some(1_240),
                 reported_output_tokens: Some(310),
                 reported_cached_read_tokens: Some(14_100),
@@ -4915,6 +5194,7 @@ mod tests {
                 current_msg_count: 6,
                 current_char_sum: 3_900,
                 reported_total_tokens: Some(15_650),
+                reported_turn_total_tokens: Some(15_650),
                 reported_input_tokens: Some(1_050),
                 reported_output_tokens: Some(500),
                 reported_cached_read_tokens: Some(14_100),
@@ -4938,6 +5218,7 @@ mod tests {
                 current_msg_count: 7,
                 current_char_sum: 4_100,
                 reported_total_tokens: Some(16_000),
+                reported_turn_total_tokens: Some(15_650),
                 reported_input_tokens: Some(1_050),
                 reported_output_tokens: Some(500),
                 reported_cached_read_tokens: Some(14_100),
@@ -4965,6 +5246,7 @@ mod tests {
                 current_msg_count: 2,
                 current_char_sum: 900,
                 reported_total_tokens: Some(11_030),
+                reported_turn_total_tokens: Some(11_030),
                 reported_input_tokens: Some(11_024),
                 reported_output_tokens: Some(6),
                 reported_cached_read_tokens: Some(11_006),
@@ -4974,6 +5256,78 @@ mod tests {
             .unwrap();
         assert_eq!(codex_turn.row.input_tokens_total, 18);
         assert_eq!(codex_turn.row.cached_read_tokens_total, 11_006);
+
+        // WarmACP 27.4M multi-step turn: occupancy (`reported_total_tokens` = 85k) stays separate
+        // from `_meta.turn_total_tokens` (27.4M), and rollover resets `last_seen_meta_seq = 0`.
+        let warm_turn = repo
+            .settle_slot_economy_turn(SettleSlotEconomyParams {
+                team_id: "team-econ-1".into(),
+                slot_id: "slot-warm".into(),
+                owner_user_id: "system_default_user".into(),
+                role: "teammate".into(),
+                conversation_id: "conv-econ-warm".into(),
+                wallet_type: WalletType::CliSubscription,
+                backend: "antigravity".into(),
+                model_id: "default".into(),
+                current_msg_count: 2,
+                current_char_sum: 2_000,
+                reported_total_tokens: Some(85_000),
+                reported_turn_total_tokens: Some(27_400_000),
+                reported_input_tokens: None,
+                reported_output_tokens: None,
+                reported_cached_read_tokens: None,
+                reported_meta_seq: Some(1_794_511_200_000_001),
+            })
+            .await
+            .unwrap();
+        assert_eq!(warm_turn.row.last_seen_usage_tokens, 85_000);
+        assert_eq!(
+            warm_turn.row.input_tokens_total + warm_turn.row.output_tokens_total + warm_turn.row.cached_read_tokens_total,
+            27_400_000
+        );
+        assert_eq!(warm_turn.row.last_seen_meta_seq, 1_794_511_200_000_001);
+
+        let cleared = repo
+            .clear_acp_context_usage_on_rollover("system_default_user", "conv-econ-warm")
+            .await
+            .unwrap();
+        assert!(cleared, "rollover must reset custom_team_slot_economy even without acp_session row");
+        let after_rollover = repo
+            .get_team_slot_economy("team-econ-1", "slot-warm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rollover.last_seen_meta_seq, 0);
+        assert_eq!(after_rollover.last_seen_usage_tokens, 0);
+
+        // Verify `enforce_hard_cap_on_cli` persistence & `slot_has_custom_api_key` helper
+        let pref_capped = repo
+            .upsert_team_context_pref_ext(UpsertTeamContextPrefParams {
+                team_id: "team-econ-1".into(),
+                enforce_hard_cap_on_cli: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(pref_capped.is_enforce_hard_cap_on_cli_enabled());
+        assert!(slot_has_custom_api_key(
+            Some(r#"{"custom_env":{"ANTHROPIC_API_KEY":"sk-ant-123"}}"#),
+            None,
+            None
+        ));
+        assert!(slot_has_custom_api_key(
+            None,
+            None,
+            Some(r#"[{"name":"OPENAI_API_KEY","value":"sk-proj-456"}]"#)
+        ));
+        assert!(
+            !slot_has_custom_api_key(
+                Some(r#"{"mcp_servers":[{"env":{"BRAVE_API_KEY":"bsa-123"}}],"team_mcp_stdio_config":{"token":"internal"}}"#),
+                None,
+                None
+            ),
+            "MCP tool env keys must never misclassify $0 CLI OAuth slots as paid API key"
+        );
 
         repo.record_slot_compaction_savings("team-econ-1", "slot-lead", "system_default_user", 42_000)
             .await

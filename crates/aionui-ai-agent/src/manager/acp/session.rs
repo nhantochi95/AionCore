@@ -112,6 +112,10 @@ pub struct AcpSession {
     /// - invalidation: cleared on `clear_session_id` so a rebuilt session
     ///   does not inherit the previous turn's close reason.
     last_close_reason: Option<CloseReason>,
+    /// True once a streaming `UsageUpdate` (`used > 0`) arrived during the active turn.
+    saw_streaming_occupancy_in_turn: bool,
+    /// Highest `_meta.seq` observed on this session so end-of-turn usage frames stay strictly monotonic.
+    last_usage_meta_seq: i64,
 }
 
 /// RAII lease over `config_set_in_flight`. Holds an `Arc<AtomicBool>` clone;
@@ -170,6 +174,8 @@ impl AcpSession {
             config_set_in_flight: Arc::new(AtomicBool::new(false)),
             pending_events: Vec::new(),
             last_close_reason: None,
+            saw_streaming_occupancy_in_turn: false,
+            last_usage_meta_seq: 0,
         }
     }
 }
@@ -228,6 +234,24 @@ impl AcpSession {
         // A rebuilt session must not inherit the prior turn's close reason —
         // otherwise the next user-facing error would surface stale context.
         self.last_close_reason = None;
+        self.saw_streaming_occupancy_in_turn = false;
+        self.pending_events.push(AcpSessionEvent::SessionCleared);
+    }
+
+    pub fn mark_streaming_occupancy_seen(&mut self) {
+        self.saw_streaming_occupancy_in_turn = true;
+    }
+
+    pub fn reset_turn_occupancy_tracking(&mut self) {
+        self.saw_streaming_occupancy_in_turn = false;
+    }
+
+    pub fn saw_streaming_occupancy_in_turn(&self) -> bool {
+        self.saw_streaming_occupancy_in_turn
+    }
+
+    pub fn last_usage_meta_seq(&self) -> i64 {
+        self.last_usage_meta_seq
     }
 
     /// Record the reason the most recent turn closed. Overwrites any
@@ -803,6 +827,14 @@ impl AcpSession {
     /// from what we last cached, so the persistence consumer can debounce
     /// a stream of token updates into one DB write per turn.
     pub fn apply_context_usage(&mut self, usage: UsageUpdate) {
+        if let Some(seq) = usage
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("seq"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            self.last_usage_meta_seq = self.last_usage_meta_seq.max(seq);
+        }
         let changed = self.advertised.context_usage.as_ref() != Some(&usage);
         self.advertised.context_usage = Some(usage.clone());
         if changed {
@@ -844,6 +876,14 @@ impl AcpSession {
             self.observed.config_current = state.config_selections.clone();
         }
         if let Some(usage) = &state.context_usage {
+            if let Some(seq) = usage
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("seq"))
+                .and_then(serde_json::Value::as_i64)
+            {
+                self.last_usage_meta_seq = self.last_usage_meta_seq.max(seq);
+            }
             self.advertised.context_usage = Some(usage.clone());
         }
     }

@@ -777,6 +777,39 @@ fn extract_raw_chat_meta(msg: Option<&TgMessage>) -> serde_json::Value {
     }
 }
 
+/// Telegram Bot API limit for `sendPhoto` (`10 MiB`); larger images must be uploaded via `sendDocument`.
+const MAX_TELEGRAM_PHOTO_BYTES: usize = 10 * 1024 * 1024;
+
+fn is_telegram_photo_fallback_error(err: &ChannelError) -> bool {
+    let upper = err.to_string().to_ascii_uppercase();
+    upper.contains("PHOTO_INVALID_DIMENSIONS")
+        || upper.contains("PHOTO_SAVE_FILE_INVALID")
+        || upper.contains("IMAGE_PROCESS_FAILED")
+        || upper.contains("PHOTO_EXT_INVALID")
+}
+
+async fn send_media_with_photo_fallback(
+    api: &TelegramApi,
+    send_as_photo: bool,
+    params: SendMediaMultipartParams,
+) -> Result<super::types::TgMessage, ChannelError> {
+    if !send_as_photo {
+        return api.send_document_bytes(params).await;
+    }
+    match api.send_photo_bytes(params.clone()).await {
+        Ok(msg) => Ok(msg),
+        Err(err) if is_telegram_photo_fallback_error(&err) => {
+            warn!(
+                file_name = %params.file_name,
+                error = %err,
+                "Telegram sendPhoto rejected image dimensions/format; falling back to sendDocument"
+            );
+            api.send_document_bytes(params).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn try_send_local_media(
     api: &TelegramApi,
     chat_id_num: i64,
@@ -796,9 +829,11 @@ async fn try_send_local_media(
     };
 
     let path = std::path::Path::new(local_path_str);
-    let bytes = tokio::fs::read(path)
+    let raw_bytes = tokio::fs::read(path)
         .await
         .map_err(|e| ChannelError::MessageSendFailed(format!("Failed to read media file {}: {e}", path.display())))?;
+    let send_as_photo = is_photo && raw_bytes.len() <= MAX_TELEGRAM_PHOTO_BYTES;
+    let bytes = axum::body::Bytes::from(raw_bytes);
     let file_name = message
         .file_name
         .clone()
@@ -829,11 +864,7 @@ async fn try_send_local_media(
         disable_notification: message.silent,
     };
 
-    let sent_res = if is_photo {
-        api.send_photo_bytes(params.clone()).await
-    } else {
-        api.send_document_bytes(params.clone()).await
-    };
+    let sent_res = send_media_with_photo_fallback(api, send_as_photo, params.clone()).await;
 
     let sent = match sent_res {
         Ok(m) => m,
@@ -844,11 +875,7 @@ async fn try_send_local_media(
                 .caption
                 .as_deref()
                 .map(|c| truncate_message(&crate::formatter::strip_telegram_html_to_plain(c), 1020));
-            if is_photo {
-                api.send_photo_bytes(plain_params).await?
-            } else {
-                api.send_document_bytes(plain_params).await?
-            }
+            send_media_with_photo_fallback(api, send_as_photo, plain_params).await?
         }
         Err(err) => return Err(err),
     };
@@ -1378,6 +1405,193 @@ mod tests {
         assert!(plugin.last_error().is_none());
         assert_eq!(plugin.plugin_type(), PluginType::Telegram);
         assert_eq!(plugin.active_user_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn photo_over_10_mib_routes_directly_to_send_document() {
+        use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let photo_calls = Arc::new(AtomicUsize::new(0));
+        let doc_calls = Arc::new(AtomicUsize::new(0));
+        let pc = Arc::clone(&photo_calls);
+        let dc = Arc::clone(&doc_calls);
+
+        let app = Router::new()
+            .route(
+                "/bottest_token/sendPhoto",
+                post(move || {
+                    let pc = Arc::clone(&pc);
+                    async move {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "ok": true,
+                                "result": {
+                                    "message_id": 101,
+                                    "chat": { "id": 42, "type": "private" },
+                                    "date": 1700000000
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bottest_token/sendDocument",
+                post(move |body: axum::body::Bytes| {
+                    let dc = Arc::clone(&dc);
+                    async move {
+                        assert!(body.len() > MAX_TELEGRAM_PHOTO_BYTES);
+                        dc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "ok": true,
+                                "result": {
+                                    "message_id": 202,
+                                    "chat": { "id": 42, "type": "private" },
+                                    "date": 1700000000
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .layer(DefaultBodyLimit::max(20 * 1024 * 1024));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("aionui_tg_10m_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let large_png = tmp_dir.join("hires_11mb.png");
+        std::fs::write(&large_png, vec![0x89_u8; MAX_TELEGRAM_PHOTO_BYTES + 1024]).unwrap();
+
+        let api = TelegramApi::with_base_urls(
+            reqwest::Client::new(),
+            "test_token",
+            format!("http://{addr}/bottest_token"),
+            format!("http://{addr}/file/bottest_token"),
+        );
+
+        let msg = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Image,
+            text: Some("📎 hires_11mb.png".into()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: Some(large_png.to_string_lossy().into_owned()),
+            file_url: None,
+            file_name: Some("hires_11mb.png".into()),
+            media_actions: None,
+            reply_to_message_id: Some("99".into()),
+            silent: None,
+        };
+
+        let sent = try_send_local_media(&api, 42, None, &msg).await.unwrap();
+        assert_eq!(sent.as_deref(), Some("202"));
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(doc_calls.load(Ordering::SeqCst), 1);
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn photo_invalid_dimensions_falls_back_to_send_document() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let photo_calls = Arc::new(AtomicUsize::new(0));
+        let doc_calls = Arc::new(AtomicUsize::new(0));
+        let pc = Arc::clone(&photo_calls);
+        let dc = Arc::clone(&doc_calls);
+
+        let app = Router::new()
+            .route(
+                "/bottest_token/sendPhoto",
+                post(move || {
+                    let pc = Arc::clone(&pc);
+                    async move {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "ok": false,
+                                "error_code": 400,
+                                "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bottest_token/sendDocument",
+                post(move || {
+                    let dc = Arc::clone(&dc);
+                    async move {
+                        dc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "ok": true,
+                                "result": {
+                                    "message_id": 777,
+                                    "chat": { "id": 42, "type": "private" },
+                                    "date": 1700000000
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("aionui_tg_dim_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let tall_png = tmp_dir.join("panorama.png");
+        std::fs::write(&tall_png, b"fake-png-bytes").unwrap();
+
+        let api = TelegramApi::with_base_urls(
+            reqwest::Client::new(),
+            "test_token",
+            format!("http://{addr}/bottest_token"),
+            format!("http://{addr}/file/bottest_token"),
+        );
+
+        let msg = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Image,
+            text: Some("📎 panorama.png".into()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: Some(tall_png.to_string_lossy().into_owned()),
+            file_url: None,
+            file_name: Some("panorama.png".into()),
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+
+        let sent = try_send_local_media(&api, 42, None, &msg).await.unwrap();
+        assert_eq!(sent.as_deref(), Some("777"));
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(doc_calls.load(Ordering::SeqCst), 1);
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     // -- Test helpers -------------------------------------------------------

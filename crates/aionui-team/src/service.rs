@@ -2357,10 +2357,13 @@ impl TeamSessionService {
             conversation_id: Some(conversation_id.to_owned()),
             transport: TeamToolTransport::CliAssumed,
         };
-        let allowed_tools = aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
+        let allowed_tools = aionui_api_types::team_tool_descriptors_for_context(
+            role_to_tool_role(agent.role),
+            self.include_shared_room_tools(&team_id),
+        )
+        .into_iter()
+        .map(|descriptor| descriptor.name)
+        .collect::<Vec<_>>();
         Ok(ResolvedTeamToolContext {
             response: TeamToolContextResponse {
                 in_team: true,

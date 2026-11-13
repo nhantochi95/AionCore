@@ -2,10 +2,48 @@ use crate::error::AgentError;
 #[cfg(any(unix, windows))]
 use tracing::{debug, error};
 
+#[cfg(unix)]
+const POSIX_ESRCH: i32 = libc::ESRCH;
+#[cfg(not(unix))]
+#[cfg_attr(not(test), allow(dead_code))]
+const POSIX_ESRCH: i32 = 3;
+
+#[cfg(unix)]
+const POSIX_EPERM: i32 = libc::EPERM;
+#[cfg(not(unix))]
+#[cfg_attr(not(test), allow(dead_code))]
+const POSIX_EPERM: i32 = 1;
+
+/// Pure classification of `libc::kill(-pgid, SIGKILL)` results.
+///
+/// Extracted so macOS `-pgid` `EPERM` fallback behaviour is unit-tested on both
+/// Windows and Unix hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+enum GroupKillDisposition {
+    Delivered,
+    GroupExitedFallbackToPid,
+    GroupEpermFallbackToPid,
+    Failed,
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+fn classify_group_kill_result(rc: i32, raw_errno: Option<i32>) -> GroupKillDisposition {
+    if rc == 0 {
+        return GroupKillDisposition::Delivered;
+    }
+    match raw_errno {
+        Some(POSIX_ESRCH) => GroupKillDisposition::GroupExitedFallbackToPid,
+        Some(POSIX_EPERM) => GroupKillDisposition::GroupEpermFallbackToPid,
+        _ => GroupKillDisposition::Failed,
+    }
+}
+
 /// Force-kill a process by PID, plus any descendants.
 ///
 /// Uses platform-native shell commands:
-/// * Unix: `kill -9 -<pid>` to target the spawned process group
+/// * Unix: `kill -9 -<pid>` to target the spawned process group (falling back
+///   to bare `pid` on `ESRCH` or macOS `EPERM`)
 /// * Windows: `taskkill /F /T /PID <pid>` (`/T` walks the process tree —
 ///   the ACP CLI typically spawns a Node child that must die with it)
 ///
@@ -16,7 +54,10 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
         use std::io;
 
         fn kill_pid(target_pid: u32) -> Result<(), AgentError> {
-            let rc = unsafe { libc::kill(target_pid as i32, libc::SIGKILL) };
+            let Ok(signal_pid) = i32::try_from(target_pid) else {
+                return Ok(());
+            };
+            let rc = unsafe { libc::kill(signal_pid, libc::SIGKILL) };
             if rc == 0 {
                 debug!(pid = target_pid, "Direct SIGKILL sent successfully");
                 return Ok(());
@@ -34,27 +75,46 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
             }
         }
 
-        if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 1) {
-            let rc = unsafe { libc::kill(-(group_id as i32), libc::SIGKILL) };
-            if rc == 0 {
-                debug!(pid, process_group = group_id, "SIGKILL sent successfully");
-                return Ok(());
-            }
-
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                debug!(
-                    pid,
-                    process_group = group_id,
-                    "Process group already exited before SIGKILL"
-                );
-                return kill_pid(pid);
-            }
-
-            error!(pid, process_group = group_id, error = %err, "Failed to send SIGKILL to process group");
-            return Err(AgentError::internal(format!(
-                "Failed to kill process group {group_id}: {err}"
-            )));
+        if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 1)
+            && let Ok(group_i32) = i32::try_from(group_id)
+        {
+            let rc = unsafe { libc::kill(-group_i32, libc::SIGKILL) };
+            let err = if rc == 0 {
+                None
+            } else {
+                Some(io::Error::last_os_error())
+            };
+            let raw_errno = err.as_ref().and_then(io::Error::raw_os_error);
+            return match classify_group_kill_result(rc, raw_errno) {
+                GroupKillDisposition::Delivered => {
+                    debug!(pid, process_group = group_id, "SIGKILL sent successfully");
+                    Ok(())
+                }
+                GroupKillDisposition::GroupExitedFallbackToPid => {
+                    debug!(
+                        pid,
+                        process_group = group_id,
+                        "Process group already exited before SIGKILL; falling back to bare PID"
+                    );
+                    kill_pid(pid)
+                }
+                GroupKillDisposition::GroupEpermFallbackToPid => {
+                    debug!(
+                        pid,
+                        process_group = group_id,
+                        error = ?err,
+                        "Process group SIGKILL returned EPERM; falling back to bare PID"
+                    );
+                    kill_pid(pid)
+                }
+                GroupKillDisposition::Failed => {
+                    let err = err.unwrap_or_else(|| io::Error::other("unknown kill error"));
+                    error!(pid, process_group = group_id, error = %err, "Failed to send SIGKILL to process group");
+                    Err(AgentError::internal(format!(
+                        "Failed to kill process group {group_id}: {err}"
+                    )))
+                }
+            };
         }
 
         kill_pid(pid)
@@ -379,5 +439,22 @@ mod tests {
         );
 
         proc.kill(Duration::from_millis(100)).await.unwrap();
+    }
+
+    #[test]
+    fn group_kill_disposition_falls_back_to_pid_on_esrch_and_eperm() {
+        use super::{GroupKillDisposition, POSIX_EPERM, POSIX_ESRCH, classify_group_kill_result};
+
+        assert_eq!(classify_group_kill_result(0, None), GroupKillDisposition::Delivered);
+        assert_eq!(
+            classify_group_kill_result(-1, Some(POSIX_ESRCH)),
+            GroupKillDisposition::GroupExitedFallbackToPid
+        );
+        assert_eq!(
+            classify_group_kill_result(-1, Some(POSIX_EPERM)),
+            GroupKillDisposition::GroupEpermFallbackToPid
+        );
+        assert_eq!(classify_group_kill_result(-1, Some(22)), GroupKillDisposition::Failed);
+        assert_eq!(classify_group_kill_result(-1, None), GroupKillDisposition::Failed);
     }
 }

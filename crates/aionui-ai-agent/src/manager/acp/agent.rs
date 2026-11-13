@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::agent_session_flow::PromptOutcome;
-use super::error_mapping::AcpSendFailure;
+use super::agent_session_flow::{PromptOutcome, drain_turn_observations};
+use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
 
 /// The user-visible body inside an [`AgentError`].
 ///
@@ -1316,6 +1316,7 @@ impl AcpAgentManager {
 
         let content = {
             let mut s = self.session.write().await;
+            s.reset_turn_occupancy_tracking();
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -1329,12 +1330,76 @@ impl AcpAgentManager {
 
         self.dump_acp_final_input(&sid, data, &content);
 
-        let data = SendMessageData {
+        let first_attempt_data = SendMessageData {
             content,
             ..data.clone()
         };
-        self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
+        let mut recovery_probe_rx = self.runtime.subscribe();
+        match self
+            .prompt_existing_session(&first_attempt_data, Some(&sid), matched_command.as_ref())
             .await
+        {
+            Err(AcpSendFailure::Acp(err))
+                if is_acp_session_not_found(&err) && drain_turn_observations(&mut recovery_probe_rx).empty =>
+            {
+                // Orphaned session rejected at prompt time prior to streaming any visible output:
+                // rebuild via `session/new` (clearing persisted `session_id`), re-run `pre_send` on
+                // original `raw_user_input` so `SessionNewPreludeHook` injects `preset_context`,
+                // and retry once without emitting a duplicate `AgentStreamEvent::Start`.
+                let fresh_sid = {
+                    let _lock = self.session_lock.lock().await;
+                    let rebuilt_sid = self
+                        .rebuild_after_session_not_found(&sid, &err)
+                        .await
+                        .map_err(AcpSendFailure::from)?;
+                    let mut s = self.session.write().await;
+                    let ready_sid = mark_session_opened_after_protocol_ready(
+                        &mut s,
+                        rebuilt_sid,
+                        self.protocol.is_connected(),
+                        &self.params.conversation_id,
+                        self.backend(),
+                    )
+                    .map_err(AcpSendFailure::from)?;
+                    s.reset_turn_occupancy_tracking();
+                    self.commit_session_changes(&mut s).await;
+                    ready_sid
+                };
+
+                let retry_matched_command = {
+                    let session = self.session.read().await;
+                    session
+                        .available_commands()
+                        .and_then(|commands| matched_slash_command(&raw_user_input, commands))
+                };
+                let retry_content = {
+                    let mut s = self.session.write().await;
+                    let mut ctx = PromptCtx {
+                        session: &mut s,
+                        params: &self.params,
+                        skill_manager: &self.skill_manager,
+                        runtime: &self.runtime,
+                    };
+                    let transformed = self.pipeline.pre_send(&mut ctx, raw_user_input.clone()).await;
+                    self.commit_session_changes(&mut s).await;
+                    transformed
+                };
+
+                self.dump_acp_final_input(&fresh_sid, data, &retry_content);
+                let retry_data = SendMessageData {
+                    content: retry_content,
+                    ..data.clone()
+                };
+                self.prompt_existing_session_with_options(
+                    &retry_data,
+                    Some(&fresh_sid),
+                    retry_matched_command.as_ref(),
+                    false,
+                )
+                .await
+            }
+            other => other,
+        }
     }
 
     fn dump_acp_final_input(&self, session_id: &str, data: &SendMessageData, final_content: &str) {

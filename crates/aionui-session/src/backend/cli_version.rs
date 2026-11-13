@@ -259,6 +259,12 @@ pub fn already_reported(cli: &str, session_id: &str) -> bool {
         .insert((cli.to_owned(), session_id.to_owned()))
 }
 
+/// Whether a version drift verdict warrants a `WARN` log (`Older`) versus a
+/// quiet `DEBUG` trace (`Newer`, e.g. `agy 1.5.6 > 1.3.5`).
+fn should_warn_on_version_drift(verdict: VersionVerdict) -> bool {
+    matches!(verdict, VersionVerdict::Older)
+}
+
 /// Probe `<cli> --version` and return the drift notice to emit, if any.
 ///
 /// Returns `None` when this session already reported, when the CLI is not
@@ -277,14 +283,19 @@ pub async fn session_drift_notice(
     if already_reported(cli, session_id) {
         tracing::debug!(session_id = %session_id, cli = %cli, "version check skipped: already reported for this session");
         return None;
-    }
+    };
     let Some(reported) = probe_cli_version(spawner, program, session_id).await else {
         tracing::warn!(session_id = %session_id, cli = %cli, program = %program.display(), "version probe produced no output");
         return None;
     };
     tracing::info!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version detected");
+    let verdict = classify(&reported, verified);
     let notice = drift_notice(cli, &reported, verified)?;
-    tracing::warn!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version drift");
+    if should_warn_on_version_drift(verdict) {
+        tracing::warn!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version drift");
+    } else {
+        tracing::debug!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version newer than verified baseline");
+    }
     Some(notice)
 }
 
@@ -593,5 +604,26 @@ mod tests {
             VersionVerdict::Unknown
         );
         assert!(drift_notice("claude", "not a version", VERIFIED_CLAUDE_VERSION).is_none());
+    }
+
+    #[test]
+    fn newer_agy_version_uses_debug_log_severity_while_older_warns() {
+        let newer = classify("agy 1.5.6", VERIFIED_AGY_VERSION);
+        assert_eq!(newer, VersionVerdict::Newer);
+        assert!(
+            !should_warn_on_version_drift(newer),
+            "Newer CLI version (agy 1.5.6 > 1.3.5) must log at debug!, not warn!"
+        );
+
+        let exact = classify("1.3.5", VERIFIED_AGY_VERSION);
+        assert_eq!(exact, VersionVerdict::Verified);
+        assert!(!should_warn_on_version_drift(exact));
+
+        let older = classify("1.1.8", VERIFIED_AGY_VERSION);
+        assert_eq!(older, VersionVerdict::Older);
+        assert!(
+            should_warn_on_version_drift(older),
+            "Older CLI version must continue to warn!"
+        );
     }
 }

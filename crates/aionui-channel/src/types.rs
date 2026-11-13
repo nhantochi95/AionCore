@@ -161,7 +161,7 @@ impl PairingStatus {
 ///
 /// Remaining fields are captured in `extra` for extensibility
 /// (API Spec `[key: string]: unknown`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginCredentials {
     // Telegram
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +197,52 @@ pub struct PluginCredentials {
     // Extensibility
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl fmt::Debug for PluginCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn mask_secret(opt: &Option<String>) -> Option<&'static str> {
+            match opt.as_deref() {
+                None => None,
+                Some("") => Some(""),
+                Some(_) => Some("[REDACTED]"),
+            }
+        }
+
+        let redacted_extra: HashMap<&str, serde_json::Value> = self
+            .extra
+            .iter()
+            .map(|(k, v)| {
+                let lower = k.to_ascii_lowercase();
+                let is_secret_key = lower.contains("token")
+                    || lower.contains("secret")
+                    || lower.contains("key")
+                    || lower.contains("password")
+                    || lower.contains("credential");
+                let masked = match (is_secret_key, v) {
+                    (true, serde_json::Value::Null) => serde_json::Value::Null,
+                    (true, serde_json::Value::String(s)) if s.is_empty() => serde_json::Value::String(String::new()),
+                    (true, _) => serde_json::Value::String("[REDACTED]".to_owned()),
+                    (false, other) => other.clone(),
+                };
+                (k.as_str(), masked)
+            })
+            .collect();
+
+        f.debug_struct("PluginCredentials")
+            .field("token", &mask_secret(&self.token))
+            .field("app_id", &self.app_id)
+            .field("app_secret", &mask_secret(&self.app_secret))
+            .field("encrypt_key", &mask_secret(&self.encrypt_key))
+            .field("verification_token", &mask_secret(&self.verification_token))
+            .field("client_id", &self.client_id)
+            .field("client_secret", &mask_secret(&self.client_secret))
+            .field("account_id", &self.account_id)
+            .field("bot_token", &mask_secret(&self.bot_token))
+            .field("app_token", &mask_secret(&self.app_token))
+            .field("extra", &redacted_extra)
+            .finish()
+    }
 }
 
 impl PluginCredentials {
@@ -1099,5 +1145,53 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: PluginConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn plugin_credentials_debug_redacts_all_secret_fields() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "encoding_aes_key".to_owned(),
+            serde_json::Value::String("super_aes_secret_key_999".to_owned()),
+        );
+        extra.insert(
+            "public_note".to_owned(),
+            serde_json::Value::String("visible_metadata".to_owned()),
+        );
+
+        let creds = PluginCredentials {
+            token: Some("7123456789:AAH_abcdefghijklmnopqrstuvwxyz012345".into()),
+            app_id: Some("cli_public_id".into()),
+            app_secret: Some("lark_app_secret_val".into()),
+            encrypt_key: Some("lark_encrypt_key_val".into()),
+            verification_token: Some("lark_verify_token_val".into()),
+            client_id: Some("ding_client_id".into()),
+            client_secret: Some(String::new()),
+            account_id: None,
+            bot_token: Some("wx_bot_token_secret".into()),
+            app_token: Some("xapp-1-secret-slack-token".into()),
+            extra,
+        };
+
+        let dbg = format!("{creds:?}");
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        assert!(dbg.contains("cli_public_id"), "{dbg}");
+        assert!(dbg.contains("ding_client_id"), "{dbg}");
+        assert!(dbg.contains("visible_metadata"), "{dbg}");
+        assert!(dbg.contains("client_secret: Some(\"\")"), "{dbg}");
+        assert!(dbg.contains("account_id: None"), "{dbg}");
+
+        for leaked in [
+            "7123456789",
+            "AAH_abcdefghijklmnopqrstuvwxyz012345",
+            "lark_app_secret_val",
+            "lark_encrypt_key_val",
+            "lark_verify_token_val",
+            "wx_bot_token_secret",
+            "xapp-1-secret-slack-token",
+            "super_aes_secret_key_999",
+        ] {
+            assert!(!dbg.contains(leaked), "Debug output leaked {leaked}: {dbg}");
+        }
     }
 }

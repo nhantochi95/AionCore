@@ -147,6 +147,11 @@ pub trait TeamProjectionMessageStore: Send + Sync {
     ) -> Result<Option<MessageRow>, TeamError>;
 
     async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), TeamError>;
+
+    async fn insert_projected_message_if_absent(&self, row: &MessageRow) -> Result<bool, TeamError> {
+        self.insert_projected_message(row).await?;
+        Ok(true)
+    }
 }
 
 pub struct TeamMessageProjection<S: ?Sized> {
@@ -201,7 +206,18 @@ where
         }
 
         let row = Self::build_message_row(&request, &msg_id, aionui_common::now_ms())?;
-        self.store.insert_projected_message(&row).await?;
+        let inserted = self.store.insert_projected_message_if_absent(&row).await?;
+        if !inserted {
+            info!(
+                team_id = %request.team_id,
+                slot_id = %request.slot_id,
+                conversation_id = %request.conversation_id,
+                event_name = TEAMMATE_MESSAGE_EVENT,
+                outcome = "already_projected",
+                "Team message projection deduped on atomic insert"
+            );
+            return Ok(ProjectedTeamMessage::AlreadyProjected { msg_id });
+        }
 
         let teammate_event_payload = match &request.source {
             TeamProjectionSource::Teammate {
@@ -316,5 +332,93 @@ where
             created_at,
             backend_turn_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct DedupStore {
+        seen_ids: Mutex<std::collections::HashSet<String>>,
+    }
+
+    #[async_trait]
+    impl TeamProjectionMessageStore for DedupStore {
+        fn mint_message_id(&self) -> String {
+            "minted-1".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<MessageRow>, TeamError> {
+            // Simulate TOCTOU race where two concurrent callers both see `None` on pre-check
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), TeamError> {
+            self.seen_ids.lock().unwrap().insert(row.id.clone());
+            Ok(())
+        }
+
+        async fn insert_projected_message_if_absent(&self, row: &MessageRow) -> Result<bool, TeamError> {
+            Ok(self.seen_ids.lock().unwrap().insert(row.id.clone()))
+        }
+    }
+
+    struct RecordingBroadcaster {
+        events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, message: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(message);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_projection_emits_teammate_event_only_once() {
+        let store = Arc::new(DedupStore {
+            seen_ids: Mutex::new(std::collections::HashSet::new()),
+        });
+        let broadcaster = Arc::new(RecordingBroadcaster {
+            events: Mutex::new(Vec::new()),
+        });
+        let projection = TeamMessageProjection::new(store, Arc::clone(&broadcaster) as Arc<dyn EventBroadcaster>);
+
+        let req = TeamProjectionRequest::teammate_visible(
+            "user-1",
+            "team-1",
+            "slot-lead",
+            "conv-lead",
+            "slot-worker",
+            "Worker",
+            "Task ready for review",
+            "mbx-race-1",
+        );
+        let expected_msg_id = teammate_dedupe_key("team-1", "mbx-race-1", "conv-lead");
+
+        let first = projection.project(req.clone()).await.unwrap();
+        let second = projection.project(req).await.unwrap();
+
+        assert_eq!(
+            first,
+            ProjectedTeamMessage::Inserted {
+                msg_id: expected_msg_id.clone()
+            }
+        );
+        assert_eq!(
+            second,
+            ProjectedTeamMessage::AlreadyProjected {
+                msg_id: expected_msg_id
+            }
+        );
+        let emitted = broadcaster.events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].name, TEAMMATE_MESSAGE_EVENT);
     }
 }

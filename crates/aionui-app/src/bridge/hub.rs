@@ -23,7 +23,7 @@ use aionui_channel::types::{
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::custom_bridge_schema::{
     CreateActionInboxParams, RecordCostRunParams, SlotWalletFacts, WalletType, classify_slot_wallet_facts,
-    estimate_api_token_cost_usd,
+    estimate_api_token_cost_usd, slot_has_custom_api_key,
 };
 use aionui_db::{
     CreateSharedRoomMessageParams, CreateSharedRoomTaskParams, CustomSharedRoomMessageRow, CustomSharedRoomRow,
@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::bridge::file_guard::{
-    StagedRoomArtifact, is_image_file_name, sanitize_file_name, save_inbound_telegram_attachment,
-    stage_room_artifacts_batch_async, stage_room_oversized_message_async, validate_outbound_file_path,
+    RejectedOutboundFile, StagedRoomArtifact, is_image_file_name, partition_outbound_files, sanitize_file_name,
+    save_inbound_telegram_attachment, stage_room_artifacts_batch_async, stage_room_oversized_message_async,
 };
 use crate::bridge::judge::{
     ParticipatingTeam, RoomRoutingHeuristics, RoomRoutingInput, RoutedTarget, is_task_blocked,
@@ -57,6 +57,43 @@ use crate::routes::inbox::ActionInboxCardDto;
 /// Minimum run duration (45s) for Desktop-initiated runs to trigger a proactive Telegram summary
 /// when no teammates were delegated and `stream_mode == "milestones"`.
 const SMART_FILTER_DESKTOP_DURATION_MS: i64 = 45_000;
+
+/// Threshold above which outbound Telegram file uploads are staged asynchronously (`512 KiB`).
+const OUTBOUND_INLINE_BYTE_CAP: u64 = 512 * 1024;
+/// Maximum concurrency for outbound Telegram attachment uploads.
+const OUTBOUND_UPLOAD_CONCURRENCY: usize = 2;
+/// Startup garbage-collection max age for orphaned `<data_dir>/outbound-staging` files (`15 min`).
+const OUTBOUND_STAGING_MAX_AGE_SECS: u64 = 15 * 60;
+/// Maximum wait duration when draining in-flight staged Telegram uploads on shutdown.
+const OUTBOUND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct TempStagedFile(PathBuf);
+
+impl Drop for TempStagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct InflightUploadGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InflightUploadGuard {
+    fn drop(&mut self) {
+        if self.counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundFilesDispatchResult {
+    delivered_files: Vec<String>,
+    queued_files: Vec<String>,
+    rejected_files: Vec<RejectedOutboundFile>,
+}
 
 #[derive(Debug, Clone)]
 pub enum RunOrigin {
@@ -193,6 +230,10 @@ pub struct TelegramTeamHub {
     pending_task_wakes: Arc<DashMap<(String, String), PendingCrossTeamTaskWake>>,
     delivered_handoff_banners: DashMap<(String, String), String>,
     last_room_read_cursor: DashMap<(String, String), String>,
+    outbound_upload_semaphore: Arc<tokio::sync::Semaphore>,
+    inflight_outbound_uploads: Arc<std::sync::atomic::AtomicUsize>,
+    outbound_uploads_drained: Arc<tokio::sync::Notify>,
+    outbound_staging_gc_started: std::sync::atomic::AtomicBool,
 }
 
 impl TelegramTeamHub {
@@ -230,6 +271,10 @@ impl TelegramTeamHub {
             pending_task_wakes: Arc::new(DashMap::new()),
             delivered_handoff_banners: DashMap::new(),
             last_room_read_cursor: DashMap::new(),
+            outbound_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(OUTBOUND_UPLOAD_CONCURRENCY)),
+            inflight_outbound_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            outbound_uploads_drained: Arc::new(tokio::sync::Notify::new()),
+            outbound_staging_gc_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -261,11 +306,75 @@ impl TelegramTeamHub {
         HubLocale::from_lang(&lang)
     }
 
+    /// Sweeps `<data_dir>/outbound-staging` once on startup to remove orphaned staged files older than 15 minutes.
+    pub fn spawn_outbound_staging_gc(&self) {
+        if self
+            .outbound_staging_gc_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let staging_dir = self.data_dir.join("outbound-staging");
+        tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&staging_dir) else {
+                return;
+            };
+            let max_age = std::time::Duration::from_secs(OUTBOUND_STAGING_MAX_AGE_SECS);
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !meta.file_type().is_file() {
+                    continue;
+                }
+                let is_stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| now.duration_since(mtime).ok())
+                    .is_some_and(|age| age > max_age);
+                if is_stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        });
+    }
+
+    /// Waits up to 5 seconds for in-flight background Telegram attachment uploads to complete.
+    pub async fn drain_outbound_uploads(&self) {
+        let wait_loop = async {
+            loop {
+                let notified = self.outbound_uploads_drained.notified();
+                if self
+                    .inflight_outbound_uploads
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        if tokio::time::timeout(OUTBOUND_DRAIN_TIMEOUT, wait_loop)
+            .await
+            .is_err()
+        {
+            warn!(
+                remaining = self
+                    .inflight_outbound_uploads
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "timed out after 5s waiting for outbound Telegram uploads to drain"
+            );
+        }
+    }
+
     /// Spawns the background EventBus watcher that handles:
     /// 1. Desktop-origin Team run tracking (`team.runStarted`)
     /// 2. Immediate crash / rate-limit / quota alerts (`team.agentRuntimeStatusChanged` / `team.runFailed`)
     /// 3. Closed-loop Shared Room synthesis mirroring + Smart Notification Filter (`team.runCompleted`)
     pub fn spawn_event_watcher(self: &Arc<Self>) {
+        self.spawn_outbound_staging_gc();
         let mut rx = self.event_bus.subscribe();
         let hub = Arc::clone(self);
 
@@ -377,6 +486,7 @@ impl TelegramTeamHub {
                     _ => {}
                 }
             }
+            hub.drain_outbound_uploads().await;
         });
     }
 
@@ -644,6 +754,35 @@ impl TelegramTeamHub {
         Ok(sent_ids)
     }
 
+    async fn partition_outbound_files_async(
+        &self,
+        raw_files: Vec<String>,
+        team_workspace: Option<String>,
+    ) -> (Vec<(PathBuf, String, u64)>, Vec<RejectedOutboundFile>) {
+        if raw_files.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let data_dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            partition_outbound_files(&raw_files, team_workspace.as_deref(), &data_dir)
+        })
+        .await
+        {
+            Ok((valid, rejected)) => {
+                for r in &rejected {
+                    warn!(file = %r.path, error = %r.reason, "outbound file rejected by path guard");
+                }
+                (valid, rejected)
+            }
+            Err(join_err) => {
+                let reason = format!("Outbound file validation task panicked: {join_err}");
+                let rejected = Vec::new();
+                warn!(error = %reason, "outbound file validation task failed");
+                (Vec::new(), rejected)
+            }
+        }
+    }
+
     async fn send_validated_outbound_files(
         &self,
         owner_user_id: &str,
@@ -652,58 +791,241 @@ impl TelegramTeamHub {
         team_workspace: Option<&str>,
         target_type: CustomTargetType,
         target_id: &str,
-    ) -> Vec<String> {
-        let base_chat_id = split_chat_and_thread(reply_chat).0;
-        let mut delivered = Vec::new();
+        reply_to_message_id: Option<&str>,
+    ) -> OutboundFilesDispatchResult {
+        let (valid, rejected) = self
+            .partition_outbound_files_async(raw_files.to_vec(), team_workspace.map(str::to_owned))
+            .await;
+        self.dispatch_prevalidated_outbound_files(
+            owner_user_id,
+            reply_chat,
+            valid,
+            rejected,
+            target_type,
+            target_id,
+            reply_to_message_id,
+        )
+        .await
+    }
 
-        for raw in raw_files {
-            let valid_path = match validate_outbound_file_path(raw, team_workspace, &self.data_dir) {
-                Ok(p) => p,
-                Err(reason) => {
-                    warn!(file = %raw, error = %reason, "outbound file rejected by path guard");
-                    continue;
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_prevalidated_outbound_files(
+        &self,
+        owner_user_id: &str,
+        reply_chat: &str,
+        valid_files: Vec<(PathBuf, String, u64)>,
+        mut rejected_files: Vec<RejectedOutboundFile>,
+        target_type: CustomTargetType,
+        target_id: &str,
+        reply_to_message_id: Option<&str>,
+    ) -> OutboundFilesDispatchResult {
+        if valid_files.is_empty() {
+            return OutboundFilesDispatchResult {
+                delivered_files: Vec::new(),
+                queued_files: Vec::new(),
+                rejected_files,
+            };
+        }
+
+        let base_chat_id = split_chat_and_thread(reply_chat).0.to_owned();
+        let total_bytes: u64 = valid_files.iter().map(|(_, _, sz)| *sz).sum();
+        let should_stage_async = valid_files.len() > 1 || total_bytes > OUTBOUND_INLINE_BYTE_CAP;
+
+        if should_stage_async {
+            self.spawn_outbound_staging_gc();
+            let staging_dir = self.data_dir.join("outbound-staging");
+            let stage_result = tokio::task::spawn_blocking(move || {
+                let mut staged_items: Vec<(TempStagedFile, String)> = Vec::with_capacity(valid_files.len());
+                let mut copy_rejections: Vec<RejectedOutboundFile> = Vec::new();
+                if let Err(e) = std::fs::create_dir_all(&staging_dir) {
+                    for (src, _, _) in valid_files {
+                        copy_rejections.push(RejectedOutboundFile {
+                            path: src.to_string_lossy().into_owned(),
+                            reason: format!(
+                                "Failed to create outbound staging directory '{}': {e}",
+                                staging_dir.display()
+                            ),
+                        });
+                    }
+                    return (staged_items, copy_rejections);
+                }
+                for (src, safe_name, _) in valid_files {
+                    let dest = staging_dir.join(format!("{}_{}", generate_prefixed_id("outf"), safe_name));
+                    match std::fs::copy(&src, &dest) {
+                        Ok(_) => staged_items.push((TempStagedFile(dest), safe_name)),
+                        Err(e) => copy_rejections.push(RejectedOutboundFile {
+                            path: src.to_string_lossy().into_owned(),
+                            reason: format!("Failed to stage outbound attachment '{}': {e}", src.display()),
+                        }),
+                    }
+                }
+                (staged_items, copy_rejections)
+            })
+            .await;
+
+            let (staged_items, copy_rejections) = match stage_result {
+                Ok(pair) => pair,
+                Err(join_err) => {
+                    warn!(error = %join_err, "outbound staging copy task panicked");
+                    return OutboundFilesDispatchResult {
+                        delivered_files: Vec::new(),
+                        queued_files: Vec::new(),
+                        rejected_files,
+                    };
                 }
             };
-            let file_name = valid_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("attachment.bin")
-                .to_owned();
-            let path_str = valid_path.to_string_lossy().into_owned();
-            let is_img = is_image_file_name(&file_name);
+            rejected_files.extend(copy_rejections);
+            let queued_files: Vec<String> = staged_items.iter().map(|(_, name)| name.clone()).collect();
 
+            if !staged_items.is_empty() {
+                self.inflight_outbound_uploads
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let inflight_guard = InflightUploadGuard {
+                    counter: Arc::clone(&self.inflight_outbound_uploads),
+                    drained: Arc::clone(&self.outbound_uploads_drained),
+                };
+                let semaphore = Arc::clone(&self.outbound_upload_semaphore);
+                let channel_manager = Arc::clone(&self.channel_manager);
+                let bridge_repo = Arc::clone(&self.bridge_repo);
+                let uid = owner_user_id.to_owned();
+                let chat = reply_chat.to_owned();
+                let tid = target_id.to_owned();
+                let reply_to = reply_to_message_id.map(str::to_owned);
+
+                tokio::spawn(async move {
+                    let _inflight = inflight_guard;
+                    for (staged_file, safe_name) in staged_items {
+                        let _permit = semaphore.acquire().await;
+                        let path_str = staged_file.0.to_string_lossy().into_owned();
+                        let is_img = is_image_file_name(&safe_name);
+                        let msg = UnifiedOutgoingMessage {
+                            message_type: if is_img {
+                                OutgoingMessageType::Image
+                            } else {
+                                OutgoingMessageType::File
+                            },
+                            text: Some(format!("📎 {safe_name}")),
+                            parse_mode: None,
+                            buttons: None,
+                            keyboard: None,
+                            image_url: if is_img { Some(path_str.clone()) } else { None },
+                            file_url: if !is_img { Some(path_str) } else { None },
+                            file_name: Some(safe_name.clone()),
+                            media_actions: None,
+                            reply_to_message_id: reply_to.clone(),
+                            silent: None,
+                        };
+
+                        match channel_manager.send_message(&uid, "telegram", &chat, msg).await {
+                            Ok(mid) => {
+                                let _ = bridge_repo
+                                    .record_msg_route("telegram", &base_chat_id, &mid, target_type, &tid)
+                                    .await;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    file = %safe_name,
+                                    error = %err,
+                                    "staged background Telegram attachment upload failed"
+                                );
+                                let fallback_notice = UnifiedOutgoingMessage {
+                                    message_type: OutgoingMessageType::Text,
+                                    text: Some(format!("⚠️ Failed to upload attachment '{safe_name}'.")),
+                                    parse_mode: None,
+                                    buttons: None,
+                                    keyboard: None,
+                                    image_url: None,
+                                    file_url: None,
+                                    file_name: None,
+                                    media_actions: None,
+                                    reply_to_message_id: reply_to.clone(),
+                                    silent: None,
+                                };
+                                let _ = channel_manager
+                                    .send_message(&uid, "telegram", &chat, fallback_notice)
+                                    .await;
+                            }
+                        }
+                        drop(staged_file);
+                    }
+                });
+            }
+
+            return OutboundFilesDispatchResult {
+                delivered_files: Vec::new(),
+                queued_files,
+                rejected_files,
+            };
+        }
+
+        // Fast inline path: single validated file <= 512 KiB
+        let mut delivered_files = Vec::with_capacity(1);
+        for (valid_path, safe_name, _) in valid_files {
+            let _permit = self.outbound_upload_semaphore.acquire().await;
+            let path_str = valid_path.to_string_lossy().into_owned();
+            let is_img = is_image_file_name(&safe_name);
             let msg = UnifiedOutgoingMessage {
                 message_type: if is_img {
                     OutgoingMessageType::Image
                 } else {
                     OutgoingMessageType::File
                 },
-                text: Some(format!("📎 {file_name}")),
+                text: Some(format!("📎 {safe_name}")),
                 parse_mode: None,
                 buttons: None,
                 keyboard: None,
                 image_url: if is_img { Some(path_str.clone()) } else { None },
-                file_url: if !is_img { Some(path_str.clone()) } else { None },
-                file_name: Some(file_name.clone()),
+                file_url: if !is_img { Some(path_str) } else { None },
+                file_name: Some(safe_name.clone()),
                 media_actions: None,
-                reply_to_message_id: None,
+                reply_to_message_id: reply_to_message_id.map(str::to_owned),
                 silent: None,
             };
 
-            if let Ok(mid) = self
+            match self
                 .channel_manager
                 .send_message(owner_user_id, "telegram", reply_chat, msg)
                 .await
             {
-                let _ = self
-                    .bridge_repo
-                    .record_msg_route("telegram", base_chat_id, &mid, target_type, target_id)
-                    .await;
-                delivered.push(file_name);
+                Ok(mid) => {
+                    let _ = self
+                        .bridge_repo
+                        .record_msg_route("telegram", &base_chat_id, &mid, target_type, target_id)
+                        .await;
+                    delivered_files.push(safe_name);
+                }
+                Err(err) => {
+                    warn!(file = %safe_name, error = %err, "inline Telegram attachment upload failed");
+                    rejected_files.push(RejectedOutboundFile {
+                        path: valid_path.to_string_lossy().into_owned(),
+                        reason: format!("Telegram upload failed: {err}"),
+                    });
+                    let fallback_notice = UnifiedOutgoingMessage {
+                        message_type: OutgoingMessageType::Text,
+                        text: Some(format!("⚠️ Failed to upload attachment '{safe_name}'.")),
+                        parse_mode: None,
+                        buttons: None,
+                        keyboard: None,
+                        image_url: None,
+                        file_url: None,
+                        file_name: None,
+                        media_actions: None,
+                        reply_to_message_id: reply_to_message_id.map(str::to_owned),
+                        silent: None,
+                    };
+                    let _ = self
+                        .channel_manager
+                        .send_message(owner_user_id, "telegram", reply_chat, fallback_notice)
+                        .await;
+                }
             }
         }
 
-        delivered
+        OutboundFilesDispatchResult {
+            delivered_files,
+            queued_files: Vec::new(),
+            rejected_files,
+        }
     }
 
     async fn make_team_quick_buttons(
@@ -1217,6 +1539,16 @@ impl TelegramTeamHub {
     }
 
     pub fn classify_slot_agent_wallet(agent: &aionui_api_types::TeamAgentResponse) -> WalletType {
+        Self::classify_slot_agent_wallet_with_key(
+            agent,
+            slot_has_custom_api_key(None, None, None),
+        )
+    }
+
+    pub fn classify_slot_agent_wallet_with_key(
+        agent: &aionui_api_types::TeamAgentResponse,
+        has_custom_api_key: bool,
+    ) -> WalletType {
         classify_slot_wallet_facts(&SlotWalletFacts {
             slot_backend: Some(&agent.backend),
             assistant_backend: Some(&agent.assistant_backend),
@@ -1225,8 +1557,25 @@ impl TelegramTeamHub {
             provider_id: None,
             model_id: Some(&agent.model),
             auth_methods_json: None,
-            has_custom_api_key: false,
+            has_custom_api_key,
         })
+    }
+
+    async fn classify_slot_agent_wallet_live(
+        &self,
+        owner_user_id: &str,
+        agent: &aionui_api_types::TeamAgentResponse,
+    ) -> WalletType {
+        let has_custom_api_key = self
+            .bridge_repo
+            .slot_has_custom_api_key_in_db(
+                owner_user_id,
+                &agent.conversation_id,
+                &agent.backend,
+                agent.assistant_id.as_deref(),
+            )
+            .await;
+        Self::classify_slot_agent_wallet_with_key(agent, has_custom_api_key)
     }
 
     pub fn classify_team_lead_wallet(team: &TeamResponse) -> (String, WalletType) {
@@ -1258,8 +1607,14 @@ impl TelegramTeamHub {
         owner_user_id: &str,
         team: &TeamResponse,
     ) -> Option<(f64, f64)> {
-        let (_, lead_wallet) = Self::classify_team_lead_wallet(team);
-        if lead_wallet != WalletType::ApiKey && !Self::has_any_api_key_slot(team) {
+        let mut has_paid_slot = false;
+        for member in &team.assistants {
+            if self.classify_slot_agent_wallet_live(owner_user_id, member).await == WalletType::ApiKey {
+                has_paid_slot = true;
+                break;
+            }
+        }
+        if !has_paid_slot {
             return None;
         }
         let Ok(wallet) = self.bridge_repo.get_or_create_cost_wallet(owner_user_id).await else {
@@ -1300,8 +1655,16 @@ impl TelegramTeamHub {
         run_id: &str,
         synthesis_chars: usize,
     ) {
-        let (lead_slot_id, lead_wallet) = Self::classify_team_lead_wallet(team);
-        let has_paid_slot = lead_wallet == WalletType::ApiKey || Self::has_any_api_key_slot(team);
+        let (lead_slot_id, _) = Self::classify_team_lead_wallet(team);
+        let mut has_paid_slot = false;
+        let mut slot_wallets = Vec::with_capacity(team.assistants.len());
+        for member in &team.assistants {
+            let w = self.classify_slot_agent_wallet_live(owner_user_id, member).await;
+            if w == WalletType::ApiKey {
+                has_paid_slot = true;
+            }
+            slot_wallets.push(w);
+        }
         let effective_wallet = if has_paid_slot {
             WalletType::ApiKey
         } else {
@@ -1321,8 +1684,7 @@ impl TelegramTeamHub {
         let mut measured_out_tokens = 0_i64;
         let mut measured_api_cost_usd = 0.0_f64;
 
-        for member in &team.assistants {
-            let slot_wallet = Self::classify_slot_agent_wallet(member);
+        for (member, slot_wallet) in team.assistants.iter().zip(slot_wallets.into_iter()) {
             let (_, total_bytes) = self
                 .bridge_repo
                 .estimate_conversation_tokens_fast(&member.conversation_id)
@@ -2202,6 +2564,14 @@ impl TelegramTeamHub {
         &self,
         args: PostRoomMessageArgs<'_>,
     ) -> Result<(SharedRoomMessageDto, Vec<RoutedTarget>), String> {
+        let (msg_dto, targets, _) = self.post_message_to_shared_room_with_rejections(args).await?;
+        Ok((msg_dto, targets))
+    }
+
+    async fn post_message_to_shared_room_with_rejections(
+        &self,
+        args: PostRoomMessageArgs<'_>,
+    ) -> Result<(SharedRoomMessageDto, Vec<RoutedTarget>, Vec<RejectedOutboundFile>), String> {
         let room_dto = self.build_shared_room_dto(args.owner_user_id, args.room_id).await?;
 
         if args.sender_type == "user" {
@@ -2253,6 +2623,7 @@ impl TelegramTeamHub {
         .await?;
         let staged_artifacts = artifact_batch.artifacts;
         let recipient_inbox_paths = artifact_batch.recipient_inbox_paths;
+        let rejected_files = artifact_batch.rejected_files;
 
         let reply_sender_team_id = if let Some(ref rid) = args.reply_to_id {
             self.bridge_repo
@@ -2495,7 +2866,7 @@ impl TelegramTeamHub {
                     room_name = room_dto.name,
                     body = args.content
                 );
-                let _ = self
+                let sent_room_ids = self
                     .send_formatted_telegram_message(
                         args.owner_user_id,
                         &tg_dest,
@@ -2505,17 +2876,33 @@ impl TelegramTeamHub {
                         CustomTargetType::Room,
                         args.room_id,
                     )
-                    .await;
+                    .await
+                    .unwrap_or_default();
                 let staged_paths: Vec<String> = staged_artifacts.iter().map(|a| a.staged_path.clone()).collect();
                 if !staged_paths.is_empty() {
+                    let fallback_team_ws = if source_ws.is_none()
+                        && let Some(tid) = args.sender_team_id
+                    {
+                        self.team_service
+                            .get_team(args.owner_user_id, tid)
+                            .await
+                            .ok()
+                            .map(|team| team.workspace)
+                    } else {
+                        None
+                    };
+                    let effective_sender_ws = source_ws
+                        .or(fallback_team_ws.as_deref())
+                        .filter(|w| !w.trim().is_empty());
                     let _ = self
                         .send_validated_outbound_files(
                             args.owner_user_id,
                             &tg_dest,
                             &staged_paths,
-                            None,
+                            effective_sender_ws,
                             CustomTargetType::Room,
                             args.room_id,
+                            sent_room_ids.last().map(String::as_str),
                         )
                         .await;
                 }
@@ -2525,7 +2912,7 @@ impl TelegramTeamHub {
         if hop_limit_triggered {
             self.emit_hop_limit_reached_notice(args.owner_user_id, &room_dto)
                 .await;
-            return Ok((msg_dto, Vec::new()));
+            return Ok((msg_dto, Vec::new(), rejected_files));
         }
 
         // Offload oversized Shared Room message (> 2,400 chars) to `.shared-inbox/` once for all woken targets
@@ -2743,7 +3130,7 @@ impl TelegramTeamHub {
             });
         }
 
-        Ok((msg_dto, effective_targets))
+        Ok((msg_dto, effective_targets, rejected_files))
     }
 
     async fn emit_hop_limit_reached_notice(&self, owner_user_id: &str, room_dto: &SharedRoomDto) {
@@ -2869,6 +3256,33 @@ impl TelegramTeamHub {
         blocked_by: Vec<String>,
         files: Vec<String>,
     ) -> Result<SharedRoomTaskDto, String> {
+        let (dto, _) = self
+            .create_cross_team_task_with_rejections(
+                owner_user_id,
+                room_id,
+                from_team_id,
+                to_team_ref,
+                title,
+                description,
+                blocked_by,
+                files,
+            )
+            .await?;
+        Ok(dto)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_cross_team_task_with_rejections(
+        &self,
+        owner_user_id: &str,
+        room_id: &str,
+        from_team_id: Option<&str>,
+        to_team_ref: &str,
+        title: &str,
+        description: &str,
+        blocked_by: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<(SharedRoomTaskDto, Vec<RejectedOutboundFile>), String> {
         let room_dto = self.build_shared_room_dto(owner_user_id, room_id).await?;
         let to_team_id = self
             .resolve_team_id_in_room(owner_user_id, room_id, to_team_ref)
@@ -2897,7 +3311,7 @@ impl TelegramTeamHub {
         validate_task_dependencies(&task_id, &blocked_by, &existing_tasks)?;
 
         let allow_user_local_files = from_team_id.is_none();
-        let staged = stage_room_artifacts_batch_async(
+        let stage_batch = stage_room_artifacts_batch_async(
             room_id.to_owned(),
             files,
             source_ws.map(ToOwned::to_owned),
@@ -2905,8 +3319,9 @@ impl TelegramTeamHub {
             recipient_ws,
             allow_user_local_files,
         )
-        .await?
-        .artifacts;
+        .await?;
+        let staged = stage_batch.artifacts;
+        let rejected_files = stage_batch.rejected_files;
 
         let created = self
             .bridge_repo
@@ -3014,9 +3429,10 @@ impl TelegramTeamHub {
             }
         }
 
-        Ok(dto)
+        Ok((dto, rejected_files))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_cross_team_task(
         &self,
         owner_user_id: &str,
@@ -3027,6 +3443,31 @@ impl TelegramTeamHub {
         result_summary: Option<String>,
         files: Vec<String>,
     ) -> Result<SharedRoomTaskDto, String> {
+        let (dto, _) = self
+            .update_cross_team_task_with_rejections(
+                owner_user_id,
+                task_id,
+                actor_team_id,
+                status,
+                description,
+                result_summary,
+                files,
+            )
+            .await?;
+        Ok(dto)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_cross_team_task_with_rejections(
+        &self,
+        owner_user_id: &str,
+        task_id: &str,
+        actor_team_id: Option<&str>,
+        status: Option<String>,
+        description: Option<String>,
+        result_summary: Option<String>,
+        files: Vec<String>,
+    ) -> Result<(SharedRoomTaskDto, Vec<RejectedOutboundFile>), String> {
         let existing = self
             .bridge_repo
             .get_shared_room_task(task_id)
@@ -3059,6 +3500,7 @@ impl TelegramTeamHub {
 
         let mut merged_artifacts: Vec<StagedRoomArtifact> =
             serde_json::from_str(&existing.artifact_paths_json).unwrap_or_default();
+        let mut rejected_files = Vec::new();
         if !files.is_empty() {
             let source_ws = actor_team_id.and_then(|tid| {
                 room_dto
@@ -3082,9 +3524,9 @@ impl TelegramTeamHub {
                 recipient_ws,
                 allow_user_local_files,
             )
-            .await?
-            .artifacts;
-            merged_artifacts.extend(newly_staged);
+            .await?;
+            merged_artifacts.extend(newly_staged.artifacts);
+            rejected_files = newly_staged.rejected_files;
         }
 
         let updated = self
@@ -3312,7 +3754,7 @@ impl TelegramTeamHub {
             }
         }
 
-        Ok(dto)
+        Ok((dto, rejected_files))
     }
 }
 
@@ -4996,7 +5438,15 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             entry.notify_completed_sent = true;
         }
 
-        // Broadcast realtime toast/event to Desktop UI as well
+        let (valid_files, rejected_files) = self
+            .partition_outbound_files_async(files, Some(team.workspace.clone()))
+            .await;
+        let validated_desktop_files: Vec<String> = valid_files
+            .iter()
+            .map(|(path, _, _)| path.to_string_lossy().into_owned())
+            .collect();
+
+        // Broadcast realtime toast/event to Desktop UI as well (only validated files)
         self.event_bus.broadcast(WebSocketMessage::new(
             "team.proactiveNotification",
             serde_json::json!({
@@ -5005,7 +5455,8 @@ impl TeamExternalBridgePort for TelegramTeamHub {
                 "team_name": team.name,
                 "kind": kind,
                 "summary": summary,
-                "files": files,
+                "files": validated_desktop_files,
+                "rejected_files": rejected_files,
                 "created_at": now_ms(),
             }),
         ));
@@ -5068,6 +5519,9 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             return Ok(serde_json::json!({
                 "delivered_telegram": false,
                 "delivered_desktop": true,
+                "delivered_files": Vec::<String>::new(),
+                "queued_files": Vec::<String>::new(),
+                "rejected_files": rejected_files,
                 "note": "No active Telegram destination connected; notification delivered to Desktop UI."
             }));
         };
@@ -5136,14 +5590,15 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             }
         }
 
-        let delivered_files = self
-            .send_validated_outbound_files(
+        let file_dispatch = self
+            .dispatch_prevalidated_outbound_files(
                 user_id,
                 &dest_chat,
-                &files,
-                Some(&team.workspace),
+                valid_files,
+                rejected_files,
                 CustomTargetType::Team,
                 team_id,
+                sent_ids.last().map(String::as_str),
             )
             .await;
 
@@ -5151,7 +5606,9 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             team_id = %team_id,
             kind = %kind,
             chunks = sent_ids.len(),
-            files = delivered_files.len(),
+            delivered = file_dispatch.delivered_files.len(),
+            queued = file_dispatch.queued_files.len(),
+            rejected = file_dispatch.rejected_files.len(),
             "proactive team_notify_user delivered to Telegram"
         );
 
@@ -5159,7 +5616,9 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             "delivered_telegram": true,
             "delivered_desktop": true,
             "message_ids": sent_ids,
-            "delivered_files": delivered_files,
+            "delivered_files": file_dispatch.delivered_files,
+            "queued_files": file_dispatch.queued_files,
+            "rejected_files": file_dispatch.rejected_files,
         }))
     }
 
@@ -5294,8 +5753,8 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             None => self.resolve_default_room_for_team(user_id, team_id).await?,
         };
 
-        let (msg_dto, routed) = self
-            .post_message_to_shared_room(PostRoomMessageArgs {
+        let (msg_dto, routed, rejected_files) = self
+            .post_message_to_shared_room_with_rejections(PostRoomMessageArgs {
                 owner_user_id: user_id,
                 room_id: &resolved_room_id,
                 sender_type: "leader",
@@ -5315,6 +5774,7 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             "room_id": resolved_room_id,
             "message_id": msg_dto.id,
             "woken_targets": routed,
+            "rejected_files": rejected_files,
         }))
     }
 
@@ -5334,8 +5794,8 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             None => self.resolve_default_room_for_team(user_id, team_id).await?,
         };
 
-        let task_dto = self
-            .create_cross_team_task(
+        let (task_dto, rejected_files) = self
+            .create_cross_team_task_with_rejections(
                 user_id,
                 &resolved_room_id,
                 Some(team_id),
@@ -5350,6 +5810,7 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         Ok(serde_json::json!({
             "created": true,
             "task": task_dto,
+            "rejected_files": rejected_files,
         }))
     }
 
@@ -5373,8 +5834,8 @@ impl TeamExternalBridgePort for TelegramTeamHub {
             }
         }
 
-        let task_dto = self
-            .update_cross_team_task(
+        let (task_dto, rejected_files) = self
+            .update_cross_team_task_with_rejections(
                 user_id,
                 task_id,
                 Some(team_id),
@@ -5388,6 +5849,7 @@ impl TeamExternalBridgePort for TelegramTeamHub {
         Ok(serde_json::json!({
             "updated": true,
             "task": task_dto,
+            "rejected_files": rejected_files,
         }))
     }
 

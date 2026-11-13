@@ -596,16 +596,38 @@ async fn get_active_sessions(
 // Channel settings handlers
 // ---------------------------------------------------------------------------
 
+/// Built-in channel entry listed in `get_plugin_status` whose runtime plugin
+/// enum (`PluginType`) is not yet wired. Returning empty/default platform
+/// settings keeps cold-boot `configMigration.ts` and Channel Settings UI free
+/// of `400 Invalid platform: wecom` errors while still rejecting genuinely
+/// unknown platform slugs.
+const WECOM_PLATFORM_ID: &str = "wecom";
+
+fn is_graceful_unconfigured_platform(platform: &str) -> bool {
+    platform == WECOM_PLATFORM_ID
+}
+
 /// `GET /api/channel/settings/:platform` — return backend-owned channel settings.
 async fn get_channel_settings(
     State(state): State<ChannelRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
 ) -> Result<Json<ApiResponse<ChannelPlatformSettingsResponse>>, ApiError> {
-    let platform = PluginType::from_str_opt(&platform)
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Some(parsed_platform) = PluginType::from_str_opt(&platform) else {
+        if is_graceful_unconfigured_platform(&platform) {
+            return Ok(Json(ApiResponse::ok(ChannelPlatformSettingsResponse {
+                platform: WECOM_PLATFORM_ID.to_owned(),
+                assistant: None,
+                default_model: None,
+            })));
+        }
+        return Err(ApiError::BadRequest(format!("Invalid platform: {}", platform)));
+    };
 
-    let settings = state.settings_service.get_platform_settings(&user.id, platform).await?;
+    let settings = state
+        .settings_service
+        .get_platform_settings(&user.id, parsed_platform)
+        .await?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
@@ -616,13 +638,23 @@ async fn set_channel_assistant_setting(
     Path(platform): Path<String>,
     body: Result<Json<ChannelAssistantSettingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let platform = PluginType::from_str_opt(&platform)
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Some(parsed_platform) = PluginType::from_str_opt(&platform) else {
+        if is_graceful_unconfigured_platform(&platform) {
+            let Json(_req) = body.map_err(ApiError::from)?;
+            state.session_manager.clear_all_sessions(&user.id).await?;
+            return Ok(Json(ApiResponse::ok(BridgeResponse {
+                success: true,
+                message: Some("Assistant setting updated".into()),
+                error: None,
+            })));
+        }
+        return Err(ApiError::BadRequest(format!("Invalid platform: {}", platform)));
+    };
     let Json(req) = body.map_err(ApiError::from)?;
 
     state
         .settings_service
-        .set_assistant_setting(&user.id, platform, &req)
+        .set_assistant_setting(&user.id, parsed_platform, &req)
         .await?;
     state.session_manager.clear_all_sessions(&user.id).await?;
 
@@ -640,13 +672,23 @@ async fn set_channel_default_model_setting(
     Path(platform): Path<String>,
     body: Result<Json<ChannelDefaultModelSetting>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let platform = PluginType::from_str_opt(&platform)
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Some(parsed_platform) = PluginType::from_str_opt(&platform) else {
+        if is_graceful_unconfigured_platform(&platform) {
+            let Json(_req) = body.map_err(ApiError::from)?;
+            state.session_manager.clear_all_sessions(&user.id).await?;
+            return Ok(Json(ApiResponse::ok(BridgeResponse {
+                success: true,
+                message: Some("Default model setting updated".into()),
+                error: None,
+            })));
+        }
+        return Err(ApiError::BadRequest(format!("Invalid platform: {}", platform)));
+    };
     let Json(req) = body.map_err(ApiError::from)?;
 
     state
         .settings_service
-        .set_model_setting(&user.id, platform, &req)
+        .set_model_setting(&user.id, parsed_platform, &req)
         .await?;
     state.session_manager.clear_all_sessions(&user.id).await?;
 
@@ -673,8 +715,9 @@ async fn sync_channel_settings(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    let _platform = PluginType::from_str_opt(&req.platform)
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
+    if PluginType::from_str_opt(&req.platform).is_none() && !is_graceful_unconfigured_platform(&req.platform) {
+        return Err(ApiError::BadRequest(format!("Invalid platform: {}", req.platform)));
+    }
 
     state.session_manager.clear_all_sessions(&user.id).await?;
 
@@ -1105,5 +1148,105 @@ mod tests {
         let config = build_test_config(&req);
         assert_eq!(config.credentials.bot_token.as_deref(), Some("bot_token_xyz"));
         assert_eq!(config.credentials.account_id.as_deref(), Some("account_abc"));
+    }
+
+    struct NoopBroadcaster;
+    impl aionui_realtime::EventBroadcaster for NoopBroadcaster {
+        fn broadcast(&self, _event: aionui_api_types::WebSocketMessage<serde_json::Value>) {}
+    }
+
+    async fn make_test_router_state() -> (ChannelRouterState, aionui_db::Database) {
+        let db = aionui_db::init_database_memory().await.expect("in-memory db");
+        let repo: Arc<dyn IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(db.pool().clone()));
+        let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
+            Arc::new(aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()));
+        let bc: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(NoopBroadcaster);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(4);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(4);
+        let manager = Arc::new(ChannelManager::new(
+            Arc::clone(&repo),
+            Arc::clone(&bc),
+            [0x11; 32],
+            msg_tx,
+            confirm_tx,
+        ));
+        let pairing_service = Arc::new(PairingService::new(Arc::clone(&repo), Arc::clone(&bc)));
+        let session_manager = Arc::new(SessionManager::new(Arc::clone(&repo)));
+        let plugin_factory: Arc<PluginFactory> = Arc::new(Box::new(|_pt| None));
+        let settings_service = Arc::new(ChannelSettingsService::new(pref_repo));
+        let extension_registry = ExtensionRegistry::new(
+            aionui_extension::ExtensionStateStore::new(std::env::temp_dir().join("aionui-wecom-route-test-ext.json")),
+            bc,
+            "0.0.0-test".into(),
+        );
+        (
+            ChannelRouterState {
+                manager,
+                pairing_service,
+                session_manager,
+                repo,
+                plugin_factory,
+                settings_service,
+                extension_registry,
+                team_bridge: Arc::new(std::sync::OnceLock::new()),
+            },
+            db,
+        )
+    }
+
+    fn test_current_user() -> CurrentUser {
+        CurrentUser::local_default()
+    }
+
+    #[tokio::test]
+    async fn wecom_channel_settings_returns_200_default_while_unknown_returns_400() {
+        use axum::response::IntoResponse;
+
+        let (state, _db) = make_test_router_state().await;
+        let user = test_current_user();
+
+        // 1. GET /api/channel/settings/wecom -> 200 OK with empty/default settings
+        let wecom_resp = get_channel_settings(
+            State(state.clone()),
+            Extension(user.clone()),
+            Path("wecom".to_owned()),
+        )
+        .await
+        .expect("wecom settings should succeed");
+        let status = wecom_resp.clone().into_response().status();
+        assert_eq!(status, StatusCode::OK);
+        assert!(wecom_resp.0.success);
+        let data = wecom_resp.0.data.expect("wecom response data");
+        assert_eq!(data.platform, "wecom");
+        assert!(data.assistant.is_none());
+        assert!(data.default_model.is_none());
+
+        // 2. POST /api/channel/settings/sync for wecom -> 200 OK
+        let sync_resp = sync_channel_settings(
+            State(state.clone()),
+            Extension(user.clone()),
+            Ok(Json(SyncChannelSettingsRequest {
+                platform: "wecom".to_owned(),
+            })),
+        )
+        .await
+        .expect("wecom sync should succeed");
+        assert_eq!(sync_resp.into_response().status(), StatusCode::OK);
+
+        // 3. Unknown platforms ("nonexistent", "invalid_platform") still return 400 Bad Request
+        for invalid in ["nonexistent", "invalid_platform", "WECOM"] {
+            let err = get_channel_settings(
+                State(state.clone()),
+                Extension(user.clone()),
+                Path(invalid.to_owned()),
+            )
+            .await
+            .expect_err("unknown platform must fail");
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {invalid}"
+            );
+        }
     }
 }

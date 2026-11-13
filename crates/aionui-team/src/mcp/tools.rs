@@ -117,6 +117,8 @@ pub struct TaskListInput {
     #[serde(default)]
     pub status: Option<TaskListStatusInput>,
     #[serde(default)]
+    pub statuses: Option<TaskListStatusInput>,
+    #[serde(default)]
     pub include_deleted: Option<bool>,
     #[serde(default)]
     pub limit: Option<i64>,

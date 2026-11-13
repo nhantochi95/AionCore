@@ -116,6 +116,67 @@ impl SqliteConversationRepository {
         }
     }
 
+    async fn insert_message_if_absent_once(&self, user_id: &str, message: &MessageRow) -> Result<bool, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result: Result<bool, DbError> = async {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                    .bind(user_id)
+                    .bind(&message.conversation_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if exists == 0 {
+                return Err(DbError::NotFound(format!(
+                    "Conversation '{}' not found",
+                    message.conversation_id
+                )));
+            }
+            let exec = sqlx::query(
+                "INSERT INTO messages \
+                    (id, conversation_id, msg_id, type, content, position, \
+                     status, hidden, created_at, backend_turn_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&message.id)
+            .bind(&message.conversation_id)
+            .bind(&message.msg_id)
+            .bind(&message.r#type)
+            .bind(&message.content)
+            .bind(&message.position)
+            .bind(&message.status)
+            .bind(message.hidden)
+            .bind(message.created_at)
+            .bind(&message.backend_turn_id)
+            .execute(&mut *connection)
+            .await?;
+
+            let inserted = exec.rows_affected() == 1;
+            if inserted {
+                sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+                    .bind(message.created_at)
+                    .bind(&message.conversation_id)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            Ok(inserted)
+        }
+        .await;
+
+        match result {
+            Ok(inserted) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(inserted)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         // Writer-lock-first transaction; see `insert_message_once` for why.
         let mut connection = self.pool.acquire().await?;
@@ -968,6 +1029,10 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         self.insert_message_once(user_id, message).await
+    }
+
+    async fn insert_message_if_absent(&self, user_id: &str, message: &MessageRow) -> Result<bool, DbError> {
+        self.insert_message_if_absent_once(user_id, message).await
     }
 
     async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {

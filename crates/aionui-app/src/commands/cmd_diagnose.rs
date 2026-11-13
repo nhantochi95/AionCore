@@ -999,7 +999,7 @@ fn redact_value(value: Value) -> Value {
             Value::Object(redacted)
         }
         Value::Array(items) => Value::Array(items.into_iter().map(redact_value).collect()),
-        Value::String(text) => Value::String(redact_text(&text)),
+        Value::String(text) => Value::String(scrub_secret_tokens_plain(&text)),
         other => other,
     }
 }
@@ -1048,9 +1048,74 @@ fn redact_text(text: &str) -> String {
     {
         return redacted;
     }
-    let text = redact_prefixed_secret(text, "sk-", "sk-REDACTED");
+    scrub_secret_tokens_plain(text)
+}
+
+/// Scrubs secret tokens in plain text without attempting JSON parsing, safe to
+/// invoke directly on `Value::String` leaves inside `redact_value`.
+fn scrub_secret_tokens_plain(text: &str) -> String {
+    let text = scrub_botfather_tokens_plain(text);
+    let text = redact_prefixed_secret(&text, "sk-", "sk-REDACTED");
     let text = redact_prefixed_secret(&text, "Bearer ", "Bearer REDACTED");
     redact_prefixed_secret(&text, "bearer ", "bearer REDACTED")
+}
+
+fn scrub_botfather_tokens_plain(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let candidate = if i + 4 <= len && &bytes[i..i + 3] == b"bot" && bytes[i + 3].is_ascii_digit() {
+            Some((true, i + 3))
+        } else if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
+            Some((false, i))
+        } else {
+            None
+        };
+
+        if let Some((has_bot_prefix, digits_start)) = candidate {
+            let mut digits_end = digits_start;
+            while digits_end < len && bytes[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if (6..=15).contains(&(digits_end - digits_start)) {
+                let sec_start_opt = if digits_end < len && bytes[digits_end] == b':' {
+                    Some(digits_end + 1)
+                } else if digits_end + 3 <= len
+                    && bytes[digits_end] == b'%'
+                    && bytes[digits_end + 1] == b'3'
+                    && matches!(bytes[digits_end + 2], b'A' | b'a')
+                {
+                    Some(digits_end + 3)
+                } else {
+                    None
+                };
+
+                if let Some(sec_start) = sec_start_opt {
+                    let mut sec_end = sec_start;
+                    while sec_end < len
+                        && (bytes[sec_end].is_ascii_alphanumeric()
+                            || bytes[sec_end] == b'_'
+                            || bytes[sec_end] == b'-')
+                    {
+                        sec_end += 1;
+                    }
+                    if (30..=64).contains(&(sec_end - sec_start)) {
+                        out.push_str(if has_bot_prefix { "bot[REDACTED]" } else { "[REDACTED]" });
+                        i = sec_end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn redact_prefixed_secret(text: &str, prefix: &str, replacement: &str) -> String {
@@ -1196,5 +1261,59 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn redact_text_scrubs_json_tracing_string_leaves_and_plain_botfather_tokens() {
+        let json_line = serde_json::json!({
+            "timestamp": "2026-11-12T15:22:55Z",
+            "level": "ERROR",
+            "fields": {
+                "error": "getUpdates request failed: https://api.telegram.org/bot7123456789:AAH_abcdefghijklmnopqrstuvwxyz012345/getUpdates",
+                "file_error": "download failed: https://api.telegram.org/file/bot8123456789%3ABBH_0123456789abcdefghijklmnopqrstuv/doc.pdf",
+                "raw_detail": "9123456789:CCH_abcdefghijklmnopqrstuvwxyz987654",
+                "nested_json_string": "{\"inner_err\":\"bot6123456789:DDH_abcdefghijklmnopqrstuvwxyz456789\"}",
+                "location": "src/api.rs:123"
+            }
+        })
+        .to_string();
+
+        let redacted = redact_text(&json_line);
+        for leaked in [
+            "7123456789",
+            "8123456789",
+            "9123456789",
+            "6123456789",
+            "AAH_abcdefghijklmnopqrstuvwxyz012345",
+            "BBH_0123456789abcdefghijklmnopqrstuv",
+            "CCH_abcdefghijklmnopqrstuvwxyz987654",
+            "DDH_abcdefghijklmnopqrstuvwxyz456789",
+        ] {
+            assert!(!redacted.contains(leaked), "leaked {leaked}: {redacted}");
+        }
+
+        let parsed: Value = serde_json::from_str(&redacted).expect("must remain valid JSON");
+        assert_eq!(parsed["timestamp"], "2026-11-12T15:22:55Z");
+        assert_eq!(parsed["fields"]["location"], "src/api.rs:123");
+        assert!(
+            parsed["fields"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("bot[REDACTED]/getUpdates"),
+            "{parsed}"
+        );
+        assert!(
+            parsed["fields"]["file_error"]
+                .as_str()
+                .unwrap()
+                .contains("file/bot[REDACTED]/doc.pdf"),
+            "{parsed}"
+        );
+        assert_eq!(parsed["fields"]["raw_detail"], "[REDACTED]");
+        // nested_json_string stays a string leaf (not re-parsed into an Object) with its secret scrubbed
+        assert_eq!(
+            parsed["fields"]["nested_json_string"],
+            "{\"inner_err\":\"bot[REDACTED]\"}"
+        );
     }
 }

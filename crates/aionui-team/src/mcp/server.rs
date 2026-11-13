@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::TeamSendMessageQueuedResponse;
+use aionui_api_types::{TeamSendMessageQueuedResponse, TeamToolErrorCode};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -493,17 +493,98 @@ pub(crate) struct ToolCallError {
     pub message: String,
     pub domain_code: Option<&'static str>,
     pub details: Option<Value>,
+    pub tool_error_code: Option<TeamToolErrorCode>,
 }
 
 impl ToolCallError {
-    fn from_message(message: impl Into<String>) -> Self {
+    pub(crate) fn from_message(message: impl Into<String>) -> Self {
         let message = message.into();
+        let classified = classify_public_error(&message);
+        let tool_error_code = classify_tool_error_code(&message);
+        Self {
+            message,
+            domain_code: classified.as_ref().map(|value| value.code),
+            details: classified.and_then(|value| value.details),
+            tool_error_code,
+        }
+    }
+
+    pub(crate) fn from_team_error(err: TeamError) -> Self {
+        let code = match &err {
+            TeamError::MemberBusy { .. }
+            | TeamError::MemberRuntimeStarting { .. }
+            | TeamError::RuntimeNotReady { .. } => TeamToolErrorCode::TransportUnavailable,
+            TeamError::SessionNotFound(_) | TeamError::TeamNotFound(_) => TeamToolErrorCode::TeamNotFound,
+            TeamError::AgentNotFound(_) => TeamToolErrorCode::AgentNotFound,
+            TeamError::LeaderOnly(_)
+            | TeamError::Forbidden(_)
+            | TeamError::ContextResetLeaderNotTargetable { .. } => TeamToolErrorCode::PermissionDenied,
+            TeamError::InvalidRequest(_)
+            | TeamError::TaskNotFound(_)
+            | TeamError::BlockedTaskNotFound(_)
+            | TeamError::BackendNotAllowed(_)
+            | TeamError::DuplicateAgentName(_)
+            | TeamError::MemberUnsupported { .. }
+            | TeamError::ContextResetUnavailable { .. }
+            | TeamError::Json(_) => TeamToolErrorCode::SchemaValidationFailed,
+            TeamError::MemberRuntimeFailed { .. }
+            | TeamError::WorkspacePathUnavailable(_)
+            | TeamError::WorkspacePathRuntimeUnavailable(_)
+            | TeamError::Database(_) => TeamToolErrorCode::TransportUnavailable,
+        };
+        let message = err.to_string();
         let classified = classify_public_error(&message);
         Self {
             message,
             domain_code: classified.as_ref().map(|value| value.code),
             details: classified.and_then(|value| value.details),
+            tool_error_code: Some(code),
         }
+    }
+}
+
+fn classify_tool_error_code(message: &str) -> Option<TeamToolErrorCode> {
+    if message.starts_with("Unknown tool:") {
+        Some(TeamToolErrorCode::UnknownTool)
+    } else if message.starts_with("Only Lead")
+        || message.starts_with("Forbidden:")
+        || message.contains("is not a member of shared room")
+        || message.contains("not bound to any Shared Room")
+        || message.contains("No Shared Room")
+        || message.contains("No shared room")
+        || message.contains("not in a shared room")
+    {
+        Some(TeamToolErrorCode::PermissionDenied)
+    } else if message.contains("Invalid agent target")
+        || message.starts_with("Agent not found:")
+        || message.contains("MailboxTargetInvalid")
+    {
+        Some(TeamToolErrorCode::AgentNotFound)
+    } else if message.contains("No active session")
+        || message.starts_with("Team not found:")
+        || message.starts_with("Session not found:")
+    {
+        Some(TeamToolErrorCode::TeamNotFound)
+    } else if message.starts_with("Team service not available")
+        || message.starts_with("External channel/room bridge is not configured")
+    {
+        Some(TeamToolErrorCode::TransportUnavailable)
+    } else if message.starts_with("Invalid")
+        || message.starts_with("Missing required field")
+        || message.starts_with("Shared room not found")
+        || message.starts_with("Cross-team task")
+        || message.starts_with("Target team")
+        || message.starts_with("Task not found:")
+        || message.starts_with("Blocked task not found:")
+        || message.starts_with("Preset assistant not found:")
+        || message.starts_with("message must not be empty")
+        || message.starts_with("team_interrupt_agent requires")
+        || message.contains("does not accept arguments")
+        || message.contains("is no longer accepted")
+    {
+        Some(TeamToolErrorCode::SchemaValidationFailed)
+    } else {
+        None
     }
 }
 
@@ -610,7 +691,7 @@ async fn exec_list_assistants(
     let user_id = service
         .team_owner_user_id(team_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     let assistants = service.list_team_selectable_assistants(&user_id).await;
     let value = json!({ "assistants": assistants });
     serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
@@ -639,12 +720,12 @@ async fn exec_describe_assistant(
     let user_id = service
         .team_owner_user_id(team_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
 
     service
         .describe_assistant(&user_id, assistant_id, locale)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))
+        .map_err(ToolCallError::from_team_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +747,7 @@ async fn resolve_external_bridge_and_user(
     let user_id = svc
         .team_owner_user_id(team_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     let ext = svc
         .external_bridge()
         .cloned()
@@ -865,7 +946,7 @@ async fn exec_read_messages(
     let peek = service
         .peek_agent_messages(team_id, caller_slot_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     let page = inbox_page(peek.messages, since_message_id)?;
     let team_workspace = service.team_workspace_for_session(team_id);
     let rendered = render_inbox_page_with_workspace(page, team_workspace.as_deref());
@@ -878,7 +959,7 @@ async fn exec_read_messages(
         service
             .observe_agent_messages(team_id, caller_slot_id, batch_id, &rendered.observable_message_ids)
             .await
-            .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+            .map_err(ToolCallError::from_team_error)?;
     }
     json_text(&rendered.value)
 }
@@ -1052,7 +1133,7 @@ async fn exec_send_message(
         scheduler
             .notify_shutdown_rejected(caller_slot_id, reason)
             .await
-            .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+            .map_err(ToolCallError::from_team_error)?;
         if let Some(svc) = service.upgrade()
             && let Err(e) = svc
                 .wake_leader_after_recovery_message(team_id, caller_slot_id, WorkSource::ShutdownRejected)
@@ -1109,7 +1190,7 @@ async fn exec_send_message(
                 Some(input.files.clone()),
             )
             .await
-            .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+            .map_err(ToolCallError::from_team_error)?;
         target_results.push(result);
     }
 
@@ -1155,7 +1236,7 @@ async fn exec_interrupt_agent(
             input.reason,
         )
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     serde_json::to_string_pretty(&response)
         .map_err(|error| ToolCallError::from_message(format!("Serialization error: {error}")))
 }
@@ -1208,19 +1289,45 @@ struct TaskListFilters {
 fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallError> {
     let input: TaskListInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
-    let statuses = match input.status {
-        Some(TaskListStatusInput::Single(status)) => Some(vec![parse_task_status_arg(&status)?]),
-        Some(TaskListStatusInput::Many(statuses)) => {
-            if statuses.is_empty() {
-                return Err(ToolCallError::from_message("Invalid params: status must not be empty"));
+    let mut raw_tokens: Vec<String> = Vec::new();
+    for source in [input.status, input.statuses] {
+        match source {
+            Some(TaskListStatusInput::Single(single)) => {
+                for part in single.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        raw_tokens.push(trimmed.to_owned());
+                    }
+                }
             }
-            let parsed = statuses
-                .iter()
-                .map(|status| parse_task_status_arg(status))
-                .collect::<Result<Vec<_>, _>>()?;
-            Some(parsed)
+            Some(TaskListStatusInput::Many(many)) => {
+                for entry in many {
+                    for part in entry.split(',') {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            raw_tokens.push(trimmed.to_owned());
+                        }
+                    }
+                }
+            }
+            None => {}
         }
-        None => None,
+    }
+    let statuses = if raw_tokens.is_empty()
+        || raw_tokens
+            .iter()
+            .any(|tok| tok.eq_ignore_ascii_case("all") || tok == "*")
+    {
+        None
+    } else {
+        let mut parsed = Vec::with_capacity(raw_tokens.len());
+        for token in &raw_tokens {
+            let mapped = parse_task_status_arg(token)?;
+            if !parsed.contains(&mapped) {
+                parsed.push(mapped);
+            }
+        }
+        Some(parsed)
     };
     let limit = match input.limit {
         Some(value) if value <= 0 => {
@@ -1240,8 +1347,15 @@ fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallErro
 }
 
 fn parse_task_status_arg(status: &str) -> Result<TaskStatus, ToolCallError> {
-    TaskStatus::parse(status)
-        .ok_or_else(|| ToolCallError::from_message(format!("Invalid params: unsupported task status '{status}'")))
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "pending" | "todo" | "open" => Ok(TaskStatus::Pending),
+        "in_progress" | "active" | "in_review" | "blocked" => Ok(TaskStatus::InProgress),
+        "completed" | "done" => Ok(TaskStatus::Completed),
+        "deleted" | "cancelled" | "canceled" => Ok(TaskStatus::Deleted),
+        _ => TaskStatus::parse(&normalized)
+            .ok_or_else(|| ToolCallError::from_message(format!("Invalid params: unsupported task status '{status}'"))),
+    }
 }
 
 fn json_text(value: &Value) -> Result<String, ToolCallError> {
@@ -1312,7 +1426,7 @@ async fn exec_spawn_agent(
             }))
             .map_err(TeamError::Json)
         })
-        .map_err(|e| ToolCallError::from_message(e.to_string()))
+        .map_err(ToolCallError::from_team_error)
 }
 
 /// Renders the mailbox notice a task owner receives when a task becomes theirs
@@ -1423,7 +1537,7 @@ async fn exec_task_create(
             &input.blocked_by.unwrap_or_default(),
         )
         .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
 
     // Assigning a task to a teammate notifies and wakes it (gated: skips blocked
     // tasks, which wake later via the upstream-completion unblock path).
@@ -1454,7 +1568,7 @@ async fn exec_task_update(
             input.blocked_by,
         )
         .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
 
     // A (re)assignment to a teammate notifies the new owner.
     if reassigned {
@@ -1482,7 +1596,7 @@ async fn exec_task_update(
         if let Some(svc) = service.upgrade() {
             svc.send_agent_message_from_agent(team_id, caller_slot_id, &lead_slot_id, reply_text, files_opt)
                 .await
-                .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+                .map_err(ToolCallError::from_team_error)?;
         } else {
             scheduler
                 .mailbox
@@ -1496,7 +1610,7 @@ async fn exec_task_update(
                     files_opt.as_deref(),
                 )
                 .await
-                .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+                .map_err(ToolCallError::from_team_error)?;
         }
         reply_sent = true;
         reply_target = Some(lead_slot_id);
@@ -1515,7 +1629,7 @@ async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<Str
     let tasks = scheduler
         .list_tasks()
         .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     let mut output: Vec<Value> = tasks
         .iter()
         .filter(|task| match filters.owner.as_deref() {
@@ -1575,18 +1689,18 @@ async fn exec_rename_agent(
             .ok_or_else(|| ToolCallError::from_message(format!("No active session for team {team_id}")))?;
         svc.rename_agent(&user_id, team_id, &resolved_slot, &input.new_name)
             .await
-            .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+            .map_err(ToolCallError::from_team_error)?;
     } else {
         scheduler
             .rename_agent(&resolved_slot, &input.new_name)
             .await
-            .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+            .map_err(ToolCallError::from_team_error)?;
     }
 
     let agent = scheduler
         .get_agent(&resolved_slot)
         .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     json_text(&json!({
         "status": "ok",
         "action": "agent_renamed",
@@ -1611,11 +1725,11 @@ async fn exec_clear_agent_context(
     let user_id = service
         .team_owner_user_id(team_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
     let outcome = service
         .clear_agent_context_in_session(&user_id, team_id, &target_slot_id)
         .await
-        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
 
     json_text(&json!({
         "status": "ok",
@@ -1651,7 +1765,7 @@ async fn exec_shutdown_agent(
     service
         .shutdown_agent_in_session(team_id, caller_slot_id, &target_slot_id, input.reason)
         .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        .map_err(ToolCallError::from_team_error)?;
 
     json_text(&json!({
         "status": "ok",

@@ -15,7 +15,7 @@ use aionui_common::{AgentType, ApiError, ProviderWithModel};
 use aionui_conversation::ConversationService;
 use aionui_db::custom_bridge_schema::{
     CreateActionInboxParams, SettleSlotEconomyParams, SlotWalletFacts, UpsertTeamContextPrefParams, WalletType,
-    classify_slot_wallet_facts,
+    classify_slot_wallet_facts, slot_has_custom_api_key,
 };
 use aionui_db::{
     IAgentMetadataRepository, IConversationRepository, IProviderRepository, ITeamRepository,
@@ -177,6 +177,8 @@ pub struct TeamContextStatusResponse {
     #[serde(default)]
     pub auto_fallback_free_cli: bool,
     #[serde(default)]
+    pub enforce_hard_cap_on_cli: bool,
+    #[serde(default)]
     pub total_wakeup_turns: i64,
     #[serde(default)]
     pub total_input_tokens: i64,
@@ -219,6 +221,8 @@ pub struct CompactTeamContextRequest {
     pub max_turn_hops_per_run: Option<i64>,
     #[serde(default)]
     pub auto_fallback_free_cli: Option<bool>,
+    #[serde(default)]
+    pub enforce_hard_cap_on_cli: Option<bool>,
     #[serde(default)]
     pub force_interrupt: Option<bool>,
 }
@@ -350,12 +354,72 @@ pub struct AnchoredExtractionResult {
 pub struct AnchoredHandoverEngine;
 
 impl AnchoredHandoverEngine {
-    /// Scrubs API keys and auth tokens (`sk-[A-Za-z0-9_-]+`, `Bearer <tok>`, `api[_-]?key[:=]<tok>`)
+    /// Scrubs API keys and auth tokens (`sk-[A-Za-z0-9_-]+`, `Bearer <tok>`, `api[_-]?key[:=]<tok>`,
+    /// and Telegram BotFather tokens `(?:bot)?\d{6,15}(?::|%3[Aa])[A-Za-z0-9_-]{30,64}`)
     /// from deterministic summaries before persisting or injecting into prompts.
     pub fn scrub_secrets(input: &str) -> String {
-        let step1 = Self::scrub_sk_tokens(input);
+        let step0 = Self::scrub_botfather_tokens(input);
+        let step1 = Self::scrub_sk_tokens(&step0);
         let step2 = Self::scrub_bearer_tokens(&step1);
         Self::scrub_api_key_assignments(&step2)
+    }
+
+    fn scrub_botfather_tokens(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len);
+        let mut i = 0;
+
+        while i < len {
+            let candidate = if i + 4 <= len && &bytes[i..i + 3] == b"bot" && bytes[i + 3].is_ascii_digit() {
+                Some((true, i + 3))
+            } else if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
+                Some((false, i))
+            } else {
+                None
+            };
+
+            if let Some((has_bot_prefix, digits_start)) = candidate {
+                let mut digits_end = digits_start;
+                while digits_end < len && bytes[digits_end].is_ascii_digit() {
+                    digits_end += 1;
+                }
+                if (6..=15).contains(&(digits_end - digits_start)) {
+                    let sec_start_opt = if digits_end < len && bytes[digits_end] == b':' {
+                        Some(digits_end + 1)
+                    } else if digits_end + 3 <= len
+                        && bytes[digits_end] == b'%'
+                        && bytes[digits_end + 1] == b'3'
+                        && matches!(bytes[digits_end + 2], b'A' | b'a')
+                    {
+                        Some(digits_end + 3)
+                    } else {
+                        None
+                    };
+
+                    if let Some(sec_start) = sec_start_opt {
+                        let mut sec_end = sec_start;
+                        while sec_end < len
+                            && (bytes[sec_end].is_ascii_alphanumeric()
+                                || bytes[sec_end] == b'_'
+                                || bytes[sec_end] == b'-')
+                        {
+                            sec_end += 1;
+                        }
+                        if (30..=64).contains(&(sec_end - sec_start)) {
+                            out.push_str(if has_bot_prefix { "bot[REDACTED]" } else { "[REDACTED]" });
+                            i = sec_end;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
     }
 
     fn scrub_sk_tokens(input: &str) -> String {
@@ -973,14 +1037,19 @@ impl TeamHubOrchestrator {
         presets
     }
 
-    pub fn infer_max_context_tokens(model_id: &str, provider_limit: Option<i64>) -> i64 {
+    pub fn infer_max_context_tokens(backend: &str, model_id: &str, provider_limit: Option<i64>) -> i64 {
         if let Some(limit) = provider_limit
             && limit > 0
         {
             return limit;
         }
         let lower = model_id.trim().to_ascii_lowercase();
+        let backend_lower = backend.trim().to_ascii_lowercase();
         if lower.contains("gemini") {
+            1_000_000
+        } else if (lower.is_empty() || lower == "default" || lower == backend_lower)
+            && matches!(backend_lower.as_str(), "antigravity" | "agy" | "gemini" | "gemini-cli")
+        {
             1_000_000
         } else if lower.contains("mini")
             || lower.contains("haiku")
@@ -990,6 +1059,20 @@ impl TeamHubOrchestrator {
             128_000
         } else {
             DEFAULT_CONTEXT_WINDOW_TOKENS
+        }
+    }
+
+    pub fn compute_effective_compact_limit_tokens(
+        wallet_type: WalletType,
+        max_tokens: i64,
+        threshold_pct: i64,
+        economy_cap_tokens: i64,
+        enforce_hard_cap_on_cli: bool,
+    ) -> i64 {
+        let pct_limit = ((max_tokens * threshold_pct) / 100).max(1);
+        match wallet_type {
+            WalletType::CliSubscription if !enforce_hard_cap_on_cli => pct_limit,
+            _ => pct_limit.min(economy_cap_tokens),
         }
     }
 
@@ -1144,13 +1227,18 @@ impl TeamHubOrchestrator {
                 .unwrap_or(bare_id);
 
             let meta_row = self.agent_metadata_repo.get_for_user(user_id, &row.id).await.ok().flatten();
+            let has_custom_api_key = slot_has_custom_api_key(
+                None,
+                meta_row.as_ref().and_then(|m| m.env.as_deref()),
+                meta_row.as_ref().and_then(|m| m.env_override.as_deref()),
+            );
             let wallet_type = Self::classify_slot_wallet_ext(
                 backend,
                 "",
                 None,
                 backend,
                 meta_row.as_ref().and_then(|m| m.auth_methods.as_deref()),
-                false,
+                has_custom_api_key,
             )
             .as_str()
             .to_owned();
@@ -1625,10 +1713,39 @@ impl TeamHubOrchestrator {
 
             let max_tokens = reported_max
                 .filter(|&m| m > 0)
-                .unwrap_or_else(|| Self::infer_max_context_tokens(&model_id, provider_limit));
+                .unwrap_or_else(|| Self::infer_max_context_tokens(&backend, &model_id, provider_limit));
 
-            let pct_limit = ((max_tokens * pref.threshold_pct) / 100).max(1);
-            let effective_compact_limit_tokens = pct_limit.min(economy_cap_tokens);
+            let has_custom_api_key = slot_has_custom_api_key(
+                conv_row.as_ref().map(|c| c.extra.as_str()),
+                None,
+                None,
+            ) || self
+                .bridge_repo
+                .slot_has_custom_api_key_in_db(
+                    user_id,
+                    &member.conversation_id,
+                    &backend,
+                    member.assistant_id.as_deref(),
+                )
+                .await;
+
+            let wallet_type_enum = Self::classify_slot_wallet_ext(
+                &backend,
+                &member.assistant_backend,
+                provider_id.as_deref(),
+                &model_id,
+                None,
+                has_custom_api_key,
+            );
+            let wallet_type = wallet_type_enum.as_str().to_owned();
+
+            let effective_compact_limit_tokens = Self::compute_effective_compact_limit_tokens(
+                wallet_type_enum,
+                max_tokens,
+                pref.threshold_pct,
+                economy_cap_tokens,
+                pref.is_enforce_hard_cap_on_cli_enabled(),
+            );
 
             let anchor = anchors.get(&member.slot_id);
             let slot_econ = slot_economies.get(&member.slot_id);
@@ -1663,17 +1780,6 @@ impl TeamHubOrchestrator {
             } else {
                 "normal"
             }
-            .to_owned();
-
-            let wallet_type = Self::classify_slot_wallet_ext(
-                &backend,
-                &member.assistant_backend,
-                provider_id.as_deref(),
-                &model_id,
-                None,
-                false,
-            )
-            .as_str()
             .to_owned();
 
             let pending_model_swap = swaps.get(&member.slot_id).map(|s| ModelTargetSpec {
@@ -1736,6 +1842,7 @@ impl TeamHubOrchestrator {
                 24
             },
             auto_fallback_free_cli: pref.is_auto_fallback_free_cli_enabled(),
+            enforce_hard_cap_on_cli: pref.is_enforce_hard_cap_on_cli_enabled(),
             total_wakeup_turns,
             total_input_tokens,
             total_output_tokens,
@@ -1759,6 +1866,7 @@ impl TeamHubOrchestrator {
                 "coalesced_wakes_saved": status.coalesced_wakes_saved,
                 "max_turn_hops_per_run": status.max_turn_hops_per_run,
                 "auto_fallback_free_cli": status.auto_fallback_free_cli,
+                "enforce_hard_cap_on_cli": status.enforce_hard_cap_on_cli,
                 "total_wakeup_turns": status.total_wakeup_turns,
                 "total_input_tokens": status.total_input_tokens,
                 "total_output_tokens": status.total_output_tokens,
@@ -1793,7 +1901,8 @@ impl TeamHubOrchestrator {
             || req.economy_mode.is_some()
             || req.max_context_tokens.is_some()
             || req.max_turn_hops_per_run.is_some()
-            || req.auto_fallback_free_cli.is_some();
+            || req.auto_fallback_free_cli.is_some()
+            || req.enforce_hard_cap_on_cli.is_some();
 
         if has_pref_patch {
             pref = self
@@ -1806,6 +1915,7 @@ impl TeamHubOrchestrator {
                     max_context_tokens: req.max_context_tokens,
                     max_turn_hops_per_run: req.max_turn_hops_per_run,
                     auto_fallback_free_cli: req.auto_fallback_free_cli,
+                    enforce_hard_cap_on_cli: req.enforce_hard_cap_on_cli,
                 })
                 .await
                 .map_err(|e| ApiError::Internal(format!("Failed to update context prefs: {e}")))?;
@@ -2572,13 +2682,22 @@ impl TeamHubOrchestrator {
                 slot_model_id = m.model.clone();
                 slot_backend = m.backend.clone();
                 slot_role = m.role.clone();
+                let has_custom_api_key = self
+                    .bridge_repo
+                    .slot_has_custom_api_key_in_db(
+                        user_id,
+                        conversation_id,
+                        &m.backend,
+                        m.assistant_id.as_deref(),
+                    )
+                    .await;
                 slot_wallet = Self::classify_slot_wallet_ext(
                     &m.backend,
                     &m.assistant_backend,
                     None,
                     &m.model,
                     None,
-                    false,
+                    has_custom_api_key,
                 );
             }
             let prev_econ = self
@@ -2623,6 +2742,9 @@ impl TeamHubOrchestrator {
                     .or_else(|| v.get("total_tokens"))
                     .and_then(serde_json::Value::as_i64)
             });
+            let reported_turn_total_tokens = meta_obj
+                .and_then(|m| m.get("turn_total_tokens").or_else(|| m.get("turnTotalTokens")))
+                .and_then(serde_json::Value::as_i64);
             let reported_input_tokens = meta_obj
                 .and_then(|m| m.get("input_tokens").or_else(|| m.get("inputTokens")))
                 .or_else(|| usage_val.as_ref().and_then(|v| v.get("input_tokens").or_else(|| v.get("inputTokens"))))
@@ -2658,6 +2780,7 @@ impl TeamHubOrchestrator {
                         current_msg_count: msg_count,
                         current_char_sum: total_bytes,
                         reported_total_tokens,
+                        reported_turn_total_tokens,
                         reported_input_tokens,
                         reported_output_tokens,
                         reported_cached_read_tokens,
@@ -2786,6 +2909,7 @@ impl TeamHubOrchestrator {
                     max_context_tokens: None,
                     max_turn_hops_per_run: None,
                     auto_fallback_free_cli: None,
+                    enforce_hard_cap_on_cli: None,
                     force_interrupt: Some(false),
                 },
             )
@@ -2810,5 +2934,114 @@ mod tests {
         assert!(scrubbed.contains("[REDACTED_SECRET]"));
         assert!(scrubbed.contains("Bearer [REDACTED_TOKEN]"));
         assert!(scrubbed.contains("api_key=[REDACTED_KEY]"));
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_prefixed_unprefixed_and_url_encoded_botfather_tokens() {
+        let raw = "Telegram failed on https://api.telegram.org/bot7123456789:AAH_abcdefghijklmnopqrstuvwxyz012345/getUpdates \
+                   and https://api.telegram.org/file/bot8123456789%3ABBH_0123456789abcdefghijklmnopqrstuv/doc.pdf \
+                   plus raw 9123456789:CCH_abcdefghijklmnopqrstuvwxyz987654 and 6123456789%3aDDH_abcdefghijklmnopqrstuvwxyz456789 \
+                   at src/api.rs:123 on 2026-11-12T15:22:55Z";
+        let scrubbed = AnchoredHandoverEngine::scrub_secrets(raw);
+        for leaked in [
+            "7123456789",
+            "8123456789",
+            "9123456789",
+            "6123456789",
+            "AAH_abcdefghijklmnopqrstuvwxyz012345",
+            "BBH_0123456789abcdefghijklmnopqrstuv",
+            "CCH_abcdefghijklmnopqrstuvwxyz987654",
+            "DDH_abcdefghijklmnopqrstuvwxyz456789",
+        ] {
+            assert!(!scrubbed.contains(leaked), "leaked {leaked}: {scrubbed}");
+        }
+        assert!(scrubbed.contains("bot[REDACTED]/getUpdates"), "{scrubbed}");
+        assert!(scrubbed.contains("file/bot[REDACTED]/doc.pdf"), "{scrubbed}");
+        assert!(scrubbed.contains("src/api.rs:123"), "{scrubbed}");
+        assert!(scrubbed.contains("2026-11-12T15:22:55Z"), "{scrubbed}");
+    }
+
+    #[test]
+    fn infer_max_context_tokens_scopes_default_1m_to_antigravity_and_gemini() {
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("antigravity", "default", None),
+            1_000_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("gemini", "default", None),
+            1_000_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("gemini-cli", "", None),
+            1_000_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("claude", "default", None),
+            200_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("codex", "default", None),
+            200_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("claude", "claude-3-5-haiku", None),
+            128_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::infer_max_context_tokens("aionrs", "custom-model", Some(256_000)),
+            256_000
+        );
+    }
+
+    #[test]
+    fn cli_subscription_uses_window_pct_while_api_key_enforces_economy_cap() {
+        // $0 CLI OAuth on 1M window @ 80% -> 800,000 (not 160,000!) unless opt-in `enforce_hard_cap_on_cli`
+        assert_eq!(
+            TeamHubOrchestrator::compute_effective_compact_limit_tokens(
+                WalletType::CliSubscription,
+                1_000_000,
+                80,
+                160_000,
+                false,
+            ),
+            800_000
+        );
+        assert_eq!(
+            TeamHubOrchestrator::compute_effective_compact_limit_tokens(
+                WalletType::CliSubscription,
+                1_000_000,
+                80,
+                160_000,
+                true,
+            ),
+            160_000
+        );
+        // Paid API key on 1M window @ 80% -> capped at `max_context_tokens` (160,000)
+        assert_eq!(
+            TeamHubOrchestrator::compute_effective_compact_limit_tokens(
+                WalletType::ApiKey,
+                1_000_000,
+                80,
+                160_000,
+                false,
+            ),
+            160_000
+        );
+
+        // Shared `slot_has_custom_api_key` elevates CLI slot to `WalletType::ApiKey`
+        let has_key = slot_has_custom_api_key(
+            Some(r#"{"custom_env":{"ANTHROPIC_API_KEY":"sk-ant-live"}}"#),
+            None,
+            None,
+        );
+        assert!(has_key);
+        assert_eq!(
+            TeamHubOrchestrator::classify_slot_wallet_ext("claude", "", None, "opus", None, has_key),
+            WalletType::ApiKey
+        );
+        assert_eq!(
+            TeamHubOrchestrator::classify_slot_wallet_ext("claude", "", None, "opus", None, false),
+            WalletType::CliSubscription
+        );
     }
 }

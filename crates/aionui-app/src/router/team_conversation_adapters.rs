@@ -432,6 +432,13 @@ impl TeamProjectionMessageStore for TeamConversationAdapters {
             .await
             .map_err(map_conversation_update_error)
     }
+
+    async fn insert_projected_message_if_absent(&self, row: &MessageRow) -> Result<bool, TeamError> {
+        self.conversation_service
+            .insert_raw_message_if_absent(&self.require_owner_user_id(&row.conversation_id).await?, row)
+            .await
+            .map_err(map_conversation_update_error)
+    }
 }
 
 #[async_trait]

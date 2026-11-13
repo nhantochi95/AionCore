@@ -212,6 +212,85 @@ pub(crate) fn pid_signal_target(pid: u32) -> Option<i32> {
 /// case `pgid as i32` wraps negative and `-(negative)` becomes POSITIVE, so the
 /// group-kill would silently collapse into a single-PID kill and leak the
 /// grandchild subtree (F50). Pure; unit-tested.
+/// POSIX errno constants for pure cross-platform decision helpers.
+/// On Unix these bind to `libc::ESRCH` / `libc::EPERM`; on non-Unix hosts they
+/// use the standard POSIX values (3 and 1) so the pure decision unit tests
+/// compile and execute identically on Windows and Unix.
+#[cfg(unix)]
+const POSIX_ESRCH: i32 = libc::ESRCH;
+#[cfg(not(unix))]
+#[cfg_attr(not(test), allow(dead_code))]
+const POSIX_ESRCH: i32 = 3;
+
+#[cfg(unix)]
+const POSIX_EPERM: i32 = libc::EPERM;
+#[cfg(not(unix))]
+#[cfg_attr(not(test), allow(dead_code))]
+const POSIX_EPERM: i32 = 1;
+
+/// Pure classification of `libc::kill(-pgid, sig)` for process-group signalling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+pub(crate) enum GroupSignalDecision {
+    /// Signal delivered to process group (`rc == 0`).
+    Delivered,
+    /// Process group already gone (`ESRCH`) — fall back to bare `pid`.
+    FallbackToPidEsrch,
+    /// macOS/Unix `EPERM` on `-pgid` (zombie group leader or child did not form
+    /// its own process group) — log at `debug!` and fall back to bare `pid`.
+    FallbackToPidEperm,
+    /// Unexpected OS error.
+    Failed,
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+pub(crate) fn classify_group_signal(rc: i32, raw_errno: Option<i32>) -> GroupSignalDecision {
+    if rc == 0 {
+        return GroupSignalDecision::Delivered;
+    }
+    match raw_errno {
+        Some(POSIX_ESRCH) => GroupSignalDecision::FallbackToPidEsrch,
+        Some(POSIX_EPERM) => GroupSignalDecision::FallbackToPidEperm,
+        _ => GroupSignalDecision::Failed,
+    }
+}
+
+/// Pure classification of `libc::kill(-pgid, 0)` for `process_group_alive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+pub(crate) enum GroupProbeDecision {
+    /// Group has at least one live signalable member (`rc == 0`).
+    Alive,
+    /// Group no longer exists (`ESRCH`).
+    Dead,
+    /// `EPERM` on `-pgid` (e.g. zombie group leader on macOS): do NOT blindly
+    /// report alive (which stalls `kill_and_wait` until timeout) — fall back to
+    /// probing the bare leader `pid` via `libc::kill(pid, 0)`.
+    FallbackToPidProbe,
+    /// Unexpected errno — treat conservatively as alive.
+    AliveOtherErrno,
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+pub(crate) fn classify_group_probe(rc: i32, raw_errno: Option<i32>) -> GroupProbeDecision {
+    if rc == 0 {
+        return GroupProbeDecision::Alive;
+    }
+    match raw_errno {
+        Some(POSIX_ESRCH) => GroupProbeDecision::Dead,
+        Some(POSIX_EPERM) => GroupProbeDecision::FallbackToPidProbe,
+        _ => GroupProbeDecision::AliveOtherErrno,
+    }
+}
+
+/// Pure classification of fallback `libc::kill(pid, 0)` after `-pgid` returned `EPERM`.
+/// For a same-UID child process, `rc == 0` means still present; `ESRCH` means gone;
+/// `EPERM` means the PID was recycled onto a foreign-UID process (not our group).
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+pub(crate) fn classify_pid_probe_fallback(rc: i32, _raw_errno: Option<i32>) -> bool {
+    rc == 0
+}
+
 #[cfg(unix)]
 pub(crate) fn group_kill_target(pgid: u32) -> Option<i32> {
     if pgid <= 1 {
@@ -222,26 +301,46 @@ pub(crate) fn group_kill_target(pgid: u32) -> Option<i32> {
 }
 
 /// Force-kill a process group (or the bare pid if no group), best-effort.
-/// `ESRCH` (already gone) is treated as success. Honors the `pgid > 1`
-/// blast-floor (IC-6) and refuses to wrap large ids (F50).
+/// `ESRCH` (already gone) is treated as success; `EPERM` on `-pgid` falls back
+/// to the bare `pid` and logs at `debug!`. Honors the `pgid > 1` blast-floor
+/// (IC-6) and refuses to wrap large ids (F50).
 pub fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), ProcessError> {
     #[cfg(unix)]
     {
         if let Some(target) = process_group_id.and_then(group_kill_target) {
-            return kill_target(target).or_else(|e| {
-                // Group leader may already be gone; fall back to the bare pid.
-                if e.already_gone {
-                    match pid_signal_target(pid) {
-                        Some(t) => kill_target(t).map_err(|e| e.into()),
-                        None => Ok(()), // pid out of i32 range — nothing safe to do
-                    }
-                } else {
-                    Err(e.into())
+            let rc = unsafe { libc::kill(target, libc::SIGKILL) };
+            let err = if rc == 0 {
+                None
+            } else {
+                Some(std::io::Error::last_os_error())
+            };
+            let raw_errno = err.as_ref().and_then(std::io::Error::raw_os_error);
+            return match classify_group_signal(rc, raw_errno) {
+                GroupSignalDecision::Delivered => Ok(()),
+                GroupSignalDecision::FallbackToPidEsrch => {
+                    tracing::debug!(
+                        pid,
+                        ?process_group_id,
+                        "SIGKILL to -pgid returned ESRCH; falling back to bare pid"
+                    );
+                    kill_pid_best_effort(pid)
                 }
-            });
+                GroupSignalDecision::FallbackToPidEperm => {
+                    tracing::debug!(
+                        pid,
+                        ?process_group_id,
+                        "SIGKILL to -pgid returned EPERM; falling back to bare pid"
+                    );
+                    kill_pid_best_effort(pid)
+                }
+                GroupSignalDecision::Failed => {
+                    let detail = err.map(|e| e.to_string()).unwrap_or_else(|| "unknown os error".into());
+                    Err(ProcessError::internal(format!("SIGKILL to {target} failed: {detail}")))
+                }
+            };
         }
         match pid_signal_target(pid) {
-            Some(t) => kill_target(t).map_err(Into::into),
+            Some(t) => kill_pid_target(t),
             None => Err(ProcessError::internal(format!("pid {pid} out of signalable i32 range"))),
         }
     }
@@ -264,20 +363,15 @@ pub fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), Process
 }
 
 #[cfg(unix)]
-struct KillErr {
-    already_gone: bool,
-    msg: String,
-}
-
-#[cfg(unix)]
-impl From<KillErr> for ProcessError {
-    fn from(e: KillErr) -> Self {
-        ProcessError::internal(e.msg)
+fn kill_pid_best_effort(pid: u32) -> Result<(), ProcessError> {
+    match pid_signal_target(pid) {
+        Some(t) => kill_pid_target(t),
+        None => Ok(()), // pid out of i32 range — nothing safe to do
     }
 }
 
 #[cfg(unix)]
-fn kill_target(target: i32) -> Result<(), KillErr> {
+fn kill_pid_target(target: i32) -> Result<(), ProcessError> {
     let rc = unsafe { libc::kill(target, libc::SIGKILL) };
     if rc == 0 {
         return Ok(());
@@ -286,26 +380,47 @@ fn kill_target(target: i32) -> Result<(), KillErr> {
     if err.raw_os_error() == Some(libc::ESRCH) {
         return Ok(()); // already gone == success
     }
-    Err(KillErr {
-        already_gone: false,
-        msg: format!("SIGKILL to {target} failed: {err}"),
-    })
+    Err(ProcessError::internal(format!("SIGKILL to {target} failed: {err}")))
 }
 
 /// Liveness of a process group by signal-0 to the negative pgid (Unix).
-/// `true` if the group still has any member. Non-Unix / no pgid → false.
+/// `true` if the group still has any member. On `EPERM` (e.g. macOS zombie group
+/// leader), falls back to probing `libc::kill(pid as i32, 0)` instead of blindly
+/// returning `true`. Non-Unix / no pgid → false.
 pub fn process_group_alive(process_group_id: Option<u32>) -> bool {
     #[cfg(unix)]
     {
-        match process_group_id.and_then(group_kill_target) {
-            Some(target) => {
-                let rc = unsafe { libc::kill(target, 0) };
-                if rc == 0 {
-                    return true;
-                }
-                !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+        let Some(pgid) = process_group_id else {
+            return false;
+        };
+        let Some(target) = group_kill_target(pgid) else {
+            return false;
+        };
+        let rc = unsafe { libc::kill(target, 0) };
+        let raw_errno = if rc == 0 {
+            None
+        } else {
+            std::io::Error::last_os_error().raw_os_error()
+        };
+        match classify_group_probe(rc, raw_errno) {
+            GroupProbeDecision::Alive | GroupProbeDecision::AliveOtherErrno => true,
+            GroupProbeDecision::Dead => false,
+            GroupProbeDecision::FallbackToPidProbe => {
+                tracing::debug!(
+                    pgid,
+                    "kill(-pgid, 0) returned EPERM; falling back to bare pid liveness check"
+                );
+                let Some(pid_target) = pid_signal_target(pgid) else {
+                    return false;
+                };
+                let pid_rc = unsafe { libc::kill(pid_target, 0) };
+                let pid_errno = if pid_rc == 0 {
+                    None
+                } else {
+                    std::io::Error::last_os_error().raw_os_error()
+                };
+                classify_pid_probe_fallback(pid_rc, pid_errno)
             }
-            None => false,
         }
     }
     #[cfg(not(unix))]
@@ -463,5 +578,49 @@ mod windows_impl {
             None => Ok(()),
             Some(e) => Err(ProcessError::internal(format!("TerminateProcess({pid}) failed: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GroupProbeDecision, GroupSignalDecision, POSIX_EPERM, POSIX_ESRCH, classify_group_probe,
+        classify_group_signal, classify_pid_probe_fallback,
+    };
+
+    #[test]
+    fn group_signal_decision_handles_esrch_eperm_and_other_errnos() {
+        assert_eq!(classify_group_signal(0, None), GroupSignalDecision::Delivered);
+        assert_eq!(
+            classify_group_signal(-1, Some(POSIX_ESRCH)),
+            GroupSignalDecision::FallbackToPidEsrch
+        );
+        assert_eq!(
+            classify_group_signal(-1, Some(POSIX_EPERM)),
+            GroupSignalDecision::FallbackToPidEperm
+        );
+        assert_eq!(classify_group_signal(-1, Some(22)), GroupSignalDecision::Failed);
+        assert_eq!(classify_group_signal(-1, None), GroupSignalDecision::Failed);
+    }
+
+    #[test]
+    fn group_probe_decision_falls_back_to_pid_on_eperm_instead_of_stalling() {
+        assert_eq!(classify_group_probe(0, None), GroupProbeDecision::Alive);
+        assert_eq!(classify_group_probe(-1, Some(POSIX_ESRCH)), GroupProbeDecision::Dead);
+        assert_eq!(
+            classify_group_probe(-1, Some(POSIX_EPERM)),
+            GroupProbeDecision::FallbackToPidProbe
+        );
+        assert_eq!(
+            classify_group_probe(-1, Some(22)),
+            GroupProbeDecision::AliveOtherErrno
+        );
+    }
+
+    #[test]
+    fn pid_probe_fallback_distinguishes_live_from_esrch_and_recycled_eperm() {
+        assert!(classify_pid_probe_fallback(0, None));
+        assert!(!classify_pid_probe_fallback(-1, Some(POSIX_ESRCH)));
+        assert!(!classify_pid_probe_fallback(-1, Some(POSIX_EPERM)));
     }
 }

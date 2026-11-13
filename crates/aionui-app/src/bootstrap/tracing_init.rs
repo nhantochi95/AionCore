@@ -325,10 +325,163 @@ impl DailyDatedLogWriter {
     }
 }
 
+fn may_contain_secret_token(buf: &[u8]) -> bool {
+    let len = buf.len();
+    let mut idx = 0;
+    while idx < len {
+        match buf[idx] {
+            b':' | b'%' if idx > 0 && buf[idx - 1].is_ascii_digit() => return true,
+            b's' if idx + 3 <= len && &buf[idx..idx + 3] == b"sk-" => return true,
+            b'b' | b'B' => {
+                if idx + 3 <= len && buf[idx..idx + 3].eq_ignore_ascii_case(b"bot") {
+                    return true;
+                }
+                if idx + 7 <= len
+                    && buf[idx..idx + 6].eq_ignore_ascii_case(b"bearer")
+                    && buf[idx + 6].is_ascii_whitespace()
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn is_token_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn is_bearer_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+}
+
+fn scrub_log_secrets(input: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out: Option<String> = None;
+    let mut last_copied = 0;
+    let mut i = 0;
+
+    while i < len {
+        // 1. BotFather token: (?:bot)?\d{6,15}(?::|%3[Aa])[A-Za-z0-9_-]{30,64}
+        let bot_candidate = if i + 4 <= len && &bytes[i..i + 3] == b"bot" && bytes[i + 3].is_ascii_digit() {
+            Some((true, i + 3))
+        } else if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
+            Some((false, i))
+        } else {
+            None
+        };
+
+        if let Some((has_bot_prefix, digits_start)) = bot_candidate {
+            let mut digits_end = digits_start;
+            while digits_end < len && bytes[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            let digit_len = digits_end - digits_start;
+            if (6..=15).contains(&digit_len) {
+                let sec_start_opt = if digits_end < len && bytes[digits_end] == b':' {
+                    Some(digits_end + 1)
+                } else if digits_end + 3 <= len
+                    && bytes[digits_end] == b'%'
+                    && bytes[digits_end + 1] == b'3'
+                    && matches!(bytes[digits_end + 2], b'A' | b'a')
+                {
+                    Some(digits_end + 3)
+                } else {
+                    None
+                };
+
+                if let Some(sec_start) = sec_start_opt {
+                    let mut sec_end = sec_start;
+                    while sec_end < len && is_token_ident_byte(bytes[sec_end]) {
+                        sec_end += 1;
+                    }
+                    let sec_len = sec_end - sec_start;
+                    if (30..=64).contains(&sec_len) {
+                        let buf_out = out.get_or_insert_with(|| String::with_capacity(len));
+                        buf_out.push_str(&input[last_copied..i]);
+                        buf_out.push_str(if has_bot_prefix { "bot[REDACTED]" } else { "[REDACTED]" });
+                        i = sec_end;
+                        last_copied = sec_end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 2. OpenAI-style key: sk-[A-Za-z0-9_-]{20,}
+        if i + 23 <= len
+            && &bytes[i..i + 3] == b"sk-"
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut sec_end = i + 3;
+            while sec_end < len && is_token_ident_byte(bytes[sec_end]) {
+                sec_end += 1;
+            }
+            if sec_end - (i + 3) >= 20 {
+                let buf_out = out.get_or_insert_with(|| String::with_capacity(len));
+                buf_out.push_str(&input[last_copied..i]);
+                buf_out.push_str("sk-[REDACTED]");
+                i = sec_end;
+                last_copied = sec_end;
+                continue;
+            }
+        }
+
+        // 3. Bearer token: Bearer\s+[A-Za-z0-9._~+/=-]{20,}
+        if i + 27 <= len
+            && bytes[i..i + 6].eq_ignore_ascii_case(b"bearer")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && bytes[i + 6].is_ascii_whitespace()
+        {
+            let mut ws_end = i + 6;
+            while ws_end < len && matches!(bytes[ws_end], b' ' | b'\t') {
+                ws_end += 1;
+            }
+            let mut tok_end = ws_end;
+            while tok_end < len && is_bearer_token_byte(bytes[tok_end]) {
+                tok_end += 1;
+            }
+            if tok_end - ws_end >= 20 {
+                let buf_out = out.get_or_insert_with(|| String::with_capacity(len));
+                buf_out.push_str(&input[last_copied..i]);
+                buf_out.push_str("Bearer [REDACTED]");
+                i = tok_end;
+                last_copied = tok_end;
+                continue;
+            }
+        }
+
+        let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+        i += ch.len_utf8();
+    }
+
+    match out {
+        Some(mut redacted) => {
+            redacted.push_str(&input[last_copied..]);
+            std::borrow::Cow::Owned(redacted)
+        }
+        None => std::borrow::Cow::Borrowed(input),
+    }
+}
+
 impl Write for DailyDatedLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.active_file()?.write_all(buf)?;
-        Ok(buf.len())
+        if !may_contain_secret_token(buf) {
+            return self.active_file()?.write(buf);
+        }
+
+        let decoded = String::from_utf8_lossy(buf);
+        match scrub_log_secrets(&decoded) {
+            std::borrow::Cow::Borrowed(_) => self.active_file()?.write(buf),
+            std::borrow::Cow::Owned(redacted) => {
+                self.active_file()?.write_all(redacted.as_bytes())?;
+                Ok(buf.len())
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -536,5 +689,123 @@ mod tests {
             .expect("bootstrap must survive an unusable custom log dir");
 
         assert!(dated_log_dir(&default).is_dir());
+    }
+
+    #[test]
+    fn daily_dated_log_writer_redacts_jsonl_tokens_without_short_write_corruption_or_false_positives() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let fixed_day = LogDate {
+            year: 2026,
+            month: 11,
+            day: 12,
+        };
+        let mut writer = DailyDatedLogWriter::new_with_date_provider(
+            tmp.path().to_path_buf(),
+            "aioncore.log",
+            Box::new(move || fixed_day),
+        );
+
+        let prefixed = "bot7123456789:AAH_abcdefghijklmnopqrstuvwxyz012345";
+        let unprefixed = "8123456789:BBH_0123456789abcdefghijklmnopqrstuv";
+        let encoded_upper = "bot9123456789%3ACCH_abcdefghijklmnopqrstuvwxyz987654";
+        let encoded_lower = "6123456789%3aDDH_abcdefghijklmnopqrstuvwxyz456789";
+        let sk_secret = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        let bearer_secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0";
+
+        let line1 = serde_json::json!({
+            "timestamp": "2026-11-12T15:22:55Z",
+            "level": "WARN",
+            "target": "aionui_channel::plugins::telegram::api",
+            "location": "crates/aionui-channel/src/plugins/telegram/api.rs:123",
+            "fields": {
+                "prefixed_url": format!("https://api.telegram.org/{prefixed}/getUpdates?timeout=30"),
+                "unprefixed_raw": format!("token={unprefixed}"),
+                "encoded_file_url": format!("https://api.telegram.org/file/{encoded_upper}/photos/img.png"),
+                "encoded_lower": encoded_lower,
+                "openai": sk_secret,
+                "auth": format!("Bearer {bearer_secret}"),
+                "safe_endpoint": "http://127.0.0.1:25810/health",
+            }
+        })
+        .to_string()
+            + "\n";
+
+        let line2 = serde_json::json!({
+            "timestamp": "2026-11-12T15:23:01.987654Z",
+            "level": "INFO",
+            "fields": {
+                "source": "file.rs:123",
+                "other_source": "main.rs:42",
+                "message": "normal log line without secrets"
+            }
+        })
+        .to_string()
+            + "\n";
+
+        // write_all exercises the critical std::io::Write Ok(buf.len()) contract when shrunk!
+        std::io::Write::write_all(&mut writer, line1.as_bytes()).expect("write_all line1");
+        std::io::Write::write_all(&mut writer, line2.as_bytes()).expect("write_all line2");
+        std::io::Write::flush(&mut writer).expect("flush");
+
+        let log_path = tmp.path().join("2026/11/12/2026-11-12.aioncore.log");
+        let content = std::fs::read_to_string(log_path).expect("read written log");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "shrunk write must not duplicate trailing bytes or split lines: {content}"
+        );
+
+        // (a) Tokens are redacted
+        for secret in [
+            "7123456789",
+            "8123456789",
+            "9123456789",
+            "6123456789",
+            "AAH_abcdefghijklmnopqrstuvwxyz012345",
+            "BBH_0123456789abcdefghijklmnopqrstuv",
+            "CCH_abcdefghijklmnopqrstuvwxyz987654",
+            "DDH_abcdefghijklmnopqrstuvwxyz456789",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz012345",
+            bearer_secret,
+        ] {
+            assert!(!content.contains(secret), "log leaked {secret}: {content}");
+        }
+
+        // (b) Both lines remain valid parseable JSON without duplicated suffixes
+        let parsed1: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("redacted line 1 must remain valid JSONL");
+        let parsed2: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("line 2 must remain valid JSONL");
+
+        assert!(
+            parsed1["fields"]["prefixed_url"]
+                .as_str()
+                .unwrap()
+                .contains("bot[REDACTED]/getUpdates"),
+            "{parsed1}"
+        );
+        assert_eq!(parsed1["fields"]["unprefixed_raw"], "token=[REDACTED]");
+        assert!(
+            parsed1["fields"]["encoded_file_url"]
+                .as_str()
+                .unwrap()
+                .contains("file/bot[REDACTED]/photos/img.png"),
+            "{parsed1}"
+        );
+        assert_eq!(parsed1["fields"]["encoded_lower"], "[REDACTED]");
+        assert_eq!(parsed1["fields"]["openai"], "sk-[REDACTED]");
+        assert_eq!(parsed1["fields"]["auth"], "Bearer [REDACTED]");
+
+        // (c) Rust file.rs:123, localhost:port, and ISO timestamps are NOT false-positively redacted
+        assert_eq!(parsed1["timestamp"], "2026-11-12T15:22:55Z");
+        assert_eq!(
+            parsed1["location"],
+            "crates/aionui-channel/src/plugins/telegram/api.rs:123"
+        );
+        assert_eq!(parsed1["fields"]["safe_endpoint"], "http://127.0.0.1:25810/health");
+        assert_eq!(parsed2["timestamp"], "2026-11-12T15:23:01.987654Z");
+        assert_eq!(parsed2["fields"]["source"], "file.rs:123");
+        assert_eq!(parsed2["fields"]["other_source"], "main.rs:42");
     }
 }

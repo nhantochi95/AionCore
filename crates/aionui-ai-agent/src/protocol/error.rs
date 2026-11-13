@@ -299,7 +299,7 @@ impl AcpError {
             ErrorCode::ParseError => AcpError::ProtocolParseError { message: err.message },
             ErrorCode::InvalidRequest => AcpError::InvalidRequest { message: err.message },
             ErrorCode::ResourceNotFound => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(&err.message, err.data.as_ref(), context) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else if extract_resource_not_found(err.data.as_ref()).is_none() && is_session_load_method(context) {
                     AcpError::SessionNotFound {
@@ -316,14 +316,14 @@ impl AcpError {
                 method: context.to_owned(),
             },
             ErrorCode::InvalidParams => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(&err.message, err.data.as_ref(), context) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::InvalidParams { message: err.message }
                 }
             }
             ErrorCode::InternalError => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(&err.message, err.data.as_ref(), context) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::AgentInternal {
@@ -341,7 +341,7 @@ impl AcpError {
                     AcpError::SessionNotFound {
                         session_id: context.to_owned(),
                     }
-                } else if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                } else if let Some(sid) = extract_session_not_found(&err.message, err.data.as_ref(), context) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::OtherProtocolError {
@@ -359,34 +359,64 @@ fn is_session_load_method(context: &str) -> bool {
     context == "session/load"
 }
 
-/// If `data` carries a `{"error": "Session not found: <sid>"}` payload
-/// (either as a JSON object or as a JSON-string-of-JSON, which is what
-/// OpenCode actually emits — see ELECTRON-1HQ), return the session id.
-/// Returns `None` for any other shape so callers can fall through to
-/// the default `code`-based mapping.
-/// Pull a stale session id out of a JSON-RPC `data` payload.
+/// Detect stale/orphaned session errors from both `err.data` (recursively across
+/// objects, arrays, and JSON-encoded strings) and `err.message`.
 ///
-/// Matches on the VALUE, not on a key name. Agents disagree about where they
-/// put this string — OpenCode/Codex use `error`, glm-acp-agent uses `details`
-/// — and a fixed key list fails closed: the payload degrades to
-/// `AgentInternal`, `is_acp_session_not_found` returns false, and the
-/// `session/load` rebuild in `open_session_resume` never fires. The stale id
-/// then survives on disk and every later turn replays it, so the real failure
-/// (live case: a missing `Z_AI_API_KEY`) stays permanently hidden behind
-/// `Session not found`. Scanning the object's string values keeps recovery
-/// working for agents we have never probed.
-fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String> {
-    let value = data?;
-    let obj = match value {
-        serde_json::Value::Object(_) => value.clone(),
-        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
-        _ => return None,
-    };
-    let prefix = "Session not found: ";
-    obj.as_object()?.values().filter_map(|v| v.as_str()).find_map(|msg| {
-        let sid = msg.strip_prefix(prefix)?.trim();
-        (!sid.is_empty()).then(|| sid.to_owned())
-    })
+/// Recognises case-insensitive `"session not found"`, `"invalid session identifier"`,
+/// and `"no previous sessions found"` (Gemini CLI `-32603` / `-32602` / `-32002`
+/// resume failures as well as OpenCode/Codex/glm-acp-agent shapes).
+fn extract_session_not_found(
+    message: &str,
+    data: Option<&serde_json::Value>,
+    fallback_context: &str,
+) -> Option<String> {
+    if let Some(value) = data
+        && let Some(sid) = extract_session_not_found_from_value(value, fallback_context)
+    {
+        return Some(sid);
+    }
+    match_stale_session_text(message, fallback_context)
+}
+
+fn extract_session_not_found_from_value(value: &serde_json::Value, fallback_context: &str) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim_start();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(nested) = serde_json::from_str::<serde_json::Value>(s)
+                && let Some(sid) = extract_session_not_found_from_value(&nested, fallback_context)
+            {
+                return Some(sid);
+            }
+            match_stale_session_text(s, fallback_context)
+        }
+        serde_json::Value::Object(map) => map
+            .values()
+            .find_map(|v| extract_session_not_found_from_value(v, fallback_context)),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|v| extract_session_not_found_from_value(v, fallback_context)),
+        _ => None,
+    }
+}
+
+fn match_stale_session_text(text: &str, fallback_context: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(idx) = lower.find("session not found:") {
+        let after = text[idx + "session not found:".len()..].trim();
+        let sid = after.lines().next().unwrap_or("").trim();
+        if !sid.is_empty() {
+            return Some(sid.to_owned());
+        }
+        return Some(fallback_context.to_owned());
+    }
+    if lower.contains("session not found")
+        || lower.contains("invalid session identifier")
+        || lower.contains("no previous sessions found")
+    {
+        return Some(fallback_context.to_owned());
+    }
+    None
 }
 
 fn extract_resource_not_found(data: Option<&serde_json::Value>) -> Option<String> {
@@ -929,5 +959,29 @@ mod tests {
             !display.contains('\n'),
             "data must be appended on a single line, not pretty-printed; got {display}"
         );
+    }
+
+    fn acp_is_snf(sdk_err: &SdkError) -> bool {
+        matches!(AcpError::from_sdk(sdk_err.clone(), "ctx"), AcpError::SessionNotFound { .. })
+    }
+
+    #[test]
+    fn from_sdk_gemini_invalid_session_identifier_in_message_or_nested_data_is_session_not_found() {
+        let msg_only = SdkError::new(-32603, "Invalid session identifier \"eb484bc9-1111-2222-3333-444444444444\"");
+        match AcpError::from_sdk(msg_only, "eb484bc9-1111-2222-3333-444444444444") {
+            AcpError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "eb484bc9-1111-2222-3333-444444444444");
+            }
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+
+        let nested = SdkError::internal_error().data(serde_json::json!({
+            "error": {
+                "causes": [
+                    { "detail": "Error resuming session: No previous sessions found for this project." }
+                ]
+            }
+        }));
+        assert!(acp_is_snf(&nested), "nested Gemini resume failure must map to SessionNotFound");
     }
 }

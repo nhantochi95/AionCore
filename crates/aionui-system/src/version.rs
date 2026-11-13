@@ -3,7 +3,8 @@ use serde::Deserialize;
 
 use crate::error::SystemError;
 
-const DEFAULT_REPO: &str = "iOfficeAI/AionUi";
+const UPSTREAM_REPO: &str = "iOfficeAI/AionUi";
+const ENV_RAKAZO_GITHUB_REPO: &str = "RAKAZO_GITHUB_REPO";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Service that checks GitHub Releases for available updates.
@@ -14,6 +15,10 @@ pub struct VersionCheckService {
     /// Base URL for GitHub API. Defaults to `https://api.github.com`.
     /// Configurable for testing with mock servers.
     api_base: String,
+    /// Optional fallback repository when `RAKAZO_GITHUB_REPO` is unset.
+    /// `None` in default Rakazo fork runtime so upstream `iOfficeAI/AionUi`
+    /// is never queried unless explicitly configured via `RAKAZO_GITHUB_REPO`.
+    default_repo: Option<String>,
 }
 
 impl VersionCheckService {
@@ -22,22 +27,60 @@ impl VersionCheckService {
             http_client,
             current_version,
             api_base: GITHUB_API_BASE.to_owned(),
+            default_repo: None,
         }
     }
 
-    /// Create a service with a custom API base URL (for testing).
+    /// Create a service with a custom API base URL (for testing with mock servers).
     #[doc(hidden)]
     pub fn with_api_base(http_client: reqwest::Client, current_version: String, api_base: String) -> Self {
         Self {
             http_client,
             current_version,
             api_base,
+            default_repo: Some(UPSTREAM_REPO.to_owned()),
+        }
+    }
+
+    /// Create a service with a custom API base URL and explicit default repo policy.
+    #[doc(hidden)]
+    pub fn with_api_base_and_repo(
+        http_client: reqwest::Client,
+        current_version: String,
+        api_base: String,
+        default_repo: Option<String>,
+    ) -> Self {
+        Self {
+            http_client,
+            current_version,
+            api_base,
+            default_repo,
         }
     }
 
     /// Check for updates against GitHub Releases.
     pub async fn check_update(&self, req: &UpdateCheckRequest) -> Result<UpdateCheckResult, SystemError> {
-        let repo = resolve_repo(req.repo.as_deref());
+        let rakazo_env = std::env::var(ENV_RAKAZO_GITHUB_REPO).ok();
+        self.check_update_with_env_repo(req, rakazo_env.as_deref()).await
+    }
+
+    async fn check_update_with_env_repo(
+        &self,
+        req: &UpdateCheckRequest,
+        rakazo_env_repo: Option<&str>,
+    ) -> Result<UpdateCheckResult, SystemError> {
+        let Some(repo) = resolve_effective_repo(
+            req.repo.as_deref(),
+            rakazo_env_repo,
+            self.default_repo.as_deref(),
+        ) else {
+            return Ok(UpdateCheckResult {
+                current_version: self.current_version.clone(),
+                update_available: false,
+                latest: None,
+            });
+        };
+
         let releases = self.fetch_releases(&repo).await?;
 
         let current = parse_version(&self.current_version)
@@ -122,19 +165,35 @@ impl VersionCheckService {
     }
 }
 
-/// Resolve the GitHub repo from request or env or default.
-fn resolve_repo(from_request: Option<&str>) -> String {
-    if let Some(r) = from_request
-        && !r.is_empty()
-    {
-        return r.to_owned();
+/// Resolve the target GitHub repository according to Rakazo fork-safety policy.
+///
+/// When `RAKAZO_GITHUB_REPO` (`rakazo_env`) is unset/empty and `default_repo` is `None`
+/// (default production runtime), returns `None` unless a non-upstream custom repo was
+/// explicitly requested, ensuring zero calls to `api.github.com/repos/iOfficeAI/AionUi`.
+fn resolve_effective_repo(
+    from_request: Option<&str>,
+    rakazo_env: Option<&str>,
+    default_repo: Option<&str>,
+) -> Option<String> {
+    let env_repo = rakazo_env.map(str::trim).filter(|s| !s.is_empty());
+    let req_repo = from_request.map(str::trim).filter(|s| !s.is_empty());
+    let fallback_repo = default_repo.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(requested) = req_repo {
+        if requested.eq_ignore_ascii_case(UPSTREAM_REPO)
+            && env_repo.is_none_or(|r| !r.eq_ignore_ascii_case(UPSTREAM_REPO))
+            && fallback_repo.is_none()
+        {
+            return None;
+        }
+        return Some(requested.to_owned());
     }
-    if let Ok(v) = std::env::var("AIONUI_GITHUB_REPO")
-        && !v.is_empty()
-    {
-        return v;
+
+    if let Some(configured) = env_repo {
+        return Some(configured.to_owned());
     }
-    DEFAULT_REPO.to_owned()
+
+    fallback_repo.map(ToOwned::to_owned)
 }
 
 /// Parse a version string, stripping a leading `v` if present.
@@ -275,23 +334,118 @@ struct GitHubAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_resolve_repo_from_request() {
-        assert_eq!(resolve_repo(Some("org/repo")), "org/repo");
+        assert_eq!(
+            resolve_effective_repo(Some("org/repo"), None, None).as_deref(),
+            Some("org/repo")
+        );
     }
 
     #[test]
-    fn test_resolve_repo_empty_request() {
-        let result = resolve_repo(Some(""));
-        // Falls back to env or default
-        assert!(!result.is_empty());
+    fn test_resolve_repo_empty_request_disabled_by_default_in_fork() {
+        assert_eq!(resolve_effective_repo(Some(""), None, None), None);
+        assert_eq!(resolve_effective_repo(Some("   "), Some("  "), None), None);
     }
 
     #[test]
-    fn test_resolve_repo_none() {
-        let result = resolve_repo(None);
-        assert!(!result.is_empty());
+    fn test_resolve_repo_none_disabled_unless_rakazo_env_or_test_default_set() {
+        assert_eq!(resolve_effective_repo(None, None, None), None);
+        assert_eq!(
+            resolve_effective_repo(Some("iOfficeAI/AionUi"), None, None),
+            None,
+            "upstream repo must be blocked in default fork runtime"
+        );
+        assert_eq!(
+            resolve_effective_repo(None, Some("  rakazo-org/rakazo-aion  "), None).as_deref(),
+            Some("rakazo-org/rakazo-aion")
+        );
+        assert_eq!(
+            resolve_effective_repo(None, None, Some(UPSTREAM_REPO)).as_deref(),
+            Some(UPSTREAM_REPO)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_runtime_skips_github_network_when_rakazo_repo_unset() {
+        let mock_server = MockServer::start().await;
+        let svc = VersionCheckService::with_api_base_and_repo(
+            reqwest::Client::new(),
+            "0.3.0".to_owned(),
+            mock_server.uri(),
+            None,
+        );
+
+        let res_default = svc
+            .check_update_with_env_repo(&UpdateCheckRequest::default(), None)
+            .await
+            .expect("disabled check should return clean up-to-date result");
+        assert_eq!(res_default.current_version, "0.3.0");
+        assert!(!res_default.update_available);
+        assert!(res_default.latest.is_none());
+
+        let res_blank_env = svc
+            .check_update_with_env_repo(&UpdateCheckRequest::default(), Some("   "))
+            .await
+            .expect("blank env should also skip network");
+        assert!(!res_blank_env.update_available);
+        assert!(res_blank_env.latest.is_none());
+
+        let res_upstream_req = svc
+            .check_update_with_env_repo(
+                &UpdateCheckRequest {
+                    include_prerelease: false,
+                    repo: Some("iOfficeAI/AionUi".to_owned()),
+                },
+                None,
+            )
+            .await
+            .expect("explicit upstream repo should be blocked in default runtime");
+        assert!(!res_upstream_req.update_available);
+        assert!(res_upstream_req.latest.is_none());
+
+        let received = mock_server.received_requests().await.expect("received requests");
+        assert!(
+            received.is_empty(),
+            "default fork runtime must make 0 GitHub API calls, saw: {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_rakazo_github_repo_fetches_releases() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/rakazo-org/rakazo-aion/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "tag_name": "v0.4.0",
+                "name": "Rakazo v0.4.0",
+                "body": "Fork release",
+                "html_url": "https://github.com/rakazo-org/rakazo-aion/releases/tag/v0.4.0",
+                "published_at": "2026-11-12T00:00:00Z",
+                "prerelease": false,
+                "draft": false,
+                "assets": []
+            }])))
+            .mount(&mock_server)
+            .await;
+
+        let svc = VersionCheckService::with_api_base_and_repo(
+            reqwest::Client::new(),
+            "0.3.0".to_owned(),
+            mock_server.uri(),
+            None,
+        );
+        let res = svc
+            .check_update_with_env_repo(&UpdateCheckRequest::default(), Some(" rakazo-org/rakazo-aion "))
+            .await
+            .expect("explicit RAKAZO_GITHUB_REPO check should succeed");
+
+        assert_eq!(res.current_version, "0.3.0");
+        assert!(res.update_available);
+        assert_eq!(res.latest.expect("latest release").version, "0.4.0");
     }
 
     #[test]

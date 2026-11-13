@@ -3425,10 +3425,11 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let last_total = g("totalTokens");
     vec![SessionEvent::UsageDelta {
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
-        total_tokens: g("totalTokens"),
+        total_tokens: last_total,
         cost_usd: None,
         // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
         // the only context-window field in the whole codex protocol.
@@ -3449,6 +3450,12 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         // first-party provider, and gate on that evidence rather than on a
         // hardcoded constant.
         context_window: None,
+        occupancy_tokens: (last_total > 0).then_some(last_total),
+        // Each `thread/tokenUsage/updated` reports `last` for one API sub-call;
+        // `SessionAgentTask` accumulates `turn_billed_tokens` across sub-calls
+        // within the same turn so `_meta.turn_total_tokens` captures the full
+        // multi-step turn while `occupancy_tokens` stays on the latest sub-call.
+        turn_billed_tokens: (last_total > 0).then_some(last_total),
         // Per-turn detail line. codex reports every field natively on `last`
         // (verified: TokenUsageBreakdown in the generated schema), including the
         // reasoning tokens claude only exposes per-call.

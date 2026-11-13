@@ -45,6 +45,10 @@ pub(crate) struct Translator {
     /// and its closing message claims the work is done. Counting these is the
     /// only way to notice, because the terminal frame carries no trace of them.
     failed_steps: u32,
+    /// True once at least one streaming `step_update` carried per-step occupancy
+    /// during the current turn, so the terminal `result.usage` aggregate never
+    /// overwrites window occupancy.
+    saw_streaming_occupancy_in_turn: bool,
 }
 
 impl Translator {
@@ -91,9 +95,10 @@ impl Translator {
                 } else {
                     r.response
                 };
+                let saw_streaming = std::mem::take(&mut self.saw_streaming_occupancy_in_turn);
                 let mut out = Vec::with_capacity(3);
                 if let Some(u) = r.usage {
-                    out.push(usage_delta(&u));
+                    out.push(result_usage_delta(&u, saw_streaming));
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
                 // breaks out of its receive loop the moment it sees the turn's
@@ -295,7 +300,10 @@ impl Translator {
         }
 
         if let Some(u) = su.usage.as_ref() {
-            out.push(usage_delta(u));
+            if u.total_tokens > 0 {
+                self.saw_streaming_occupancy_in_turn = true;
+            }
+            out.push(step_usage_delta(u));
         }
         out
     }
@@ -339,7 +347,7 @@ fn subagent_input(agents: &[AgySubagent]) -> serde_json::Value {
     )
 }
 
-fn usage_delta(u: &AgyUsage) -> SessionEvent {
+fn step_usage_delta(u: &AgyUsage) -> SessionEvent {
     SessionEvent::UsageDelta {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
@@ -352,6 +360,31 @@ fn usage_delta(u: &AgyUsage) -> SessionEvent {
             thought_tokens: u.thinking_tokens,
         },
         context_window: None,
+        occupancy_tokens: (u.total_tokens > 0).then_some(u.total_tokens),
+        turn_billed_tokens: None,
+    }
+}
+
+fn result_usage_delta(u: &AgyUsage, saw_streaming_occupancy: bool) -> SessionEvent {
+    let occupancy_tokens = if saw_streaming_occupancy {
+        None
+    } else {
+        (u.total_tokens > 0).then_some(u.total_tokens)
+    };
+    SessionEvent::UsageDelta {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        total_tokens: occupancy_tokens.unwrap_or(u.total_tokens),
+        // agy reports no cost figures.
+        cost_usd: None,
+        breakdown: UsageBreakdown {
+            cached_read_tokens: u.cache_read_tokens,
+            cached_write_tokens: 0,
+            thought_tokens: u.thinking_tokens,
+        },
+        context_window: None,
+        occupancy_tokens,
+        turn_billed_tokens: (u.total_tokens > 0).then_some(u.total_tokens),
     }
 }
 

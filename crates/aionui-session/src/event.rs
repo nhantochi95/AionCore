@@ -336,6 +336,15 @@ pub enum SessionEvent {
         /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
         /// denominator of the usage indicator; `None` leaves it a bare counter.
         context_window: Option<u64>,
+        /// Window occupancy snapshot (`used`), separate from per-turn billed
+        /// token volume. `None` on terminal cumulative ACP frames when streaming
+        /// `usage_update` already reported occupancy during the turn.
+        #[serde(default)]
+        occupancy_tokens: Option<u64>,
+        /// Per-turn or intra-turn sub-call billed token volume (`_meta.turn_total_tokens`),
+        /// separate from context window occupancy.
+        #[serde(default)]
+        turn_billed_tokens: Option<u64>,
     },
 
     /// MCP / tool provisioning as a LIVE event (Addendum 5 / U16). Reducer no-op.
@@ -1367,6 +1376,8 @@ mod additive_tests {
                     total_tokens: 2,
                     cost_usd: None,
                     context_window: None,
+                    occupancy_tokens: Some(2),
+                    turn_billed_tokens: Some(2),
                     breakdown: Default::default(),
                 },
                 BackendProduced,
@@ -1646,6 +1657,8 @@ mod additive_tests {
                 total_tokens: 150,
                 cost_usd: Some(0.0021),
                 context_window: None,
+                occupancy_tokens: Some(150),
+                turn_billed_tokens: Some(150),
                 breakdown: Default::default(),
             },
             SessionEvent::Provisioning {

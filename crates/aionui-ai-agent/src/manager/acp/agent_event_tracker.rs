@@ -29,6 +29,7 @@ pub enum AcpSessionEvent {
     SessionAssigned {
         session_id: SessionId,
     },
+    SessionCleared,
     DesiredModeChanged {
         mode: ModeId,
     },
@@ -121,6 +122,9 @@ impl AcpAgentManager {
             AgentStreamEvent::AcpContextUsage(value) => {
                 if let Ok(update) = serde_json::from_value::<UsageUpdate>(value.clone()) {
                     let mut s = self.session.write().await;
+                    if update.used > 0 {
+                        s.mark_streaming_occupancy_seen();
+                    }
                     s.apply_context_usage(update);
                     self.commit_session_changes(&mut s).await;
                 }
